@@ -9,7 +9,7 @@ The information bubtrsnap needs is minimal- a snapshot directory, an archive nam
 
 As with btrbu, bubtrsnap remains largely dependency free.  It uses no data files or databases in order to perform its duties.
 
-[btrbu][https://github.com/lama7/btrbu]
+[btrbu]: https://github.com/lama7/btrbu
 
 Usage
 -----
