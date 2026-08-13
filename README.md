@@ -96,27 +96,27 @@ Hooks
 Hooks allow for external programs to be coordinated with the creation of snapshots and backups.  There are 3 types of hooks:  pre-snapshot, post-snapshot and backup.  All referring to the timing when the hooks are run.  The idea was to facilitate creating an all-in-one-place backup solution so that snapshot or backup creation could be paired with backing up to a remote server.  Or some kind of pre-processing or massaging could be done prior to taking snapshots.
 
 Hooks can only be configured in a configuration file.  They are not availabe on the command line.  The configuration values for the file are as follows:
-+ `presnaphooks` - a list of commands to run
-+ `postsnaphooks` - a table of commands where the key is an archive name
-+ `backuphooks` - a table of commands where the key is an archive name
++ `pre-snapshot-hooks` - a list of commands to run
++ `post-snapshot-hooks` - a table of commands where the key is an archive name
++ `post-backup-hooks` - a table of commands where the key is an archive name
 
 To make the hooks more useful, it is possible to use substitution strings when creating a hook command.  bubtrsnap will parse the command and swap in the appropriate value for the substitution string.  Following are lists of the substitution strings availabe for each type of hook.
 
-presnapshot:
+pre-snapshot-hooks:
 + `{archive}` - the name of the current archive is substituted
 + `{subvol}` - the name of the subvolume associated with the archive substituted
 + `{timestamp}` - the timestamp for the current run of bubtrsnap is substituted
 + `{backupdir}` - the configured backup directory is substituted
 + `{snapshotdir}` - the configured snapshot directory is substituted
 
-postsnapshot:
+post-snapshot-hooks:
 + `{snapshot}` - the full path and name of the snapshot is substituted
 + `{archive}` - just the name of the archive, no path, is substituted
 + `{timestamp}`
 + `{backupdir}`
 + `{snapshotdir}`
 
-backup:
+post-backup-hooks:
 + `{backup}` - the full path and name of the backup is substituted
 + `{snapshot}`
 + `{archive}`
