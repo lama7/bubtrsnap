@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""
+bubtrsnap— Simple btrfs snapshot & backup tool
+A new implementation inspired by the goals of btrbu (minimal deps, single file,
+sensible config, hooks, keep policy, incremental send/receive).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import tomllib
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "snapshot_dir": None,
+    "backup_dir": None,
+    "snaps_only": False,
+    "keep_hourly": 0,
+    "keep_daily": 0,
+    "keep_weekly": 0,
+    "keep_monthly": 0,
+    "keep_yearly": 0,
+    "verbose": 0,
+    "sudo": False,
+    "archives": {},          # name -> subvolume path
+    "pre_snapshot_hooks": {},
+    "post_snapshot_hooks": {},  # archive -> command
+    "post_backup_hooks": {},    # archive -> command
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def log(msg: str, level: int, verbosity: int) -> None:
+    """
+    level 1 = flow / progress
+    level 2 = commands
+    level 3 = debug (UUIDs, command output, internal decisions)
+    """
+    if verbosity >= level:
+        if level >= 3:
+            print(f"[debug] {msg}")
+        else:
+            print(msg)
+    
+def run(cmd: list[str], 
+        dry_run: bool, 
+        verbosity: int, 
+        check: bool = True, 
+        capture_output: bool = False, 
+        text: bool = None) -> subprocess.CompletedProcess | None:
+    pretty = " ".join(cmd)
+    if dry_run:
+        log(f"[dry-run] {pretty}", 2, verbosity)
+        return None
+    log(pretty, 2, verbosity)          # level 2 shows the command
+    return subprocess.run(cmd, check=check, capture_output=capture_output, text=text)
+
+def timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d%H%M")
+
+def load_toml(path: Path) -> dict[str, Any]:
+    with path.open("rb") as f:
+        return tomllib.load(f)
+
+def merge_config(cli: argparse.Namespace, config_path: Path | None) -> dict[str, Any]:
+    cfg = DEFAULT_CONFIG.copy()
+
+    if config_path and config_path.exists():
+        file_cfg = load_toml(config_path)
+        # Normalise some keys
+        if "subvolumes" in file_cfg:
+            file_cfg["archives"] = file_cfg.pop("subvolumes")
+        cfg.update(file_cfg)
+
+    # CLI overrides
+    if cli.snapshot_dir:
+        cfg["snapshot_dir"] = cli.snapshot_dir
+    if cli.backup_dir:
+        cfg["backup_dir"] = cli.backup_dir
+    if cli.snaps_only:
+        cfg["snaps_only"] = True
+    if cli.sudo:
+        cfg["sudo"] = True
+
+    for key in ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"):
+        val = getattr(cli, key, None)
+        if val is not None:
+            cfg[key] = val
+
+    # Archives from CLI completely replace those from config
+    if cli.archives:
+        cfg["archives"] = dict(cli.archives)
+
+    return cfg
+
+def btrfs_cmd(cfg: dict, *args: str) -> list[str]:
+    cmd = ["btrfs"]
+    if cfg.get("sudo"):
+        cmd = ["sudo", "-n"] + cmd
+    return cmd + list(args)
+
+def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
+    """
+    Returns (UUID, Received UUID) for a btrfs subvolume.
+    Returns (None, None) on failure.
+    """
+    try:
+        result = run(btrfs_cmd(cfg, "subvolume", "show", str(path)),
+                     False, # this allows code to be executed properly during a dry-run
+                     cfg["verbose"],
+                     check=True,  
+                     capture_output=True, 
+                     text=True)
+        uuid = None
+        received_uuid = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("UUID:"):
+                uuid = line.split(":", 1)[1].strip()
+            elif line.startswith("Received UUID:"):
+                val = line.split(":", 1)[1].strip()
+                received_uuid = None if val == "-" else val
+
+        # Debug level only
+        log(f"{path}: UUID={uuid}  Received UUID={received_uuid}", 3, cfg["verbose"])
+        return uuid, received_uuid
+    except Exception:
+        log(f"Failed to get UUIDs for {path}", 3, cfg["verbose"])
+        return None, None
+
+# ---------------------------------------------------------------------------
+# Core operations
+# ---------------------------------------------------------------------------
+def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Path:
+    name = f"{archive}.{timestamp()}"
+    dest = snap_dir / name
+    cmd = btrfs_cmd(cfg, "subvolume", "snapshot", "-r", subvol, str(dest))
+    run(cmd, cfg.get("dry_run", False), cfg["verbose"])
+    return dest
+
+def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) -> list[Path]:
+    """
+    Find previous snapshots in snapshot_dir that have already been
+    successfully received to backup_dir (matched by UUID ↔ Received UUID).
+    Returns them newest-first.
+    """
+    log(f"Finding parent subvolumes for {archive}", 3, cfg["verbose"])
+    # Collect snapshots
+    snapshots = []
+    for p in snapshot_dir.glob(f"{archive}.*"):
+        if not p.is_dir():
+            continue
+        uuid, _ = get_subvol_uuids(p, cfg)
+        if uuid:
+            ts = parse_ts(p.name)
+            if ts:
+                snapshots.append((ts, p, uuid))
+
+    # Collect received UUIDs from backup side
+    received_uuids = set()
+    for p in backup_dir.glob(f"{archive}.*"):
+        if not p.is_dir():
+            continue
+        _, received_uuid = get_subvol_uuids(p, cfg)
+        if received_uuid:
+            received_uuids.add(received_uuid)
+
+    # Match
+    parents = []
+    for ts, path, uuid in snapshots:
+        if uuid in received_uuids:
+            parents.append((ts, path))
+            log(f"Usable parent: {path.name}", 3, cfg["verbose"])
+
+    parents.sort(key=lambda x: x[0], reverse=True)
+    result = [path for _, path in parents]
+
+    if result:
+        log(f"Found {len(result)} usable parent(s) for {archive}", 3, cfg["verbose"])
+    else:
+        log("No usable parents found", 3, cfg["verbose"])
+
+    return result
+
+def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path, cfg: dict, archive: str) -> Path:
+    parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
+
+    send_cmd = btrfs_cmd(cfg, "send")
+
+    if not parents:
+        log("Full send (no matching parent found)", 1, cfg["verbose"])
+    elif len(parents) == 1:
+        log(f"Incremental send using parent {parents[0].name}", 1, cfg["verbose"])
+        send_cmd += ["-p", str(parents[0])]
+    else:
+        log(f"Incremental send using {len(parents)} clone sources", 1, cfg["verbose"])
+        for p in parents:
+            send_cmd += ["-c", str(p)]
+
+    send_cmd.append(str(snap))
+    dest = backup_dir / snap.name
+
+    if cfg.get("dry_run"):
+        log(f"[dry-run] {' '.join(send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
+        return dest
+
+    recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
+
+    # Level 2 shows the actual command
+    log(f"{' '.join(send_cmd)} | {' '.join(recv_cmd)}", 2, cfg["verbose"])
+
+    start_time = datetime.now()
+
+    send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
+    recv_proc = subprocess.Popen(recv_cmd, stdin=send_proc.stdout)
+    send_proc.stdout.close()
+    recv_proc.communicate()
+
+    elapsed = datetime.now() - start_time
+    seconds = elapsed.total_seconds()
+
+    if seconds < 60:
+        time_str = f"{seconds:.1f} seconds"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        time_str = f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        remaining = seconds % 3600
+        minutes = int(remaining // 60)
+        secs = remaining % 60
+        time_str = f"{hours}h {minutes}m {secs:.1f}s"
+
+    # Level 1 shows the timing summary
+    log(f"btrfs send/receive completed in {time_str}", 1, cfg["verbose"])
+
+    if recv_proc.returncode != 0:
+        raise RuntimeError("btrfs receive failed")
+
+    return dest
+
+def run_hook(cmd_template: str | None, mapping: dict[str, str], cfg: dict) -> None:
+    if not cmd_template:
+        return
+    cmd = cmd_template
+    for key, val in mapping.items():
+        cmd = cmd.replace(f"{{{key}}}", val)
+    log(f"Running hook: {cmd}", 1, cfg["verbose"])
+    if not cfg.get("dry_run"):
+        subprocess.run(cmd, shell=True, check=False)
+
+# ---------------------------------------------------------------------------
+# Keep policy (simple Borg-inspired)
+# ---------------------------------------------------------------------------
+def parse_ts(name: str) -> datetime | None:
+    try:
+        # expected form archive.YYYYMMDDHHMM
+        ts = name.rsplit(".", 1)[-1]
+        return datetime.strptime(ts, "%Y%m%d%H%M")
+    except Exception:
+        return None
+
+def apply_keep_policy(directory: Path, archive: str, cfg: dict) -> None:
+    # Only prune if at least one keep value is > 0
+    keep_values = [
+        cfg.get("keep_hourly", 0),
+        cfg.get("keep_daily", 0),
+        cfg.get("keep_weekly", 0),
+        cfg.get("keep_monthly", 0),
+        cfg.get("keep_yearly", 0),
+    ]
+    if not any(v > 0 for v in keep_values):
+        log(f"No keep policy specified for {archive} – skipping pruning", 1, cfg["verbose"])
+        return
+
+    log(f"For {archive} in {directory}:", 1, cfg["verbose"])
+
+    items = []
+    for p in directory.glob(f"{archive}.*"):
+        ts = parse_ts(p.name)
+        if ts:
+            items.append((ts, p))
+    items.sort(key=lambda x: x[0], reverse=True)  # newest first
+
+    if not items:
+        return
+
+    keep: set[Path] = set()
+
+    # Hourly
+    if cfg["keep_hourly"] > 0:
+        count = 0
+        last = None
+        for ts, p in items:
+            if last is None or (last - ts) >= timedelta(hours=1):
+                keep.add(p)
+                log(f"\tKeeping {p.name} (hourly)", 1, cfg["verbose"])
+                last = ts
+                count += 1
+                if count >= cfg["keep_hourly"]:
+                    break
+
+    # Daily
+    if cfg["keep_daily"] > 0:
+        count = 0
+        last_date = None
+        for ts, p in items:
+            d = ts.date()
+            if d != last_date:
+                keep.add(p)
+                log(f"\tKeeping {p.name} (daily)", 1, cfg["verbose"])
+                last_date = d
+                count += 1
+                if count >= cfg["keep_daily"]:
+                    break
+
+    # Weekly
+    if cfg["keep_weekly"] > 0:
+        count = 0
+        last = None
+        for ts, p in items:
+            if last is None or (last - ts) >= timedelta(days=7):
+                keep.add(p)
+                log(f"\tKeeping {p.name} (weekly)", 1, cfg["verbose"])
+                last = ts
+                count += 1
+                if count >= cfg["keep_weekly"]:
+                    break
+
+    # Monthly
+    if cfg["keep_monthly"] > 0:
+        count = 0
+        last_month = None
+        for ts, p in items:
+            m = (ts.year, ts.month)
+            if m != last_month:
+                keep.add(p)
+                log(f"\tKeeping {p.name} (monthly)", 1, cfg["verbose"])
+                last_month = m
+                count += 1
+                if count >= cfg["keep_monthly"]:
+                    break
+
+    # Yearly
+    if cfg["keep_yearly"] > 0:
+        count = 0
+        last_year = None
+        for ts, p in items:
+            y = ts.year
+            if y != last_year:
+                keep.add(p)
+                log(f"\tKeeping {p.name} (yearly)", 1, cfg["verbose"])
+                last_year = y
+                count += 1
+                if count >= cfg["keep_yearly"]:
+                    break
+
+    # Always keep the newest
+    keep.add(items[0][1])
+
+    for ts, p in items:
+        if p not in keep:
+            log(f"Pruning {p}", 1, cfg["verbose"])
+            cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))
+            run(cmd, cfg.get("dry_run", False), cfg["verbose"], check=False)        
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="btrfs snapshot & backup tool (Python implementation)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup home=/home
+  bubtrsnap --config=~/.config/bubtrsnap.toml --dry-run
+  bubtrsnap -v --snaps-only --keep-daily 7 root=/
+  bubtrsnap -vv --debug
+        """
+    )
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to TOML configuration file (default: ~/.config/bubtrsnap.toml)"
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        type=str,
+        help="Directory where read-only snapshots will be created"
+    )
+    parser.add_argument(
+        "--backup-dir",
+        type=str,
+        help="Directory where backups will be sent via btrfs send/receive "
+             "(must be on a btrfs filesystem)"
+    )
+    parser.add_argument(
+        "--snaps-only",
+        action="store_true",
+        help="Only create snapshots; skip the backup (send/receive) step"
+    )
+    parser.add_argument("--keep-hourly", type=int, metavar="N", help="Number of hourly snapshots/backups to retain")
+    parser.add_argument("--keep-daily", type=int, metavar="N", help="Number of daily snapshots/backups to retain")
+    parser.add_argument("--keep-weekly", type=int, metavar="N", help="Number of weekly snapshots/backups to retain")
+    parser.add_argument("--keep-monthly", type=int, metavar="N", help="Number of monthly snapshots/backups to retain")
+    parser.add_argument("--keep-yearly", type=int, metavar="N", help="Number of yearly snapshots/backups to retain")
+
+    # New verbosity handling
+    parser.add_argument(
+        "-v", "--verbose",
+        type=int,
+        nargs="?",
+        const=1,
+        default=0,
+        metavar="LEVEL",
+        help="Verbosity level: 0=quiet (default), 1=progress, 2=commands. "
+             "-v alone means level 1, --verbose 2 means level 2"
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output (highest level: commands + btrfs responses + UUIDs)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making any changes (implies -vv)"
+    )
+    parser.add_argument(
+        "--sudo",
+        action="store_true",
+        help="Run btrfs commands with 'sudo -n' (requires passwordless sudo)"
+    )
+    parser.add_argument(
+        "archives",
+        nargs="*",
+        metavar="ARCHIVE=SUBVOLUME",
+        help="Archive name and source subvolume pairs (e.g. home=/home). "
+             "If none are given, archives from the config file are used."
+    )
+
+    args = parser.parse_args()
+
+    # Parse archive=subvol pairs
+    parsed_archives = {}
+    for item in args.archives:
+        if "=" not in item:
+            print(f"Invalid archive specification: {item}", file=sys.stderr)
+            return 1
+        name, path = item.split("=", 1)
+        parsed_archives[name] = path
+    args.archives = parsed_archives
+
+    # --- Verbosity logic ---
+    verbosity = args.verbose
+    if args.debug:
+        verbosity = 3
+    if args.dry_run:
+        verbosity = max(verbosity, 2)
+    
+    # Now define config_path
+    config_path = args.config or Path.home() / ".config" / "bubtrsnap.toml"
+    cfg = merge_config(args, config_path if config_path.exists() else None)
+
+    cfg["verbose"] = verbosity
+    cfg["dry_run"] = args.dry_run
+    cfg["sudo"] = args.sudo or cfg.get("sudo", False)
+   
+    if not cfg["archives"]:
+        print("No archives specified on command line or in config.", file=sys.stderr)
+        return 1
+    if not cfg["snapshot_dir"]:
+        print("--snapshot-dir is required", file=sys.stderr)
+        return 1
+
+    snap_dir = Path(cfg["snapshot_dir"])
+    backup_dir = Path(cfg["backup_dir"]) if cfg["backup_dir"] else None
+
+    if not cfg.get("dry_run"):
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        if backup_dir:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+
+    for archive, subvol in cfg["archives"].items():
+        log(f"=== Processing archive: {archive} ({subvol}) ===", 1, cfg["verbose"])
+
+        # 1. Pre-snapshot hook
+        log("Running pre-snapshot hook...", 1, cfg["verbose"])
+        hook = cfg.get("pre_snapshot_hooks", {}).get(archive)
+        run_hook(hook, {
+            "archive": archive,
+            "subvol": subvol,
+            "timestamp": timestamp(),
+            "snapshotdir": str(snap_dir),
+            "backupdir": str(backup_dir) if backup_dir else "",
+        }, cfg)
+
+        # 2. Create snapshot
+        log("Creating snapshot...", 1, cfg["verbose"])
+        snap = create_snapshot(archive, subvol, snap_dir, cfg)
+
+        # 3. Post-snapshot hook
+        log("Running post-snapshot hook...", 1, cfg["verbose"])
+        hook = cfg.get("post_snapshot_hooks", {}).get(archive)
+        run_hook(hook, {
+            "snapshot": str(snap),
+            "archive": archive,
+            "timestamp": timestamp(),
+            "snapshotdir": str(snap_dir),
+            "backupdir": str(backup_dir) if backup_dir else "",
+        }, cfg)
+
+        # 4. Backup (send/receive) + post-backup hook
+        if not cfg["snaps_only"] and backup_dir:
+            log("Starting backup...", 1, cfg["verbose"])
+            dest = send_backup(snap, snap_dir, backup_dir, cfg, archive)
+
+            log("Running post-backup hook...", 1, cfg["verbose"])
+            hook = cfg.get("post_backup_hooks", {}).get(archive)
+            run_hook(hook, {
+                "backup": str(dest),
+                "snapshot": str(snap),
+                "archive": archive,
+                "timestamp": timestamp(),
+                "snapshotdir": str(snap_dir),
+                "backupdir": str(backup_dir),
+            }, cfg)
+        else:
+            log("Skipping backup (snaps-only or no backup_dir)", 1, cfg["verbose"])
+
+        # 5. Apply keep policy for this archive
+        log("Applying keep policy...", 1, cfg["verbose"])
+        apply_keep_policy(snap_dir, archive, cfg)
+        if backup_dir and not cfg["snaps_only"]:
+            apply_keep_policy(backup_dir, archive, cfg)
+
+        log(f"Finished archive: {archive}\n", 1, cfg["verbose"])
+
+    log("All archives processed.", 1, cfg["verbose"])
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
