@@ -32,18 +32,6 @@ These archives will share the same snapshot and backup destination, but obviousl
 
 For a full list of options and their explanations, `bubtrsnap --help` is useful.
 
-Option: send-to-file
---------------------
-
-A new feature unique to bubtrsnap is the `send-to-file` option which leverages the ability of btrfs to send it's data to a file rather than another btrfs filesystem. This is to facilitate backups of very large archives where a raw send-receive could get interrupted due to the time it takes for the transfer.  This option is still being developed but as of now, the option takes a directory destination for `btrfs send -f` command and executes just the send portion.  Alternatively, the option can be placed in a configuration file using an archive as a header like so:
-
-```
-    [send_to_file]
-    archive1 = "/home/user/"
-```
-
-The option is mutually exclusive with the `--snaps-only` option and when used on the command line, only 1 `archive=subvolume` may be specified.  If either of these options is also used in the command line then bubtrsnap exits with an error.
-
 Configuration Files
 -------------------
 
@@ -71,6 +59,18 @@ Configuration files use TOML formatting and look like:
 If an option can be specified on the command line, it can also be specified in the configuration file.  Be sure to susbstitute a `'_'` for any `'-'` characters in the command line option.  So the `--snapshot-dir` option would be specified as `snapshot_dir` in a configuration file.
 
 Configuration files and command line options can be mixed and matched as well.  The rule is that the command line overrides any configuration file settings.  For archive name/ subvolume pairs, anything specified on the command line overrides ALL of the subvolumes in the configuration file.  So if there are 5 subvolumes specified in the configuration file, but a single achive/subvolume is specified on the command line, only the command line archive/subvolume is dealt with.  Basically, bubtrsnap assumes the user knows what they are doing and tries not to get in the way.
+
+Option: send-to-file
+--------------------
+
+A new feature unique to bubtrsnap is the `send-to-file` option which leverages the ability of btrfs to send it's data to a file rather than another btrfs filesystem. This is to facilitate backups of very large archives where a raw send-receive could get interrupted due to the time it takes for the transfer.  This option is still being developed but as of now, the option takes a directory destination for `btrfs send -f` command and executes just the send portion.  Alternatively, the option can be placed in a configuration file using an archive as a header like so:
+
+```
+    [send_to_file]
+    archive1 = "/home/user/"
+```
+
+The option is mutually exclusive with the `--snaps-only` option and when used on the command line, only 1 `archive=subvolume` may be specified.  If either of these options is also used in the command line then bubtrsnap exits with an error.
 
 Keep Policy
 -----------
