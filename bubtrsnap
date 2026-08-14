@@ -249,6 +249,58 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path, cfg: dict, arc
 
     return dest
 
+def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path, stream_dir: Path, cfg: dict, archive: str) -> Path:
+    """
+    Perform a btrfs send to a file (for resumable transfers).
+    Returns the path of the created .btrfs stream file.
+    """
+    # For send-to-file we use previous snapshots as possible parents
+    parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
+
+    send_cmd = btrfs_cmd(cfg, "send")
+
+    if not parents:
+        log("Full send to file (no matching parent found)", 1, cfg["verbose"])
+    elif len(parents) == 1:
+        log(f"Incremental send to file using parent {parents[0].name}", 1, cfg["verbose"])
+        send_cmd += ["-p", str(parents[0])]
+    else:
+        log(f"Incremental send to file using {len(parents)} clone sources", 1, cfg["verbose"])
+        for p in parents:
+            send_cmd += ["-c", str(p)]
+
+    stream_file = stream_dir / f"{snap.name}.btrfs"
+    send_cmd += ["-f", str(stream_file), str(snap)]
+
+    if cfg.get("dry_run"):
+        log(f"[dry-run] {' '.join(send_cmd)}", 2, cfg["verbose"])
+        return stream_file
+
+    log(f"{' '.join(send_cmd)}", 2, cfg["verbose"])
+
+    start_time = datetime.now()
+    run(send_cmd, False, cfg["verbose"], check=True)
+    elapsed = datetime.now() - start_time
+    seconds = elapsed.total_seconds()
+
+    if seconds < 60:
+        time_str = f"{seconds:.1f} seconds"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        time_str = f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        remaining = seconds % 3600
+        minutes = int(remaining // 60)
+        secs = remaining % 60
+        time_str = f"{hours}h {minutes}m {secs:.1f}s"
+
+    log(f"btrfs send to file completed in {time_str}", 1, cfg["verbose"])
+    log(f"Stream file: {stream_file}", 1, cfg["verbose"])
+
+    return stream_file
+
 def run_hook(cmd_template: str | None, mapping: dict[str, str], cfg: dict) -> None:
     if not cmd_template:
         return
@@ -451,6 +503,13 @@ Examples:
         help="Archive name and source subvolume pairs (e.g. home=/home). "
              "If none are given, archives from the config file are used."
     )
+    parser.add_argument(
+        "--send-to-file",
+        type=str,
+        metavar="DIR",
+        help="Send the backup stream to a file in DIR instead of performing "
+             "btrfs receive. Only one archive may be specified when using this option."
+    )
 
     args = parser.parse_args()
 
@@ -486,6 +545,20 @@ Examples:
         print("--snapshot-dir is required", file=sys.stderr)
         return 1
 
+    # Check for send_to_file
+    cli_send_to_file = getattr(args, "send_to_file", None)
+
+    # Mutual exclusion: --snaps-only and --send-to-file
+    if cfg.get("snaps_only") and (cli_send_to_file or cfg.get("send_to_file")):
+        print("Error: --snaps-only and --send-to-file are mutually exclusive.", file=sys.stderr)
+        return 1
+    
+    # Make sure only 1 archive specified on the command line
+    if cli_send_to_file and len(cfg["archives"]) > 1:
+        print("Error: --send-to-file can only be used with a single archive.", file=sys.stderr)
+        return 1
+
+    # Some final setup before handling the archive/subvolume pairs
     snap_dir = Path(cfg["snapshot_dir"])
     backup_dir = Path(cfg["backup_dir"]) if cfg["backup_dir"] else None
 
@@ -494,6 +567,7 @@ Examples:
         if backup_dir:
             backup_dir.mkdir(parents=True, exist_ok=True)
 
+    # Main loop for processing archive/subvolume pairs
     for archive, subvol in cfg["archives"].items():
         log(f"=== Processing archive: {archive} ({subvol}) ===", 1, cfg["verbose"])
 
@@ -523,8 +597,32 @@ Examples:
             "backupdir": str(backup_dir) if backup_dir else "",
         }, cfg)
 
-        # 4. Backup (send/receive) + post-backup hook
-        if not cfg["snaps_only"] and backup_dir:
+        # 4. Backup + post-backup hook
+        send_to_file_dir = None
+
+        if cli_send_to_file:
+            send_to_file_dir = Path(cli_send_to_file)
+        elif isinstance(cfg.get("send_to_file"), dict) and archive in cfg["send_to_file"]:
+            send_to_file_dir = Path(cfg["send_to_file"][archive])
+
+        if send_to_file_dir:
+            send_to_file_dir.mkdir(parents=True, exist_ok=True)
+            log(f"Sending stream to directory {send_to_file_dir}...", 1, cfg["verbose"])
+
+            stream_file = send_backup_tofile(snap, snap_dir, backup_dir, send_to_file_dir, cfg, archive)
+
+            log("Running post-backup hook...", 1, cfg["verbose"])
+            hook = cfg.get("post_backup_hooks", {}).get(archive)
+            run_hook(hook, {
+                "backup": str(stream_file),
+                "snapshot": str(snap),
+                "archive": archive,
+                "timestamp": timestamp(),
+                "snapshotdir": str(snap_dir),
+                "backupdir": str(send_to_file_dir),
+            }, cfg)
+
+        elif not cfg["snaps_only"] and backup_dir:
             log("Starting backup...", 1, cfg["verbose"])
             dest = send_backup(snap, snap_dir, backup_dir, cfg, archive)
 

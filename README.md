@@ -20,7 +20,7 @@ For simple snapshot and backup needs, a command can be as simple as:
 
 Assuming a start from nothing, this will take a snapshot of `/path/to/subvolume` and place it in `/pool/snapshots` with a timestamp suffix.  So the snapshot name will be of the form `archive.YYYYMMddhhmm`.  This snapshot will then be used to send a full backup to `/backup`. 
 
-Subsequent use of this same command will result in incremental backups which will just advance the timestamp associated with the archive.  It defaults to keeping the most recent snapshot and backup.  See [keep policy][] below for how to change the keep behavior.
+Subsequent use of this same command will result in incremental backups which will just advance the timestamp associated with the archive.  By default, previous snapshots and backups are retained so that bubtrsnap can take advantage of btrfs' incremental send and receive capabilities.  Each prior snapshot and backup becomes either a parent or source.  See [keep policy][] below for how to change the keep behavior.
 
 [keep policy]: #keep-policy
 
@@ -31,6 +31,18 @@ More than 1 archive can be specified on the command line:
 These archives will share the same snapshot and backup destination, but obviously have different names qualified with a timestamp.
 
 For a full list of options and their explanations, `bubtrsnap --help` is useful.
+
+Option: send-to-file
+--------------------
+
+A new feature unique to bubtrsnap is the `send-to-file` option which leverages the ability of btrfs to send it's data to a file rather than another btrfs filesystem. This is to facilitate backups of very large archives where a raw send-receive could get interrupted due to the time it takes for the transfer.  This option is still being developed but as of now, the option takes a directory destination for `btrfs send -f` command and executes just the send portion.  Alternatively, the option can be placed in a configuration file using an archive as a header like so:
+
+```
+    [send_to_file]
+    archive1 = "/home/user/"
+```
+
+The option is mutually exclusive with the `--snaps-only` option and when used on the command line, only 1 `archive=subvolume` may be specified.  If either of these options is also used in the command line then bubtrsnap exits with an error.
 
 Configuration Files
 -------------------
@@ -43,16 +55,16 @@ Configuration files use TOML formatting and look like:
 
 ```
     # a comment...
-    snapshot_dir = "/pool/snapshots",
-    backup_dir = "/backup",
+    snapshot_dir = "/pool/snapshots"
+    backup_dir = "/backup"
 
     keep_daily = 5
 
     # archives are under a header
     [archives]
-    archive1="/path/to/subvolume1",
-    archive2="/path/to/subvolume2",
-    archive3="/path/to/subvolume3",
+    archive1="/path/to/subvolume1"
+    archive2="/path/to/subvolume2"
+    archive3="/path/to/subvolume3"
 
 ```
 
