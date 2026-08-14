@@ -63,7 +63,7 @@ Configuration files and command line options can be mixed and matched as well.  
 Option: send-to-file
 --------------------
 
-A new feature unique to bubtrsnap is the `send-to-file` option which leverages the ability of btrfs to send it's data to a file rather than another btrfs filesystem. This is to facilitate backups of very large archives where a raw send-receive could get interrupted due to the time it takes for the transfer.  This option is still being developed but as of now, the option takes a directory destination for `btrfs send -f` command and executes just the send portion.  Alternatively, the option can be placed in a configuration file using an archive as a header like so:
+A new feature unique to bubtrsnap is the `send-to-file` option which leverages the ability of btrfs to send it's data to a file rather than another btrfs filesystem. This is to facilitate backups of very large archives where a raw send-receive could get interrupted due to the time it takes for the transfer.  This option is still being developed but as of now, the option takes a directory destination for the resulting file of the `btrfs send -f` command.  The command will include a parent subvolume or clone sources so the resulting file can contain incremental information to be used.  Finally, no `btrfs receive` operation is performed, only the file is created. It is left to the user to use the resulting file as they deem appropriate.  Alternatively, the option can be placed in a configuration file using an archive as a header like so:
 
 ```
     [send_to_file]
