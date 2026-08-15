@@ -108,6 +108,21 @@ def btrfs_cmd(cfg: dict, *args: str) -> list[str]:
         cmd = ["sudo", "-n"] + cmd
     return cmd + list(args)
 
+def format_duration(seconds: float) -> str:
+    """Return a human-readable duration string."""
+    if seconds < 60:
+        return f"{seconds:.1f} seconds"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        remaining = seconds % 3600
+        minutes = int(remaining // 60)
+        secs = remaining % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
+
 def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
     """
     Returns (UUID, Received UUID) for a btrfs subvolume.
@@ -225,36 +240,21 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path, cfg: dict, arc
     send_proc.stdout.close()
     recv_proc.communicate()
 
-    elapsed = datetime.now() - start_time
-    seconds = elapsed.total_seconds()
-
-    if seconds < 60:
-        time_str = f"{seconds:.1f} seconds"
-    elif seconds < 3600:
-        minutes = int(seconds // 60)
-        secs = seconds % 60
-        time_str = f"{minutes}m {secs:.1f}s"
-    else:
-        hours = int(seconds // 3600)
-        remaining = seconds % 3600
-        minutes = int(remaining // 60)
-        secs = remaining % 60
-        time_str = f"{hours}h {minutes}m {secs:.1f}s"
-
+    elapsed = (datetime.now() - start_time).total_seconds()
     # Level 1 shows the timing summary
-    log(f"btrfs send/receive completed in {time_str}", 1, cfg["verbose"])
+    log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
 
     if recv_proc.returncode != 0:
         raise RuntimeError("btrfs receive failed")
 
     return dest
 
-def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path, stream_dir: Path, cfg: dict, archive: str) -> Path:
+def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
+                       stream_dir: Path, cfg: dict, archive: str) -> Path:
     """
-    Perform a btrfs send to a file (for resumable transfers).
+    Perform a btrfs send to a file (for later resumable transfer + receive).
     Returns the path of the created .btrfs stream file.
     """
-    # For send-to-file we use previous snapshots as possible parents
     parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
 
     send_cmd = btrfs_cmd(cfg, "send")
@@ -268,8 +268,16 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path, stream_
         log(f"Incremental send to file using {len(parents)} clone sources", 1, cfg["verbose"])
         for p in parents:
             send_cmd += ["-c", str(p)]
+            log(f"  clone source: {p.name}", 3, cfg["verbose"])
 
     stream_file = stream_dir / f"{snap.name}.btrfs"
+
+    # Safeguard against accidental overwrite
+    if stream_file.exists():
+        log(f"Error: stream file already exists: {stream_file}", 1, cfg["verbose"])
+        log("Delete it manually or choose a different location if you want to recreate it.", 1, cfg["verbose"])
+        raise FileExistsError(f"Stream file already exists: {stream_file}")
+
     send_cmd += ["-f", str(stream_file), str(snap)]
 
     if cfg.get("dry_run"):
@@ -280,24 +288,10 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path, stream_
 
     start_time = datetime.now()
     run(send_cmd, False, cfg["verbose"], check=True)
-    elapsed = datetime.now() - start_time
-    seconds = elapsed.total_seconds()
+    elapsed = (datetime.now() - start_time).total_seconds()
 
-    if seconds < 60:
-        time_str = f"{seconds:.1f} seconds"
-    elif seconds < 3600:
-        minutes = int(seconds // 60)
-        secs = seconds % 60
-        time_str = f"{minutes}m {secs:.1f}s"
-    else:
-        hours = int(seconds // 3600)
-        remaining = seconds % 3600
-        minutes = int(remaining // 60)
-        secs = remaining % 60
-        time_str = f"{hours}h {minutes}m {secs:.1f}s"
-
-    log(f"btrfs send to file completed in {time_str}", 1, cfg["verbose"])
-    log(f"Stream file: {stream_file}", 1, cfg["verbose"])
+    log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+    log(f"Stream file created: {stream_file}", 1, cfg["verbose"])
 
     return stream_file
 
@@ -609,7 +603,12 @@ Examples:
             send_to_file_dir.mkdir(parents=True, exist_ok=True)
             log(f"Sending stream to directory {send_to_file_dir}...", 1, cfg["verbose"])
 
-            stream_file = send_backup_tofile(snap, snap_dir, backup_dir, send_to_file_dir, cfg, archive)
+            try:
+                stream_file = send_backup_tofile(
+                    snap, snap_dir, backup_dir, send_to_file_dir, cfg, archive
+                )
+            except FileExistsError:
+                return 1   # Error already logged inside the function
 
             log("Running post-backup hook...", 1, cfg["verbose"])
             hook = cfg.get("post_backup_hooks", {}).get(archive)
