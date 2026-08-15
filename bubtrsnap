@@ -502,6 +502,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
     items.sort(key=lambda x: x[0], reverse=True)  # newest first
 
     if not items:
+        log(f"\tNo prior archives for {archive} found in {directory}", 1, cfg["verbose"])
         return
 
     keep_set: set[Path] = set()
@@ -511,7 +512,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         count = 0
         last = None
         for ts, p in items:
-            if last is None or (last - ts) >= timedelta(hours=1):
+            if (last is None or (last - ts) >= timedelta(hours=1)) and (p not in keep_set):
                 keep_set.add(p)
                 log(f"\tKeeping {p.name} (hourly)", 1, cfg["verbose"])
                 last = ts
@@ -525,7 +526,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         last_date = None
         for ts, p in items:
             d = ts.date()
-            if d != last_date:
+            if d != last_date and p not in keep_set:
                 keep_set.add(p)
                 log(f"\tKeeping {p.name} (daily)", 1, cfg["verbose"])
                 last_date = d
@@ -538,7 +539,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         count = 0
         last = None
         for ts, p in items:
-            if last is None or (last - ts) >= timedelta(days=7):
+            if (last is None or (last - ts) >= timedelta(days=7)) and (p not in keep_set):
                 keep_set.add(p)
                 log(f"\tKeeping {p.name} (weekly)", 1, cfg["verbose"])
                 last = ts
@@ -552,7 +553,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         last_month = None
         for ts, p in items:
             m = (ts.year, ts.month)
-            if m != last_month:
+            if m != last_month and p not in keep_set:
                 keep_set.add(p)
                 log(f"\tKeeping {p.name} (monthly)", 1, cfg["verbose"])
                 last_month = m
@@ -566,7 +567,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         last_year = None
         for ts, p in items:
             y = ts.year
-            if y != last_year:
+            if y != last_year and p not in keep_set:
                 keep_set.add(p)
                 log(f"\tKeeping {p.name} (yearly)", 1, cfg["verbose"])
                 last_year = y
