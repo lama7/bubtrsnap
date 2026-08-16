@@ -54,18 +54,25 @@ def log(msg: str, level: int, verbosity: int) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def run(cmd: list[str], 
-        dry_run: bool, 
-        verbosity: int, 
-        check: bool = True, 
-        capture_output: bool = False, 
-        text: bool = None) -> subprocess.CompletedProcess | None:
-    pretty = " ".join(cmd)
+
+def run(cmd: list[str],
+        dry_run: bool = False,
+        verbosity: int = 0,
+        **kwargs) -> subprocess.CompletedProcess | None:
+    """
+    Run a command, with optional dry-run and logging support.
+    
+    Extra keyword arguments are passed directly to subprocess.run().
+    Common ones: check=True, capture_output=True, text=True, etc.
+    """
+    pretty = " ".join(str(c) for c in cmd)
+
     if dry_run:
         log(f"[dry-run] {pretty}", 2, verbosity)
         return None
-    log(pretty, 2, verbosity)          # level 2 shows the command
-    return subprocess.run(cmd, check=check, capture_output=capture_output, text=text)
+
+    log(pretty, 2, verbosity)
+    return subprocess.run(cmd, **kwargs)
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M")
@@ -107,38 +114,103 @@ def format_duration(seconds: float) -> str:
         secs = remaining % 60
         return f"{hours}h {minutes}m {secs:.1f}s"
 
-def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
-    """
-    Returns (UUID, Received UUID) for a btrfs subvolume.
-    Returns (None, None) on failure.
-    """
+def is_btrfs_subvolume(directory: Path, cfg: dict) -> bool:
     try:
-        result = run(btrfs_cmd(cfg, "subvolume", "show", str(path)),
-                     False, # this allows code to be executed properly during a dry-run
-                     cfg["verbose"],
-                     check=True,  
-                     capture_output=True, 
-                     text=True)
-        uuid = None
-        received_uuid = None
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("UUID:"):
-                uuid = line.split(":", 1)[1].strip()
-            elif line.startswith("Received UUID:"):
-                val = line.split(":", 1)[1].strip()
-                received_uuid = None if val == "-" else val
-
-        # Debug level only
-        log(f"{path}: UUID={uuid}  Received UUID={received_uuid}", 3, cfg["verbose"])
-        return uuid, received_uuid
-    except Exception:
-        log(f"Failed to get UUIDs for {path}", 3, cfg["verbose"])
-        return None, None
+        result = run(btrfs_cmd(cfg, "subvolume", "show", str(directory)),
+                     dry_run=False,
+                     verbosity=cfg["verbose"],
+                     check=False,
+                     capture_output=True,
+                     text=True
+                )
+        return result.returncode == 0
+                                    
+    except (FileNotFoundError, Exception):
+        print(f"{directory} is not a valid btrfs subvolume", file=sys.stderr)
+        return False
 
 # ---------------------------------------------------------------------------
 # Configuration Processing
 # ---------------------------------------------------------------------------
+ALLOWED_GLOBAL_OPTIONS = {
+    "snapshot_dir": str,
+    "backup_dir": str,
+    "sudo": bool,
+    "snaps_only": bool,
+    "send_to_file": str,
+    "keep_hourly": int,
+    "keep_daily": int,
+    "keep_weekly": int,
+    "keep_monthly": int,
+    "keep_yearly": int,
+    "verbose": int,
+    "dry_run": bool,
+}
+
+ALLOWED_ARCHIVE_OPTIONS = {
+    "subvolume": str,
+    "snaps_only": bool,
+    "send_to_file": str,
+    "pre_snapshot_hook": str,
+    "post_snapshot_hook": str,
+    "post_backup_hook": str,
+    "keep_hourly": int,
+    "keep_daily": int,
+    "keep_weekly": int,
+    "keep_monthly": int,
+    "keep_yearly": int,
+}
+
+def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
+    """Helper to check a single value's type."""
+    if expected_type is str:
+        if not isinstance(value, str):
+            print(f"Error: '{name}' in {context} must be a string, got {type(value).__name__}",
+                  file=sys.stderr)
+            sys.exit(1)
+    elif expected_type is int:
+        if not isinstance(value, int) or isinstance(value, bool):  # bool is subclass of int
+            print(f"Error: '{name}' in {context} must be an integer, got {type(value).__name__}",
+                  file=sys.stderr)
+            sys.exit(1)
+    elif expected_type is bool:
+        if not isinstance(value, bool):
+            print(f"Error: '{name}' in {context} must be a boolean (true/false), got {type(value).__name__}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+def validate_config(file_cfg: dict) -> None:
+    """
+    Validate that the loaded TOML only contains known options
+    and that their types are correct.
+    """
+    for key, value in file_cfg.items():
+        if isinstance(value, dict) and "subvolume" in value:
+            # ----- Archive section -----
+            archive_name = key
+            context = f"archive section [{archive_name}]"
+
+            for opt, opt_value in value.items():
+                if opt not in ALLOWED_ARCHIVE_OPTIONS:
+                    print(f"Error: unknown option '{opt}' in {context}", file=sys.stderr)
+                    sys.exit(1)
+                _check_type(opt, opt_value, ALLOWED_ARCHIVE_OPTIONS[opt], context)
+
+            # Extra sanity: subvolume should not be empty
+            v = value.get("subvolume", "")
+            if not v.strip():
+                print(f"Error: 'subvolume' in {context} cannot be empty", file=sys.stderr)
+                sys.exit(1)
+
+        else:
+            # ----- Global option -----
+            if key not in ALLOWED_GLOBAL_OPTIONS:
+                print(f"Error: unknown global option '{key}' in configuration file",
+                      file=sys.stderr)
+                sys.exit(1)
+            _check_type(key, value, ALLOWED_GLOBAL_OPTIONS[key], "global configuration")
+
+
 def load_toml(path: Path) -> dict[str, Any]:
     with path.open("rb") as f:
         return tomllib.load(f)
@@ -206,6 +278,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     # Load TOML
     if config_path and config_path.exists():
         file_cfg = load_toml(config_path)
+        validate_config(file_cfg)
+
         for key, value in file_cfg.items():
             if isinstance(value, dict) and "subvolume" in value:
                 raw_archives[key] = value
@@ -306,8 +380,37 @@ def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Pat
     name = f"{archive}.{timestamp()}"
     dest = snap_dir / name
     cmd = btrfs_cmd(cfg, "subvolume", "snapshot", "-r", subvol, str(dest))
-    run(cmd, cfg.get("dry_run", False), cfg["verbose"])
+    run(cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"], check=True)
     return dest
+
+def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
+    """
+    Returns (UUID, Received UUID) for a btrfs subvolume.
+    Returns (None, None) on failure.
+    """
+    try:
+        result = run(btrfs_cmd(cfg, "subvolume", "show", str(path)),
+                     dry_run=False, # this allows code to be executed properly during a dry-run
+                     verbosity=cfg["verbose"],
+                     check=True,  
+                     capture_output=True, 
+                     text=True)
+        uuid = None
+        received_uuid = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("UUID:"):
+                uuid = line.split(":", 1)[1].strip()
+            elif line.startswith("Received UUID:"):
+                val = line.split(":", 1)[1].strip()
+                received_uuid = None if val == "-" else val
+
+        # Debug level only
+        log(f"{path}: UUID={uuid}  Received UUID={received_uuid}", 3, cfg["verbose"])
+        return uuid, received_uuid
+    except Exception:
+        log(f"Failed to get UUIDs for {path}", 3, cfg["verbose"])
+        return None, None
 
 def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) -> list[Path]:
     """
@@ -434,7 +537,7 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
     log(f"{' '.join(send_cmd)}", 2, cfg["verbose"])
 
     start_time = datetime.now()
-    run(send_cmd, False, cfg["verbose"], check=True)
+    run(send_cmd, dry_run=False, verbosity=cfg["verbose"], check=True)
     elapsed = (datetime.now() - start_time).total_seconds()
 
     log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
@@ -584,7 +687,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         if p not in keep_set:
             log(f"\tPruning {p.name}", 1, cfg["verbose"])
             cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))
-            run(cmd, cfg.get("dry_run", False), cfg["verbose"], check=False)
+            run(cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"], check=False)
 
 #-----------------------------------------------------------------
 # Does all archive related actions
@@ -600,6 +703,11 @@ def process_archive(archive: dict, cfg: dict) -> None:
     backup_dir = Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None
 
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
+
+    log("Verify archivec path is a valid btrfs subvolume", 1, cfg["verbose"])
+    if not is_btrfs_subvolume(subvol, cfg):
+        print(f"Error: specified subvolume path is not a btrfs subvolume in archive {name}", file=sys.stderr)
+        sys.exit(1)
 
     # 1. Pre-snapshot hook
     log("Running pre-snapshot hook...", 1, cfg["verbose"])
@@ -767,7 +875,7 @@ Examples:
     # parse them args...
     args = parser.parse_args()
 
-    # Verbosity handling (unchanged)
+    # Verbosity handling 
     verbosity = args.verbose
     if args.debug:
         verbosity = 3
@@ -796,20 +904,9 @@ Examples:
 
     # Make sure snapshot_dir and backup_dir are valid btrfs subvolumes
     # otherwise, what are we doing here?
+    log("Verify snapshot and backups directories are valid btrfs subvolumes", 1, global_cfg["verbose"])
     for path in [ global_cfg["snapshot_dir"], global_cfg["backup_dir"] ]:
-        try:
-            result = run(btrfs_cmd(global_cfg, "subvolume", "show", str(path)),
-                         False,
-                         global_cfg["verbose"],
-                         check=False,
-                         capture_output=True,
-                         text=True
-                    )
-            if result.returncode != 0:
-                print(f"{path} is not a valid btrfs subvolume", file=sys.stderr)
-                return 1
-                                        
-        except (FileNotFoundError, Exception):
+        if not is_btrfs_subvolume(path, global_cfg):
             print(f"{path} is not a valid btrfs subvolume", file=sys.stderr)
             return 1
 
