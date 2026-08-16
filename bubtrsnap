@@ -444,11 +444,12 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
 
 def run_hook(cmd_template: str | None, mapping: dict[str, str], cfg: dict) -> None:
     if not cmd_template:
+        log(f"\tNo hook to process", 1, cfg["verbose"])
         return
     cmd = cmd_template
     for key, val in mapping.items():
         cmd = cmd.replace(f"{{{key}}}", val)
-    log(f"Running hook: {cmd}", 1, cfg["verbose"])
+    log(f"\tRunning hook: {cmd}", 1, cfg["verbose"])
     if not cfg.get("dry_run"):
         subprocess.run(cmd, shell=True, check=False)
 
@@ -793,12 +794,26 @@ Examples:
         print("No archives to process.", file=sys.stderr)
         return 1
 
-    # Create directories if needed
-    snap_dir = Path(global_cfg["snapshot_dir"])
-    if not global_cfg["dry_run"]:
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        if global_cfg.get("backup_dir"):
-            Path(global_cfg["backup_dir"]).mkdir(parents=True, exist_ok=True)
+    # Make sure snapshot_dir and backup_dir are valid btrfs subvolumes
+    # otherwise, what are we doing here?
+    for path in [ global_cfg["snapshot_dir"], global_cfg["backup_dir"] ]:
+        try:
+            result = run(btrfs_cmd(global_cfg, "subvolume", "show", str(path)),
+                         False,
+                         global_cfg["verbose"],
+                         check=False,
+                         capture_output=True,
+                         text=True
+                    )
+            if result.returncode != 0:
+                print(f"{path} is not a valid btrfs subvolume", file=sys.stderr)
+                return 1
+                                        
+        except (FileNotFoundError, Exception):
+            print(f"{path} is not a valid btrfs subvolume", file=sys.stderr)
+            return 1
+
+        log(f"{path} is a valid btrfs subvolume", 2, global_cfg["verbose"])
 
     # Process each archive fully
     for archive in archives:
