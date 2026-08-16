@@ -704,7 +704,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
 
-    log("Verify archivec path is a valid btrfs subvolume", 1, cfg["verbose"])
+    log("Verify archive path is a valid btrfs subvolume", 1, cfg["verbose"])
     if not is_btrfs_subvolume(subvol, cfg):
         print(f"Error: specified subvolume path is not a btrfs subvolume in archive {name}", file=sys.stderr)
         sys.exit(1)
