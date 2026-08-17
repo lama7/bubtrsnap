@@ -117,12 +117,12 @@ def format_duration(seconds: float) -> str:
 # makes sure the dir is a subvolume, errors out if not
 def chk_btrfs_subvolume(dir: Path, cfg: dict) -> bool:
     try:
-        result = run(btrfs_cmd(cfg, "subvolume", "show", str(dir)),
-                     dry_run=False,
-                     verbosity=cfg["verbose"],
-                     stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL,
-                     check=True)
+        run(btrfs_cmd(cfg, "subvolume", "show", str(dir)),
+            dry_run=False,
+            verbosity=cfg["verbose"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True)
         log(f"\t{dir} is a valid btrfs subvolume", 2, cfg["verbose"])
                                     
     except subprocess.CalledProcessError:
@@ -387,7 +387,7 @@ def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Pat
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
-    except:
+    except subprocess.CalledProcessError:
         print(f"Error executing `{cmd}`")
         sys.exit(1)
 
@@ -418,7 +418,7 @@ def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
         # Debug level only
         log(f"{path}: UUID={uuid}  Received UUID={received_uuid}", 3, cfg["verbose"])
         return uuid, received_uuid
-    except Exception:
+    except subprocess.CalledExceptionError:
         log(f"Failed to get UUIDs for {path}", 3, cfg["verbose"])
         return None, None
 
@@ -558,7 +558,7 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
             verbosity=cfg["verbose"],
             stderr=subprocess.DEVNULL,
             check=True)
-    except:
+    except subprocess.CalledProcessError:
         print(f"Error with `{send_cmd}`")
         sys.exit(1)
 
@@ -718,8 +718,8 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=True)
-            except:
-                print(f"Error with during prune: `{cmd}`")
+            except subprocess.CalledProcessError:
+                print(f"Error during prune: `{cmd}`")
                 sys.exit(1)
 
 #-----------------------------------------------------------------
