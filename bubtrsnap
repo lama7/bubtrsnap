@@ -114,20 +114,20 @@ def format_duration(seconds: float) -> str:
         secs = remaining % 60
         return f"{hours}h {minutes}m {secs:.1f}s"
 
-def is_btrfs_subvolume(directory: Path, cfg: dict) -> bool:
+# makes sure the dir is a subvolume, errors out if not
+def chk_btrfs_subvolume(dir: Path, cfg: dict) -> bool:
     try:
-        result = run(btrfs_cmd(cfg, "subvolume", "show", str(directory)),
+        result = run(btrfs_cmd(cfg, "subvolume", "show", str(dir)),
                      dry_run=False,
                      verbosity=cfg["verbose"],
-                     check=False,
-                     capture_output=True,
-                     text=True
-                )
-        return result.returncode == 0
+                     stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL,
+                     check=True)
+        log(f"\t{dir} is a valid btrfs subvolume", 2, cfg["verbose"])
                                     
-    except (FileNotFoundError, Exception):
-        print(f"{directory} is not a valid btrfs subvolume", file=sys.stderr)
-        return False
+    except subprocess.CalledProcessError:
+        print(f"\tError: {dir} is not a btrfs subvolume", file=sys.stderr)
+        sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Configuration Processing
@@ -380,7 +380,17 @@ def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Pat
     name = f"{archive}.{timestamp()}"
     dest = snap_dir / name
     cmd = btrfs_cmd(cfg, "subvolume", "snapshot", "-r", subvol, str(dest))
-    run(cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"], check=True)
+    try:
+        run(cmd, 
+            dry_run=cfg.get("dry_run", False),
+            verbosity=cfg["verbose"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+    except:
+        print(f"Error executing `{cmd}`")
+        sys.exit(1)
+
     return dest
 
 def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
@@ -485,8 +495,13 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path, cfg: dict, arc
 
     start_time = datetime.now()
 
-    send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
-    recv_proc = subprocess.Popen(recv_cmd, stdin=send_proc.stdout)
+    send_proc = subprocess.Popen(send_cmd,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+    recv_proc = subprocess.Popen(recv_cmd, 
+                                 stdin=send_proc.stdout,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
     send_proc.stdout.close()
     recv_proc.communicate()
 
@@ -537,7 +552,16 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
     log(f"{' '.join(send_cmd)}", 2, cfg["verbose"])
 
     start_time = datetime.now()
-    run(send_cmd, dry_run=False, verbosity=cfg["verbose"], check=True)
+    try:
+        run(send_cmd, 
+            dry_run=False,
+            verbosity=cfg["verbose"],
+            stderr=subprocess.DEVNULL,
+            check=True)
+    except:
+        print(f"Error with `{send_cmd}`")
+        sys.exit(1)
+
     elapsed = (datetime.now() - start_time).total_seconds()
 
     log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
@@ -687,7 +711,16 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         if p not in keep_set:
             log(f"\tPruning {p.name}", 1, cfg["verbose"])
             cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))
-            run(cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"], check=False)
+            try:
+                run(cmd,
+                    dry_run=cfg.get("dry_run", False),
+                    verbosity=cfg["verbose"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True)
+            except:
+                print(f"Error with during prune: `{cmd}`")
+                sys.exit(1)
 
 #-----------------------------------------------------------------
 # Does all archive related actions
@@ -704,10 +737,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
 
-    log("Verify archive path is a valid btrfs subvolume", 1, cfg["verbose"])
-    if not is_btrfs_subvolume(subvol, cfg):
-        print(f"Error: specified subvolume path is not a btrfs subvolume in archive {name}", file=sys.stderr)
-        sys.exit(1)
+    log("Verifying archive path is a valid btrfs subvolume...", 1, cfg["verbose"])
+    chk_btrfs_subvolume(subvol, cfg)
 
     # 1. Pre-snapshot hook
     log("Running pre-snapshot hook...", 1, cfg["verbose"])
@@ -904,13 +935,9 @@ Examples:
 
     # Make sure snapshot_dir and backup_dir are valid btrfs subvolumes
     # otherwise, what are we doing here?
-    log("Verify snapshot and backups directories are valid btrfs subvolumes", 1, global_cfg["verbose"])
+    log("Verifying snapshot and backups directories are valid btrfs subvolumes...", 1, global_cfg["verbose"])
     for path in [ global_cfg["snapshot_dir"], global_cfg["backup_dir"] ]:
-        if not is_btrfs_subvolume(path, global_cfg):
-            print(f"{path} is not a valid btrfs subvolume", file=sys.stderr)
-            return 1
-
-        log(f"{path} is a valid btrfs subvolume", 2, global_cfg["verbose"])
+        chk_btrfs_subvolume(path, global_cfg)
 
     # Process each archive fully
     for archive in archives:
