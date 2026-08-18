@@ -296,6 +296,15 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     if getattr(cli, "snaps_only", False):
         global_cfg["snaps_only"] = True
     if getattr(cli, "send_to_file", None):
+        send_path = Path(cli.send_to_file)
+        print(f"{send_path}")
+        if not str(cli.send_to_file).strip():
+            print("Error: --send-to-file requires a non-empty directory path", file=sys.stderr)
+            sys.exit(1)
+        if send_path.is_file() or not send_path.is_dir():
+            print(f"Error: --send-to-file value '{send_path}' is not an existing directory",
+                  file=sys.stderr)
+            sys.exit(1)
         global_cfg["send_to_file"] = cli.send_to_file
 
     # CLI keep options
@@ -369,6 +378,15 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             "post_backup_hook": raw.get("post_backup_hook"),
             "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
         }
+
+        # Enforce mutual exclusion of snaps_only and send_to_file for this archive
+        if entry["snaps_only"] and entry["send_to_file"]:
+            print(
+                f"Error in archive {name}: 'snaps_only' and 'send_to_file' are mutually exclusive",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         resolved.append(entry)
 
     return global_cfg, resolved       
@@ -768,9 +786,17 @@ def process_archive(archive: dict, cfg: dict) -> None:
     send_to_file_dir = archive.get("send_to_file")
     snaps_only = archive.get("snaps_only", False)
 
+    # final check to make sure snaps_only and send_to_file aren't both set
+    if snaps_only and send_to_file_dir:
+        print(
+            f"Error: 'snaps_only' and 'send_to_file' are mutually exclusive "
+            f"(archive '{name}')",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if send_to_file_dir:
         send_to_file_dir = Path(send_to_file_dir)
-        send_to_file_dir.mkdir(parents=True, exist_ok=True)
 
         log(f"Sending stream to directory {send_to_file_dir}...", 1, cfg["verbose"])
         try:
@@ -905,6 +931,15 @@ Examples:
 
     # parse them args...
     args = parser.parse_args()
+
+    # Enforce CLI mutual exclusion and single-archive restriction for --send-to-file
+    if args.send_to_file and args.snaps_only:
+        print("Error: --send-to-file and --snaps-only are mutually exclusive", file=sys.stderr)
+        return 1
+ 
+    if args.send_to_file and args.archives and len(args.archives) > 1:
+        print("Error: --send-to-file may be used with only one archive", file=sys.stderr)
+        return 1
 
     # Verbosity handling 
     verbosity = args.verbose
