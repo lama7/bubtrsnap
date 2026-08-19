@@ -7,16 +7,15 @@ Grok.  It is a python3 based project and is a superior implenatation, imho.
 More formally, bubtrsnap is a(nother) btrfs snapshot and backup management
 script.  Like btrbu before it, bubtrsnap will bootstrap itself if no backups
 exist and uses a keep policy similar to that of borg (ie- specifying a number
-        of keeps at different time intervals).  For the simplest cases, it can
-be used straight from the command line but for more sophisticated needs it uses
-a TOML formatted configuration file with a default location in a users
-`~/.config/`.
+of keeps at different time intervals).  For the simplest cases, it can be used
+straight from the command line but for more sophisticated needs it uses a TOML
+formatted configuration file with a default location in a users `~/.config/`.
 
 The information bubtrsnap needs is minimal- a snapshot directory, an archive
 name and a subvolume that the archive name is associated with.  If a backup is
 desired, then a backup path must also be specified.  It is a btrfs specific
 utility and takes advantage of the `send` and `receive` commands to aid with
-making backups.  From a configuration file, hooks are availabe at different
+making backups.  From a configuration file, hooks are available at different
 stages to enhance it's capabilities via scripts or other command line
 utilities.  For instance, a snapshot can be taken and then a hook used to
 invoke a [borgbackup][] command using the just created snapshot as a source.
@@ -34,18 +33,18 @@ For simple snapshot and backup needs, a command can be as simple as:
 
 bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup archive1=/path/to/subvolume
 
-
 Assuming a start from nothing, this will take a snapshot of
 `/path/to/subvolume` and place it in `/pool/snapshots` with a timestamp suffix.
 So the snapshot name will be of the form `archive.YYYYMMddhhmm`.  This snapshot
-will then be used to send a full backup to `/backup`. 
+will then be used to send a full backup to `/backup`. All of these locations **must**
+be valid btrfs subvolumes.
 
 Subsequent use of this same command will result in incremental backups which
 will just advance the timestamp associated with the archive.  By default,
-     previous snapshots and backups are retained so that bubtrsnap can take
-     advantage of btrfs' incremental send and receive capabilities.  Each prior
-     snapshot and backup becomes either a parent or source.  See [keep
-     policy][] below for how to change the keep behavior.
+previous snapshots and backups are retained so that bubtrsnap can take
+advantage of btrfs' incremental send and receive capabilities.  Each prior
+snapshot and backup becomes either a parent or source.  See [keep policy][]
+below for how to change the keep behavior.
 
 [keep policy]: #keep-policy
 
@@ -108,9 +107,32 @@ option specification.  So if setting up a new archive, setting a new
 things in the configuration file.  The order of precedencee is CLI > archive
 specific > global.
 
+Using the above configuration snippet as an reference, the following command is
+now possible:
+
+    bubtrsnap archive1
+
+The above command would cause only archive1 to be processed.  Normal
+configuration settings still apply, except because the CLI has highest
+precedence, bubtrsnap will only process the named archive in the commmand.  To
+process all archives in the configuration file:
+
+    bubtrsnap
+
+or to process 2:
+
+    bubtrsnap archive2 archive3
+
+Want to change the keep all archives?
+
+    bubtrnap keep-daily 5 keep-weekly 2
+
+Note that this policy is only used for that 1 command.  No alterations are made
+to the configuration file.
+
 Archive sections are defined be a header which names the archive and then a
 `subvolume = "/path/to/subvolume"` entry.  Within an archive section, all key
-value paris are specific to that archive.  Options set in the archive take
+value pairs are specific to that archive.  Options set in the archive take
 precedence over global settings.
 
 An important concept to keep in mind when using bubtrsnap is this idea of
@@ -140,7 +162,7 @@ the ability of btrfs to send it's data to a file rather than another btrfs
 filesystem. This is to facilitate backups of very large archives where a raw
 send-receive could get interrupted due to the time it takes for the transfer.
 This option is still being developed but as of now, the option takes a
-directory destination for the resulting file of the `btrfs send -f` command.
+directory destination for the resulting file of the `btrfs send -f` command.  
 The command will include a parent subvolume or clone sources so the resulting
 file can contain incremental information to be used.  Finally, no `btrfs
 receive` operation is performed, only the file is created. It is left to the
@@ -155,8 +177,29 @@ an archive like so:
     send_to_file = "/home/user/btrfsfiles"
 ```
 
+If the `send_to_file` option is present for an archive, effectively the `backup_dir` 
+option is overridden.  So no receive operation is performed.  If `send_to_file` is 
+set in the global section like below:
+
+```
+    backup_dir = "/pool/backups"
+    snapshot_dir = "/snapshots"
+    sudo = true
+    send_to_file = "~/btrfsstreams"
+
+    [archive1]
+    subvolume = "~/another/silly/path"
+    .
+    .
+    .
+```
+
+Then the setting will apply to **ALL** archive in the configuration and can only be 
+overridden by an archive specific `send_to_file` setting.
+
 The option is mutually exclusive with the `--snaps-only` option and when used
-on the command line, only 1 `archive=subvolume` may be specified.  If either of
+on the command line, only 1 `archive=subvolume`, or alternatively the name of
+an archive section in the configuration file, may be specified.  If either of
 these options is also used in the command line then bubtrsnap exits with an
 error.
 
@@ -214,6 +257,10 @@ When specified globally it is processed first, before any archives.  When
 specified on an individual archive, snapshot creation and the associated
 pre-/post-snapshot hooks are skipped; only the receive, the post-backup hook
 (if any) and the keep policy are executed.
+
+USAGE NOTE:  It is not possible to link the output from a `send_to_file` operation
+to a `receive_from_file` operation in a single command.  That said, the resulting
+file from from a `send_to_file` can be used in a subsequent `receive_from_file`.
 
 Keep Policy
 -----------
