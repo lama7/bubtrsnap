@@ -26,6 +26,7 @@ DEFAULT_CONFIG = {
     "sudo": False,
     "snaps_only": False,
     "send_to_file": None,
+    "receive_from_file": None,
     # Global default keep policy
     "keep_hourly": 0,
     "keep_daily": 0,
@@ -123,6 +124,53 @@ def chk_is_dir(path: str):
               file=sys.stderr)
         sys.exit(1)
 
+def is_btrfs_stream(path: Path, cfg: dict) -> bool:
+    """
+    Return True if the file is a valid btrfs send stream.
+    Uses `btrfs receive --dump -f` for reliable detection.
+    """
+    cmd = btrfs_cmd(cfg, "receive", "--dump", "-f", str(path))
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
+
+def collect_stream_files(path: str | Path, cfg: dict) -> list[Path]:
+    """
+    Accept a file or directory.
+    Return sorted list of valid btrfs stream files.
+    Print discoveries to STDOUT. Exit if none found.
+    """
+    p = Path(path)
+    streams: list[Path] = []
+
+    if p.is_file():
+        if not is_btrfs_stream(p, cfg):
+            print(f"Error: '{p}' is not a valid btrfs send stream", file=sys.stderr)
+            sys.exit(1)
+        streams = [p]
+        print(f"Found stream file: {p}")
+    elif p.is_dir():
+        for candidate in sorted(p.iterdir()):
+            if candidate.is_file() and is_btrfs_stream(candidate, cfg):
+                streams.append(candidate)
+                print(f"Found stream file: {candidate}")
+        if not streams:
+            print(f"Error: no btrfs send stream files found in directory '{p}'",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Error: '{p}' is neither a file nor a directory", file=sys.stderr)
+        sys.exit(1)
+
+    return streams
+
 # makes sure the dir is a subvolume, errors out if not
 def chk_btrfs_subvolume(dir: Path, cfg: dict):
     try:
@@ -135,7 +183,8 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
         log(f"\t{dir} is a valid btrfs subvolume", 2, cfg["verbose"])
                                     
     except subprocess.CalledProcessError:
-        print(f"\tError: {dir} is not a btrfs subvolume", file=sys.stderr)
+        print(f"Error: '{dir}' is not a btrfs subvolume "
+        f"(required for snapshot/backup/receive operations)", file=sys.stderr)
         sys.exit(1)
 
 # ---------------------------------------------------------------------------
@@ -147,6 +196,7 @@ ALLOWED_GLOBAL_OPTIONS = {
     "sudo": bool,
     "snaps_only": bool,
     "send_to_file": str,
+    "receive_from_file": str,
     "keep_hourly": int,
     "keep_daily": int,
     "keep_weekly": int,
@@ -160,6 +210,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "subvolume": str,
     "snaps_only": bool,
     "send_to_file": str,
+    "receive_from_file": str,
     "pre_snapshot_hook": str,
     "post_snapshot_hook": str,
     "post_backup_hook": str,
@@ -312,6 +363,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     if getattr(cli, "send_to_file", None):
         chk_is_dir(cli.send_to_file)
         global_cfg["send_to_file"] = cli.send_to_file
+    if getattr(cli, "receive_from_file", None):
+        global_cfg["receive_from_file"] = cli.receive_from_file
 
     # CLI keep options
     cli_keeps = {}
@@ -380,6 +433,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             "snaps_only": True if getattr(cli, "snaps_only", False) else raw.get("snaps_only", global_cfg.get("snaps_only", False)),
             "send_to_file": cli.send_to_file if getattr(cli, "send_to_file", None) else raw.get("send_to_file", global_cfg.get("send_to_file")),
             "pre_snapshot_hook": raw.get("pre_snapshot_hook"),
+            "receive_from_file": raw.get("receive_from_file"),
             "post_snapshot_hook": raw.get("post_snapshot_hook"),
             "post_backup_hook": raw.get("post_backup_hook"),
             "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
@@ -395,6 +449,14 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                     file=sys.stderr,
                 )
                 sys.exit(1)
+        # Enforce mutual exclusion with receive_from_file
+        if entry.get("receive_from_file") and (entry["snaps_only"] or entry.get("send_to_file")):
+            print(
+                f"Error in archive {name}: 'receive_from_file' is mutually exclusive "
+                f"with 'snaps_only' and 'send_to_file'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
         resolved.append(entry)
 
@@ -596,6 +658,66 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
 
     return stream_file
 
+def receive_stream(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
+    """
+    Execute `btrfs receive -f <stream> <backup_dir>`.
+    Returns the received subvolume basename on success, None on 'already exists'.
+    Aborts the whole program on any other error.
+    """
+    recv_cmd = btrfs_cmd(cfg, "receive", "-f", str(stream), str(backup_dir))
+
+    if cfg.get("dry_run"):
+        log(f"[dry-run] {' '.join(recv_cmd)}", 2, cfg["verbose"])
+        return stream.stem
+
+    log(f"{' '.join(recv_cmd)}", 2, cfg["verbose"])
+    start = datetime.now()
+
+    result = subprocess.run(
+        recv_cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    elapsed = (datetime.now() - start).total_seconds()
+    log(f"btrfs receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+
+    stderr = (result.stderr or "").strip()
+
+    if result.returncode != 0:
+        if "already exists" in stderr.lower():
+            print(f"Warning: subvolume from '{stream.name}' already exists in "
+                  f"{backup_dir} – skipping", file=sys.stderr)
+            return None
+        print(f"Error receiving '{stream}':\n{stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract subvolume name reported by btrfs
+    subvol_name = None
+    for line in stderr.splitlines():
+        line = line.strip()
+        if "At subvol" in line or "Receiving subvol" in line:
+            parts = line.split()
+            for i, tok in enumerate(parts):
+                if tok in ("subvol", "subvolume") and i + 1 < len(parts):
+                    subvol_name = parts[i + 1].strip("'\"")
+                    break
+        if subvol_name:
+            break
+
+    if not subvol_name:
+        subvol_name = stream.stem
+
+    log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
+    return subvol_name
+
+def archive_name_from_received(name: str) -> str:
+    """Extract archive portion from conventional {archive}.{timestamp} name."""
+    if "." in name:
+        return name.rsplit(".", 1)[0]
+    return name
+
 def run_hook(cmd_template: str | None, mapping: dict[str, str], cfg: dict) -> None:
     if not cmd_template:
         log(f"\tNo hook to process", 1, cfg["verbose"])
@@ -789,6 +911,37 @@ def process_archive(archive: dict, cfg: dict) -> None:
     log("Verifying archive path is a valid btrfs subvolume...", 1, cfg["verbose"])
     chk_btrfs_subvolume(subvol, cfg)
 
+    # ----- receive_from_file path (skips snapshot + pre/post-snapshot hooks) -----
+    receive_path = archive.get("receive_from_file")
+    if receive_path:
+        if not cfg.get("backup_dir"):
+            print(f"Error: archive '{name}' has receive_from_file but no backup_dir",
+                  file=sys.stderr)
+            sys.exit(1)
+        backup_dir = Path(cfg["backup_dir"])
+        chk_btrfs_subvolume(backup_dir, cfg)
+
+        p = Path(receive_path)
+        if not p.is_file() or not is_btrfs_stream(p, cfg):
+            print(f"Error: archive '{name}' receive_from_file must be a single "
+                  f"valid btrfs stream file", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Found stream file: {p}")
+        received = receive_stream(p, backup_dir, cfg)
+        if received:
+            arch = archive_name_from_received(received)
+            run_hook(archive.get("post_backup_hook"), {
+                "backup": str(backup_dir / received),
+                "snapshot": "",
+                "archive": arch,
+                "timestamp": timestamp(),
+                "snapshotdir": str(Path(cfg.get("snapshot_dir") or "")),
+                "backupdir": str(backup_dir),
+            }, cfg)
+            apply_keep_policy(backup_dir, arch, archive["keep"], cfg)
+        return
+
     # 1. Pre-snapshot hook
     log("Running pre-snapshot hook...", 1, cfg["verbose"])
     run_hook(archive.get("pre_snapshot_hook"), {
@@ -918,6 +1071,14 @@ Examples:
              "Only one archive may be specified when using this option."
     )
     parser.add_argument(
+        "--receive-from-file",
+        type=str,
+        metavar="PATH",
+        help="Receive btrfs send stream(s) from FILE or DIRECTORY into --backup-dir. "
+             "Mutually exclusive with --snaps-only and --send-to-file. "
+             "When given on the CLI only the receive operation is performed."
+    )
+    parser.add_argument(
         "--sudo",
         action="store_true",
         help="Run btrfs commands with 'sudo -n'"
@@ -963,6 +1124,16 @@ Examples:
     # parse them args...
     args = parser.parse_args()
 
+    # Enforce CLI mutual exclusion for receive-from-file
+    if getattr(args, "receive_from_file", None) and args.snaps_only:
+        print("Error: --receive-from-file and --snaps-only are mutually exclusive",
+              file=sys.stderr)
+        return 1
+    if getattr(args, "receive_from_file", None) and args.send_to_file:
+        print("Error: --receive-from-file and --send-to-file are mutually exclusive",
+              file=sys.stderr)
+        return 1
+
     # Enforce CLI mutual exclusion and single-archive restriction for --send-to-file
     if args.send_to_file and args.snaps_only:
         print("Error: --send-to-file and --snaps-only are mutually exclusive", file=sys.stderr)
@@ -990,6 +1161,49 @@ Examples:
 
     global_cfg["verbose"] = verbosity
     global_cfg["dry_run"] = args.dry_run
+
+    # ----- Pure CLI receive-from-file mode -----
+    if getattr(args, "receive_from_file", None):
+        if not global_cfg.get("backup_dir"):
+            print("Error: --receive-from-file requires --backup-dir", file=sys.stderr)
+            return 1
+        backup_dir = Path(global_cfg["backup_dir"])
+        chk_btrfs_subvolume(backup_dir, global_cfg)
+
+        streams = collect_stream_files(args.receive_from_file, global_cfg)
+
+        cli_keeps = {}
+        for key in ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"):
+            val = getattr(args, key, None)
+            if val is not None:
+                cli_keeps[key] = val
+        keep = resolve_keep_policy({}, global_cfg, cli_keeps)
+
+        for stream in streams:
+            received = receive_stream(stream, backup_dir, global_cfg)
+            if received:
+                arch = archive_name_from_received(received)
+                apply_keep_policy(backup_dir, arch, keep, global_cfg)
+
+        log("All receive-from-file operations completed.", 1, global_cfg["verbose"])
+        return 0
+
+    # ----- Global config receive_from_file (runs before any archives) -----
+    if global_cfg.get("receive_from_file"):
+        if not global_cfg.get("backup_dir"):
+            print("Error: receive_from_file requires backup_dir", file=sys.stderr)
+            return 1
+        backup_dir = Path(global_cfg["backup_dir"])
+        chk_btrfs_subvolume(backup_dir, global_cfg)
+
+        streams = collect_stream_files(global_cfg["receive_from_file"], global_cfg)
+        keep = {k: global_cfg.get(k, 0) for k in
+                ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly")}
+        for stream in streams:
+            received = receive_stream(stream, backup_dir, global_cfg)
+            if received:
+                arch = archive_name_from_received(received)
+                apply_keep_policy(backup_dir, arch, keep, global_cfg)
 
     if not global_cfg.get("snapshot_dir"):
         print("--snapshot-dir is required", file=sys.stderr)
