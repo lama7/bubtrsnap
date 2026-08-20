@@ -1038,7 +1038,7 @@ Examples:
   bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup home=/home
   bubtrsnap --config=~/.config/bubtrsnap.toml
   bubtrsnap -v --snaps-only root=/
-  bubtrsnap --send-to-file /filefor/streamdata maildir=/home/user/Maildir
+  bubtrsnap --send-to-file /dirfor/streamdata/file/ maildir=/home/user/Maildir
         """
     )
 
