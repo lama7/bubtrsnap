@@ -883,6 +883,15 @@ def run_hook(cmd_template: str | None, mapping: dict[str, str], cfg: dict) -> No
 # ---------------------------------------------------------------------------
 #
 # keep policy helpers
+_KEEP_REASON = {
+    "h": "hourly",
+    "d": "daily",
+    "w": "weekly",
+    "m": "monthly",
+    "y": "yearly",
+    "1": "newest",
+}
+
 def parse_ts(name: str) -> datetime | None:
     try:
         # expected form archive.YYYYMMDDHHMM
@@ -1007,16 +1016,22 @@ def _get_keeps(
 
 def build_keep_set(ts_list: list[str], keep: dict) -> dict[str, str]:
     """
-    Port of btrbu bldKeepList.
+    Port of btrbu bldKeepList (table-driven interval loop).
+
     ts_list: sorted ascending list of 'YYYYMMDDHHMM' strings.
     Returns dict { timestamp_str: reason } for timestamps to keep.
+
+    When every keep_* is 0, returns {newest: "d"} for pure-function callers;
+    apply_keep_policy skips pruning entirely when all counts are 0.
     """
-    keep_hourly = keep.get("keep_hourly", 0)
-    keep_daily = keep.get("keep_daily", 0)
-    keep_weekly = keep.get("keep_weekly", 0)
-    keep_monthly = keep.get("keep_monthly", 0)
-    keep_yearly = keep.get("keep_yearly", 0)
-    total = keep_hourly + keep_daily + keep_weekly + keep_monthly + keep_yearly
+    counts = {
+        "h": keep.get("keep_hourly", 0),
+        "d": keep.get("keep_daily", 0),
+        "w": keep.get("keep_weekly", 0),
+        "m": keep.get("keep_monthly", 0),
+        "y": keep.get("keep_yearly", 0),
+    }
+    total = sum(counts.values())
 
     if not ts_list:
         return {}
@@ -1028,81 +1043,88 @@ def build_keep_set(ts_list: list[str], keep: dict) -> dict[str, str]:
         keeps[newest] = "d"
         return keeps
 
-    # Always keep the most recent
+    # Always keep the most recent (reason filled by first active interval)
     keeps[newest] = "1"
 
     if total == 1:
-        keeps[newest] = "d"
+        for label, n in counts.items():
+            if n:
+                keeps[newest] = label
+                break
         return keeps
 
+    # (label, count, step_fn, start_fn(newest, oldest_keep) -> ts_start)
+    # start_fn encodes btrbu's per-interval seed boundary.
+    intervals = [
+        (
+            "h",
+            counts["h"],
+            _prev_hour,
+            lambda newest, _old: _prev_hour(newest, 1),
+        ),
+        (
+            "d",
+            counts["d"],
+            _prev_day,
+            lambda newest, _old: _prev_day(newest, 1),
+        ),
+        (
+            "w",
+            counts["w"],
+            _prev_week,
+            lambda newest, old: _prev_week(_prev_day(old or newest, 1), 0),
+        ),
+        (
+            "m",
+            counts["m"],
+            _prev_month,
+            lambda newest, old: _prev_month(_prev_day(old or newest, 1), 0),
+        ),
+        (
+            "y",
+            counts["y"],
+            _prev_year,
+            lambda newest, old: _prev_year(_prev_day(old or newest, 1), 0),
+        ),
+    ]
+
     oldest_keep: str | None = None
+    prior_total = 0  # sum of counts for shorter intervals already considered
 
-    if keep_hourly:
-        keeps[newest] = "h"
-        if keep_hourly == 1:
-            oldest_keep = newest
-        else:
-            oldest_keep = _get_keeps(
-                ts_list, keeps, keep_hourly - 1,
-                _prev_hour(newest, 1), "h", _prev_hour,
-            )
+    for label, count, step_fn, start_fn in intervals:
+        if count <= 0:
+            continue
 
-    if keep_daily:
-        dkeepn = keep_daily
         if keeps.get(newest) == "1":
-            keeps[newest] = "d"
-        if keep_hourly == 0:
-            dkeepn -= 1
-        if dkeepn == 0:
-            oldest_keep = newest
-        else:
-            oldest_keep = _get_keeps(
-                ts_list, keeps, dkeepn,
-                _prev_day(newest, 1), "d", _prev_day,
-            )
+            keeps[newest] = label
 
-    if keep_weekly:
-        wkeepn = keep_weekly
-        if keeps.get(newest) == "1":
-            keeps[newest] = "w"
-        if keep_hourly + keep_daily == 0:
-            wkeepn -= 1
-        if wkeepn == 0:
-            oldest_keep = newest
-        else:
-            base = oldest_keep or newest
-            oldest_keep = _get_keeps(
-                ts_list, keeps, wkeepn,
-                _prev_week(_prev_day(base, 1), 0), "w", _prev_week,
-            )
+        # Newest consumes one slot of the shortest active interval only
+        n = count
+        if prior_total == 0:
+            n = count - 1
 
-    if keep_monthly:
-        mkeepn = keep_monthly
-        if keeps.get(newest) == "1":
-            keeps[newest] = "m"
-        if keep_hourly + keep_daily + keep_weekly == 0:
-            mkeepn -= 1
-        if mkeepn == 0:
+        if n <= 0:
             oldest_keep = newest
-        else:
-            base = oldest_keep or newest
-            oldest_keep = _get_keeps(
-                ts_list, keeps, mkeepn,
-                _prev_month(_prev_day(base, 1), 0), "m", _prev_month,
-            )
+            prior_total += count
+            continue
 
-    if keep_yearly:
-        ykeepn = keep_yearly
-        if keeps.get(newest) == "1":
-            keeps[newest] = "y"
-        if keep_hourly + keep_daily + keep_weekly + keep_monthly == 0:
-            ykeepn -= 1
-        if ykeepn != 0:
-            base = oldest_keep or newest
-            _get_keeps(
-                ts_list, keeps, ykeepn,
-                _prev_year(_prev_day(base, 1), 0), "y", _prev_year,
-            )
+        # Hourly: btrbu always treats newest as the first hourly when hourly > 0
+        if label == "h":
+            if count == 1:
+                oldest_keep = newest
+                prior_total += count
+                continue
+            n = count - 1
+
+        oldest_keep = _get_keeps(
+            ts_list,
+            keeps,
+            n,
+            start_fn(newest, oldest_keep),
+            label,
+            step_fn,
+        )
+        prior_total += count
 
     return keeps
 
@@ -1118,9 +1140,13 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         keep.get("keep_monthly", 0),
         keep.get("keep_yearly", 0),
     ]
-
     if not any(v > 0 for v in keep_values):
-        log(f"No keep policy specified for {archive} – skipping pruning", 1, cfg["verbose"])
+        log(
+            f"No keep policy specified for {archive} – skipping pruning "
+            f"(default: leave existing snapshots/backups untouched)",
+            1,
+            cfg["verbose"],
+        )
         return
 
     log(f"Keep policy for {archive}: {format_keep_policy(keep)}", 1, cfg["verbose"])
@@ -1134,13 +1160,13 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
     # ascending timestamp order (btrbu style)
     items.sort(key=lambda x: x[0])
     ts_list = [t for t, _ in items]
-    path_by_ts = {t: p for t, p in items}
 
     keeps = build_keep_set(ts_list, keep)
 
     for t, p in items:
         if t in keeps:
-            log(f"\tKeeping {p.name} ({keeps[t]})", 1, cfg["verbose"])
+            reason = _KEEP_REASON.get(keeps[t], keeps[t])
+            log(f"\tKeeping {p.name} ({reason})", 1, cfg["verbose"])
         else:
             log(f"\tPruning {p.name}", 1, cfg["verbose"])
             cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))

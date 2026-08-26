@@ -265,14 +265,15 @@ file from from a `send_to_file` can be used in a subsequent `receive_from_file`.
 Keep Policy
 -----------
 
-The keep policy for bubtrsnap is similar to [borgbackup][].  It uses hourly,
-daily, weekly, monthly and yearly timeframes to determine what to keep.  The
-relevant options are `keep-hourly`, `keep-daily`, `keep-weekly`, `keep-monthly`
-and `keep-yearly` and the value assigned is the number of snapshots and backups
-to keep at that particular timeframe. The timeframes are applied from shortest
-to longest and there is no overlap, meaning a snapshot/backup kept because of a
-daily keep doesn't count towards a weekly or monthly keep.  The keep is ALWAYS
-the most recent available for a given timeframe.
+The keep policy for bubtrsnap is a direct port of from [btrbu][] which was
+inspired by the [borgbackup][] policy.  It uses hourly, daily, weekly, monthly
+and yearly timeframes to determine what to keep.  The relevant options are
+`keep-hourly`, `keep-daily`, `keep-weekly`, `keep-monthly` and `keep-yearly`
+and the value assigned is the number of snapshots and backups to keep at that
+particular timeframe. The timeframes are applied from shortest to longest and
+there is no overlap, meaning a snapshot/backup kept because of a daily keep
+doesn't count towards a weekly or monthly keep.  The keep is ALWAYS the most
+recent available for a given timeframe.
 
 When first starting up, a given keep timeframe will not apply until that
 timeframe becomes relevant as keeps accumulate.  So monthly keeps will not
@@ -284,6 +285,19 @@ all those and only those snapshot and backups that meet the keep policy
 criteria will be kept.  Note that the keep policy applies to BOTH snapshots AND
 backups.
 
+Keeps can be specified on the CLI or via a configuration file.  If specified on
+the CLI, keeps are dealt with as all or nothing.  That is, any keep NOT
+specified on the CLI is treated as 0 keeps at that interval.  As an example,
+consider the following CLI command:
+
+    bubtrsnap --keep-daily 5 myarchive=/some/subvolume
+
+Assuming that a snapshot directory and backup directory are properly configured
+in a configuration file, this command will only keep 5 daily snapshots for
+`myarchive`.  Any previous weekly, hourly, monthly and yearly snapshots and
+backups will be pruned.  Always perform a `--dry-run` to test the results of a
+new keep policy.
+    
 An example of a configuration file with a keep policy:
 
 ```
@@ -299,9 +313,31 @@ An example of a configuration file with a keep policy:
 
 ```
 
-The shortest keep policy time interval is 1 hour fo bubtrsnap.  So multiple
+The shortest keep policy time interval is 1 hour for bubtrsnap.  So multiple
 backups within the same hour will be subject to pruning by any keep policy.
 The most recent snapshot/backups from that hour will be kept in those cases.
+
+## Default (no keep options set)
+
+If no `keep_*` values are set on the CLI or in the config file (all remain
+`0`), **pruning is skipped**. Existing snapshots and backups are left as they
+are.
+
+## Weekly boundary
+
+**Weekly keeps are aligned to Saturday** (23:59), matching btrbu. The week
+boundary used when selecting weeklies is the most recent Saturday at or before
+a candidate timestamp.
+
+## Other boundaries
+
+| Interval | Boundary used when walking backward |
+|----------|-------------------------------------|
+| Hourly   | Previous hour at minute 59          |
+| Daily    | Previous calendar day at 23:59      |
+| Weekly   | Saturday 23:59                      |
+| Monthly  | Last day of the target month 23:59  |
+| Yearly   | December 31 23:59                   |
 
 [borgbackup]: https://borgbackup.org
 
