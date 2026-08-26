@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tomllib
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -807,8 +808,15 @@ def run_hook(cmd_template: str | None, mapping: dict[str, str], cfg: dict) -> No
         subprocess.run(cmd, shell=True, check=False)
 
 # ---------------------------------------------------------------------------
-# Keep policy (simple Borg-inspired)
+# Keep Policy- (simple Borg-inspired, ported from btrbu
+#  The implementation walks backwards using interval boundaries to help
+#  determine what gets kept after a particular keep interval is completed.
+#  The hourly boundary is the previous hour, the day is 23:59 of the previous 
+#  day, the week is Saturday 11:59:59, the month is the last day of the month
+#  the year is 12/31@23:59:59.
 # ---------------------------------------------------------------------------
+#
+# keep policy helpers
 def parse_ts(name: str) -> datetime | None:
     try:
         # expected form archive.YYYYMMDDHHMM
@@ -817,17 +825,225 @@ def parse_ts(name: str) -> datetime | None:
     except Exception:
         return None
 
+def _ts_str(dt: datetime) -> str:
+    return dt.strftime("%Y%m%d%H%M")
+
+def _parse_ts_str(ts: str) -> datetime:
+    return datetime.strptime(ts, "%Y%m%d%H%M")
+
+_ARCHIVE_TS_RE = re.compile(r"^(.+)\.(\d{12})$")
+
+def iter_archive_items(directory: Path, archive: str):
+    """Yield (timestamp_str, path) for exact archive.YYYYMMDDHHMM entries."""
+    for p in directory.iterdir():
+        if not p.is_dir() and not p.is_symlink():
+            # snapshots/backups are subvolumes (dirs); skip plain files
+            # remove this guard if you also prune stream files later
+            continue
+        m = _ARCHIVE_TS_RE.match(p.name)
+        if not m:
+            continue
+        if m.group(1) != archive:
+            continue
+        ts = m.group(2)
+        # validate it's a real datetime
+        if parse_ts(p.name) is None:
+            continue
+        yield ts, p
+
+def _prev_hour(ts: str, hrs_cnt: int) -> str:
+    t = _parse_ts_str(ts) - timedelta(hours=hrs_cnt)
+    return f"{t.year:04d}{t.month:02d}{t.day:02d}{t.hour:02d}59"
+
+def _prev_day(ts: str, days_cnt: int) -> str:
+    t = _parse_ts_str(ts) - timedelta(days=days_cnt)
+    return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
+
+def _prev_week(ts: str, week_cnt: int) -> str:
+    """Most recent Saturday at or before ts, then week_cnt weeks further back."""
+    t = _parse_ts_str(ts)
+    # Python: Monday=0 ... Sunday=6.  btrbu used Sunday=1 ... Saturday=7.
+    # Align to previous Saturday (or same day if already Saturday).
+    # Saturday in Python weekday() is 5.
+    days_since_sat = (t.weekday() - 5) % 7
+    if days_since_sat != 0:
+        t = t - timedelta(days=days_since_sat)
+    t = t - timedelta(weeks=week_cnt)
+    return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
+
+def _prev_month(ts: str, months_cnt: int) -> str:
+    """Last day of the target month (23:59), matching btrbu semantics."""
+    t = _parse_ts_str(ts)
+    # last day of current month
+    if t.month == 12:
+        last_this = datetime(t.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last_this = datetime(t.year, t.month + 1, 1) - timedelta(days=1)
+
+    if months_cnt != 0:
+        # last day of (month - months_cnt)
+        y, m = t.year, t.month - months_cnt
+        while m <= 0:
+            m += 12
+            y -= 1
+        # day=0 of next month => last day of target month
+        if m == 12:
+            t = datetime(y + 1, 1, 1) - timedelta(days=1)
+        else:
+            t = datetime(y, m + 1, 1) - timedelta(days=1)
+        return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
+    elif t.day != last_this.day:
+        # not last day of month → last day of previous month
+        t = datetime(t.year, t.month, 1) - timedelta(days=1)
+        return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
+    else:
+        return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
+
+def _prev_year(ts: str, years_cnt: int) -> str:
+    t = _parse_ts_str(ts)
+    if years_cnt != 0:
+        return f"{t.year - years_cnt:04d}12312359"
+    if t.month != 12 or t.day != 31:
+        return f"{t.year - 1:04d}12312359"
+    return f"{t.year:04d}12312359"
+
+def _get_keeps(
+    timestamps: list[str],
+    keep_tbl: dict[str, str],
+    max_keeps: int,
+    ts_start: str,
+    interval_label: str,
+    interval_f,
+) -> str | None:
+    """
+    Walk timestamps (ascending) from the newest entry <= ts_start backward,
+    keeping one per interval.  Returns the oldest timestamp kept in this pass.
+    """
+    i = len(timestamps) - 1
+    while i >= 0 and timestamps[i] > ts_start:
+        i -= 1
+    if i < 0:
+        return None
+
+    keep_cnt = 0
+    oldest_keep = None
+    while i >= 0:
+        keep_tbl[timestamps[i]] = interval_label
+        oldest_keep = timestamps[i]
+        keep_cnt += 1
+        if keep_cnt == max_keeps:
+            return oldest_keep
+        tsref = interval_f(timestamps[i], 1)
+        i -= 1
+        while i >= 0 and timestamps[i] > tsref:
+            i -= 1
+    return oldest_keep
+
+def build_keep_set(ts_list: list[str], keep: dict) -> dict[str, str]:
+    """
+    Port of btrbu bldKeepList.
+    ts_list: sorted ascending list of 'YYYYMMDDHHMM' strings.
+    Returns dict { timestamp_str: reason } for timestamps to keep.
+    """
+    keep_hourly = keep.get("keep_hourly", 0)
+    keep_daily = keep.get("keep_daily", 0)
+    keep_weekly = keep.get("keep_weekly", 0)
+    keep_monthly = keep.get("keep_monthly", 0)
+    keep_yearly = keep.get("keep_yearly", 0)
+    total = keep_hourly + keep_daily + keep_weekly + keep_monthly + keep_yearly
+
+    if not ts_list:
+        return {}
+
+    keeps: dict[str, str] = {}
+    newest = ts_list[-1]
+
+    if total == 0:
+        keeps[newest] = "d"
+        return keeps
+
+    # Always keep the most recent
+    keeps[newest] = "1"
+
+    if total == 1:
+        keeps[newest] = "d"
+        return keeps
+
+    oldest_keep: str | None = None
+
+    if keep_hourly:
+        keeps[newest] = "h"
+        if keep_hourly == 1:
+            oldest_keep = newest
+        else:
+            oldest_keep = _get_keeps(
+                ts_list, keeps, keep_hourly - 1,
+                _prev_hour(newest, 1), "h", _prev_hour,
+            )
+
+    if keep_daily:
+        dkeepn = keep_daily
+        if keeps.get(newest) == "1":
+            keeps[newest] = "d"
+        if keep_hourly == 0:
+            dkeepn -= 1
+        if dkeepn == 0:
+            oldest_keep = newest
+        else:
+            oldest_keep = _get_keeps(
+                ts_list, keeps, dkeepn,
+                _prev_day(newest, 1), "d", _prev_day,
+            )
+
+    if keep_weekly:
+        wkeepn = keep_weekly
+        if keeps.get(newest) == "1":
+            keeps[newest] = "w"
+        if keep_hourly + keep_daily == 0:
+            wkeepn -= 1
+        if wkeepn == 0:
+            oldest_keep = newest
+        else:
+            base = oldest_keep or newest
+            oldest_keep = _get_keeps(
+                ts_list, keeps, wkeepn,
+                _prev_week(_prev_day(base, 1), 0), "w", _prev_week,
+            )
+
+    if keep_monthly:
+        mkeepn = keep_monthly
+        if keeps.get(newest) == "1":
+            keeps[newest] = "m"
+        if keep_hourly + keep_daily + keep_weekly == 0:
+            mkeepn -= 1
+        if mkeepn == 0:
+            oldest_keep = newest
+        else:
+            base = oldest_keep or newest
+            oldest_keep = _get_keeps(
+                ts_list, keeps, mkeepn,
+                _prev_month(_prev_day(base, 1), 0), "m", _prev_month,
+            )
+
+    if keep_yearly:
+        ykeepn = keep_yearly
+        if keeps.get(newest) == "1":
+            keeps[newest] = "y"
+        if keep_hourly + keep_daily + keep_weekly + keep_monthly == 0:
+            ykeepn -= 1
+        if ykeepn != 0:
+            base = oldest_keep or newest
+            _get_keeps(
+                ts_list, keeps, ykeepn,
+                _prev_year(_prev_day(base, 1), 0), "y", _prev_year,
+            )
+
+    return keeps
+
 def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> None:
     """
     Apply the given keep policy to snapshots or backups of an archive.
-    
-    keep = {
-        "keep_hourly": int,
-        "keep_daily": int,
-        "keep_weekly": int,
-        "keep_monthly": int,
-        "keep_yearly": int,
-    }
+    Uses the btrbu algorithm (non-overlapping interval slots from newest backward).
     """
     keep_values = [
         keep.get("keep_hourly", 0),
@@ -840,123 +1056,26 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
     if not any(v > 0 for v in keep_values):
         log(f"No keep policy specified for {archive} – skipping pruning", 1, cfg["verbose"])
         return
-    else:
-        # New logging line
-        log(f"Keep policy for {archive}: {format_keep_policy(keep)}", 1, cfg["verbose"])
 
-    # quick user info for what we're working on and where
+    log(f"Keep policy for {archive}: {format_keep_policy(keep)}", 1, cfg["verbose"])
     log(f"Applying to {archive} in {directory}:", 1, cfg["verbose"])
 
-    items = []
-    for p in directory.glob(f"{archive}.*"):
-        ts = parse_ts(p.name)
-        if ts:
-            items.append((ts, p))
-
-    items.sort(key=lambda x: x[0], reverse=True)  # newest first
-
+    items = list(iter_archive_items(directory, archive))
     if not items:
         log(f"\tNo prior archives for {archive} found in {directory}", 1, cfg["verbose"])
         return
 
-    keep_set: set[Path] = set()
-    # keep policy works from shortest to longest interval- item considered and rejected
-    # at shorter intervals shouldn't be reconsidered at longer intervals so we place them
-    # in here and use it as another condition for determining a keep
-    # this works because each interval stops processing as soon as the keep count for that
-    # interval is satisfied
-    already_rejected_set = set()
+    # ascending timestamp order (btrbu style)
+    items.sort(key=lambda x: x[0])
+    ts_list = [t for t, _ in items]
+    path_by_ts = {t: p for t, p in items}
 
-    # Hourly
-    if keep.get("keep_hourly", 0) > 0:
-        count = 0
-        last = None
-        for ts, p in items:
-            # shortest interval so no prior keeps to check for and nothing has been
-            # rejected- we'll start building those here
-            if last is None or (last - ts) >= timedelta(hours=1):
-                keep_set.add(p)
-                log(f"\tKeeping {p.name} (hourly)", 1, cfg["verbose"])
-                last = ts
-                count += 1
-                if count >= keep["keep_hourly"]:
-                    break
-            else:
-                already_rejected_set.add(p)
+    keeps = build_keep_set(ts_list, keep)
 
-    # Daily
-    if keep.get("keep_daily", 0) > 0:
-        count = 0
-        last_date = None
-        for ts, p in items:
-            d = ts.date()
-            # make sure within the interval and not already kept or considered
-            if d != last_date and p not in keep_set and p not in already_rejected_set:
-                keep_set.add(p)
-                log(f"\tKeeping {p.name} (daily)", 1, cfg["verbose"])
-                last_date = d
-                count += 1
-                if count >= keep["keep_daily"]:
-                    break
-            else:
-                already_rejected_set.add(p)
-
-    # Weekly
-    if keep.get("keep_weekly", 0) > 0:
-        count = 0
-        last = None
-        for ts, p in items:
-            # make sure within the interval and not already kept or considered
-            if ((last is None or (last - ts) >= timedelta(days=7)) 
-                and (p not in keep_set)
-                and (p not in already_rejected_set)):
-                keep_set.add(p)
-                log(f"\tKeeping {p.name} (weekly)", 1, cfg["verbose"])
-                last = ts
-                count += 1
-                if count >= keep["keep_weekly"]:
-                    break
-            else:
-                already_rejected_set.add(p)
-
-    # Monthly
-    if keep.get("keep_monthly", 0) > 0:
-        count = 0
-        last_month = None
-        for ts, p in items:
-            m = (ts.year, ts.month)
-            # make sure within the interval and not already kept or considered
-            if m != last_month and p not in keep_set and p not in already_rejected_set:
-                keep_set.add(p)
-                log(f"\tKeeping {p.name} (monthly)", 1, cfg["verbose"])
-                last_month = m
-                count += 1
-                if count >= keep["keep_monthly"]:
-                    break
-            else:
-                already_rejected_set.add(p)
-
-    # Yearly
-    if keep.get("keep_yearly", 0) > 0:
-        count = 0
-        last_year = None
-        for ts, p in items:
-            y = ts.year
-            # make sure within the interval and not already kept or considered
-            if y != last_year and p not in keep_set and p not in already_rejected_set:
-                keep_set.add(p)
-                log(f"\tKeeping {p.name} (yearly)", 1, cfg["verbose"])
-                last_year = y
-                count += 1
-                if count >= keep["keep_yearly"]:
-                    break
-
-    # Always keep the newest
-    keep_set.add(items[0][1])
-
-    # Prune everything not in the keep set
-    for ts, p in items:
-        if p not in keep_set:
+    for t, p in items:
+        if t in keeps:
+            log(f"\tKeeping {p.name} ({keeps[t]})", 1, cfg["verbose"])
+        else:
             log(f"\tPruning {p.name}", 1, cfg["verbose"])
             cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))
             try:
@@ -967,7 +1086,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
                     stderr=subprocess.DEVNULL,
                     check=True)
             except subprocess.CalledProcessError:
-                print(f"Error during prune: `{cmd}`")
+                print(f"Error during prune: `{cmd}`", file=sys.stderr)
                 sys.exit(1)
 
 #-----------------------------------------------------------------
