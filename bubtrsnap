@@ -25,8 +25,8 @@ DEFAULT_CONFIG = {
     "backup_dir": None,
     "sudo": False,
     "snaps_only": False,
-    "send_to_file": None,
-    "receive_from_file": None,
+    "send_to_dir": None,
+    "receive_from_dir": None,    
     # Global default keep policy
     "keep_hourly": 0,
     "keep_daily": 0,
@@ -115,12 +115,18 @@ def format_duration(seconds: float) -> str:
         secs = remaining % 60
         return f"{hours}h {minutes}m {secs:.1f}s"
 
-def chk_is_dir(path: str):
-    if not path or not path.strip():
-        print("Error: send_to_file value not set", file=sys.stderr)
+def expand_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    return str(Path(path).expanduser())
+
+def chk_is_dir(path: str, label: str = "directory") -> None:
+    if not path or not str(path).strip():
+        print(f"Error: {label} value not set", file=sys.stderr)
         sys.exit(1)
-    if Path(path).is_file() or not Path(path).is_dir():
-        print(f"Error: --send-to-file value '{path}' is not an existing directory",
+    p = Path(path)
+    if p.is_file() or not p.is_dir():
+        print(f"Error: {label} '{path}' is not an existing directory",
               file=sys.stderr)
         sys.exit(1)
 
@@ -141,35 +147,65 @@ def is_btrfs_stream(path: Path, cfg: dict) -> bool:
     except OSError:
         return False
 
-def collect_stream_files(path: str | Path, cfg: dict) -> list[Path]:
+def stream_snapshot_name(path: Path, cfg: dict) -> str | None:
     """
-    Accept a file or directory.
-    Return sorted list of valid btrfs stream files.
-    Print discoveries to STDOUT. Exit if none found.
+    Run `btrfs receive --dump -f <path>` and extract the snapshot name
+    from the first line of output.
+    Expected form: 'snapshot' <whitespace> <name> ...
+    Leading './' or '/' on the name are stripped.
     """
-    p = Path(path)
-    streams: list[Path] = []
+    cmd = btrfs_cmd(cfg, "receive", "--dump", "-f", str(path))
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
 
-    if p.is_file():
-        if not is_btrfs_stream(p, cfg):
-            print(f"Error: '{p}' is not a valid btrfs send stream", file=sys.stderr)
-            sys.exit(1)
-        streams = [p]
-        print(f"Found stream file: {p}")
-    elif p.is_dir():
-        for candidate in sorted(p.iterdir()):
-            if candidate.is_file() and is_btrfs_stream(candidate, cfg):
-                streams.append(candidate)
-                print(f"Found stream file: {candidate}")
-        if not streams:
-            print(f"Error: no btrfs send stream files found in directory '{p}'",
-                  file=sys.stderr)
-            sys.exit(1)
-    else:
-        print(f"Error: '{p}' is neither a file nor a directory", file=sys.stderr)
-        sys.exit(1)
+    if result.returncode != 0:
+        return None
 
-    return streams
+    first = (result.stdout or "").splitlines()
+    if not first:
+        return None
+    parts = first[0].strip().split()
+    if not parts or parts[0].lower() != "snapshot":
+        return None
+    if len(parts) < 2:
+        return None
+    name = parts[1].lstrip("./")
+    return name or None
+
+def find_newest_stream_for_archive(directory: Path, archive: str, cfg: dict) -> Path | None:
+    """
+    In directory, find the newest valid stream whose embedded snapshot name
+    belongs to the given archive (name starts with '{archive}.').
+    """
+    candidates: list[tuple[datetime, Path]] = []
+    if not directory.is_dir():
+        return None
+    for p in directory.iterdir():
+        if not p.is_file():
+            continue
+        snap_name = stream_snapshot_name(p, cfg)
+        if not snap_name:
+            continue
+        # Match archive by conventional prefix archive.TIMESTAMP
+        base = snap_name.split("/")[-1]
+        if not (base == archive or base.startswith(archive + ".")):
+            continue
+        ts = parse_ts(base)  # existing helper
+        if ts is None:
+            # fall back to file mtime
+            ts = datetime.fromtimestamp(p.stat().st_mtime)
+        candidates.append((ts, p))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 # makes sure the dir is a subvolume, errors out if not
 def chk_btrfs_subvolume(dir: Path, cfg: dict):
@@ -195,8 +231,8 @@ ALLOWED_GLOBAL_OPTIONS = {
     "backup_dir": str,
     "sudo": bool,
     "snaps_only": bool,
-    "send_to_file": str,
-    "receive_from_file": str,
+    "send_to_dir": str,
+    "receive_from_dir": str,    
     "keep_hourly": int,
     "keep_daily": int,
     "keep_weekly": int,
@@ -331,6 +367,9 @@ def parse_cli_archives(raw_args: list[str]) -> dict[str, str | None]:
             result[item] = None
     return result
 
+# ---------------------------------------------------------------------------
+# Main entry to setup archives for processing
+# ---------------------------------------------------------------------------
 def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None) -> tuple[dict, list[dict]]:
     global_cfg = DEFAULT_CONFIG.copy()
     raw_archives = {}  # name -> raw section from TOML
@@ -351,6 +390,12 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             else:
                 global_cfg[key] = value
 
+    # expand directory paths for paths specified like "~/"
+    if "send_to_dir" in global_cfg and global_cfg["send_to_dir"]:
+        global_cfg["send_to_dir"] = expand_path(global_cfg["send_to_dir"])
+    if "receive_from_dir" in global_cfg and global_cfg["receive_from_dir"]:
+        global_cfg["receive_from_dir"] = expand_path(global_cfg["receive_from_dir"])
+
     # Apply global CLI overrides
     if cli.snapshot_dir:
         global_cfg["snapshot_dir"] = cli.snapshot_dir
@@ -360,11 +405,23 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         global_cfg["sudo"] = True
     if getattr(cli, "snaps_only", False):
         global_cfg["snaps_only"] = True
-    if getattr(cli, "send_to_file", None):
-        chk_is_dir(cli.send_to_file)
-        global_cfg["send_to_file"] = cli.send_to_file
-    if getattr(cli, "receive_from_file", None):
-        global_cfg["receive_from_file"] = cli.receive_from_file
+
+    # Global CLI overrides (dirs only; file options are archive-specific)
+    if getattr(cli, "send_to_dir", None):
+        cli.send_to_dir = expand_path(cli.send_to_dir)
+        chk_is_dir(cli.send_to_dir, "send-to-dir")
+        global_cfg["send_to_dir"] = cli.send_to_dir
+    if getattr(cli, "receive_from_dir", None):
+        cli.receive_from_dir = expand_path(cli.receive_from_dir)
+        chk_is_dir(cli.receive_from_dir, "receive-from-dir")
+        global_cfg["receive_from_dir"] = cli.receive_from_dir
+
+    cli_send_file = getattr(cli, "send_to_file", None)
+    if cli_send_file:
+        cli_send_file = expand_path(cli_send_file)
+    cli_recv_file = getattr(cli, "receive_from_file", None)
+    if cli_recv_file:
+        cli_recv_file = expand_path(cli_recv_file)
 
     # CLI keep options
     cli_keeps = {}
@@ -375,6 +432,24 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
 
     # Parse CLI archives (new style)
     cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
+
+    # File options on CLI require exactly one archive
+    if cli_send_file or cli_recv_file:
+        n_cli = len(cli_archives) if cli_archives else 0
+        n_cfg = len(raw_archives)
+        if n_cli > 1:
+            print("Error: --send-to-file/--receive-from-file require exactly one archive",
+                  file=sys.stderr)
+            sys.exit(1)
+        if n_cli == 0 and n_cfg != 1:
+            print("Error: --send-to-file/--receive-from-file with no CLI archive "
+                  "require exactly one archive in the configuration file",
+                  file=sys.stderr)
+            sys.exit(1)
+        if cli_send_file and cli_recv_file and cli_send_file != cli_recv_file:
+            print("Error: --send-to-file and --receive-from-file must name the same file",
+                  file=sys.stderr)
+            sys.exit(1)
 
     archives_to_process = []
 
@@ -427,40 +502,54 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             print(f"Error: subvolume path does not exist: {subvol}", file=sys.stderr)
             sys.exit(1)
 
+        # Per-archive file options: CLI overrides archive section; never global
+        send_file = cli_send_file if cli_send_file is not None else raw.get("send_to_file")
+        recv_file = cli_recv_file if cli_recv_file is not None else raw.get("receive_from_file")
+        if send_file and recv_file and send_file != recv_file:
+            print(f"Error in archive {name}: send_to_file and receive_from_file "
+                  f"must be the same file", file=sys.stderr)
+            sys.exit(1)
+        if send_file:
+            send_file = expand_path(send_file)
+        if recv_file:
+            recv_file = expand_path(recv_file)
+
+        # Dir options from global (CLI already folded into global_cfg)
+        send_dir = global_cfg.get("send_to_dir")
+        recv_dir = global_cfg.get("receive_from_dir")
+
+        # Hard error: mixing file options with dir options
+        if (send_file or recv_file) and (send_dir or recv_dir):
+            print(f"Error: cannot mix send-to-file/receive-from-file with "
+                  f"send-to-dir/receive-from-dir (archive '{name}')",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        snaps_only = True if getattr(cli, "snaps_only", False) \
+                     else raw.get("snaps_only", global_cfg.get("snaps_only", False))
+
+        if snaps_only and (send_file or recv_file or send_dir or recv_dir):
+            print(f"Error in archive {name}: snaps_only is mutually exclusive "
+                  f"with send/receive file and directory options",
+                  file=sys.stderr)
+            sys.exit(1)
+
         entry = {
             "name": name,
             "subvolume": str(subvol_path),
-            "snaps_only": True if getattr(cli, "snaps_only", False) else raw.get("snaps_only", global_cfg.get("snaps_only", False)),
-            "send_to_file": cli.send_to_file if getattr(cli, "send_to_file", None) else raw.get("send_to_file", global_cfg.get("send_to_file")),
+            "snaps_only": snaps_only,
+            "send_to_file": send_file,
+            "receive_from_file": recv_file,
+            "send_to_dir": None if (send_file or recv_file) else send_dir,
+            "receive_from_dir": None if (send_file or recv_file) else recv_dir,
             "pre_snapshot_hook": raw.get("pre_snapshot_hook"),
-            "receive_from_file": raw.get("receive_from_file"),
             "post_snapshot_hook": raw.get("post_snapshot_hook"),
             "post_backup_hook": raw.get("post_backup_hook"),
             "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
         }
-
-        # make sure send_to_file is a valid, existing directory
-        if entry["send_to_file"]:
-            chk_is_dir(entry["send_to_file"])
-            # Enforce mutual exclusion of snaps_only and send_to_file for this archive
-            if entry["snaps_only"]:
-                print(
-                    f"Error in archive {name}: 'snaps_only' and 'send_to_file' are mutually exclusive",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-        # Enforce mutual exclusion with receive_from_file
-        if entry.get("receive_from_file") and (entry["snaps_only"] or entry.get("send_to_file")):
-            print(
-                f"Error in archive {name}: 'receive_from_file' is mutually exclusive "
-                f"with 'snaps_only' and 'send_to_file'",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
         resolved.append(entry)
 
-    return global_cfg, resolved       
+    return global_cfg, resolved
 
 # ---------------------------------------------------------------------------
 # Core operations
@@ -517,7 +606,7 @@ def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) 
     successfully received to backup_dir (matched by UUID ↔ Received UUID).
     Returns them newest-first.
     """
-    log(f"Finding parent subvolumes for {archive}", 3, cfg["verbose"])
+    log(f"Finding parent subvolumes for {archive}", 2, cfg["verbose"])
     # Collect snapshots
     snapshots = []
     for p in snapshot_dir.glob(f"{archive}.*"):
@@ -603,16 +692,14 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path, cfg: dict, arc
 
     return dest
 
-def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
-                       stream_dir: Path, cfg: dict, archive: str) -> Path:
+def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
+                       stream_file: Path, cfg: dict, archive: str) -> Path:
     """
-    Perform a btrfs send to a file (for later resumable transfer + receive).
-    Returns the path of the created .btrfs stream file.
+    btrfs send -f <stream_file>.  Errors if stream_file already exists.
     """
-    parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
+    parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
 
     send_cmd = btrfs_cmd(cfg, "send")
-
     if not parents:
         log("Full send to file (no matching parent found)", 1, cfg["verbose"])
     elif len(parents) == 1:
@@ -622,15 +709,11 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
         log(f"Incremental send to file using {len(parents)} clone sources", 1, cfg["verbose"])
         for p in parents:
             send_cmd += ["-c", str(p)]
-            log(f"  clone source: {p.name}", 3, cfg["verbose"])
 
-    stream_file = stream_dir / f"{snap.name}.btrfs"
-
-    # Safeguard against accidental overwrite
     if stream_file.exists():
-        log(f"Error: stream file already exists: {stream_file}", 1, cfg["verbose"])
-        log("Delete it manually or choose a different location if you want to recreate it.", 1, cfg["verbose"])
-        raise FileExistsError(f"Stream file already exists: {stream_file}")
+        print(f"Error: stream file already exists: {stream_file}", file=sys.stderr)
+        print("Delete it manually or choose a different path.", file=sys.stderr)
+        sys.exit(1)
 
     send_cmd += ["-f", str(stream_file), str(snap)]
 
@@ -639,23 +722,17 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path,
         return stream_file
 
     log(f"{' '.join(send_cmd)}", 2, cfg["verbose"])
-
     start_time = datetime.now()
     try:
-        run(send_cmd, 
-            dry_run=False,
-            verbosity=cfg["verbose"],
-            stderr=subprocess.DEVNULL,
-            check=True)
+        run(send_cmd, dry_run=False, verbosity=cfg["verbose"],
+            stderr=subprocess.DEVNULL, check=True)
     except subprocess.CalledProcessError:
-        print(f"Error with `{send_cmd}`")
+        print(f"Error with `{' '.join(send_cmd)}`", file=sys.stderr)
         sys.exit(1)
 
     elapsed = (datetime.now() - start_time).total_seconds()
-
     log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
     log(f"Stream file created: {stream_file}", 1, cfg["verbose"])
-
     return stream_file
 
 def receive_stream(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
@@ -898,131 +975,156 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
 #-----------------------------------------------------------------
 def process_archive(archive: dict, cfg: dict) -> None:
     """
-    Fully process a single archive:
+    Normal processing for a single archive:
     pre-hook → snapshot → post-snapshot-hook → backup → post-backup-hook → keep policy
+    If just send_to_file:
+    pre-hook -> snapshot -> post-snapshot-hook -> send backup to file -> keep for snapshots
+    If just recv_from_file:
+    backup receive from file -> post-backup-hook -> keep for backups
+    If both send_to and recv_from then same as Normal above except the backup uses a file
+    as a staging step.
+    Processing for send_to_dir and recv_from_dir uses same processing flow except it will
+    handle multiple archives versus a single archive for the file variant 
     """
     name = archive["name"]
     subvol = archive["subvolume"]
-    snap_dir = Path(cfg["snapshot_dir"])
+    snap_dir = Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None
     backup_dir = Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None
 
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
 
-    log("Verifying archive path is a valid btrfs subvolume...", 1, cfg["verbose"])
-    chk_btrfs_subvolume(subvol, cfg)
+    send_file = archive.get("send_to_file")
+    recv_file = archive.get("receive_from_file")
+    send_dir  = archive.get("send_to_dir")
+    recv_dir  = archive.get("receive_from_dir")
+    snaps_only = archive.get("snaps_only", False)
 
-    # ----- receive_from_file path (skips snapshot + pre/post-snapshot hooks) -----
-    receive_path = archive.get("receive_from_file")
-    if receive_path:
-        if not cfg.get("backup_dir"):
-            print(f"Error: archive '{name}' has receive_from_file but no backup_dir",
+    # ----- receive-only (file) -----
+    if recv_file and not send_file:
+        if not backup_dir:
+            print(f"Error: archive '{name}' receive_from_file requires backup_dir",
                   file=sys.stderr)
             sys.exit(1)
-        backup_dir = Path(cfg["backup_dir"])
         chk_btrfs_subvolume(backup_dir, cfg)
-
-        p = Path(receive_path)
+        p = Path(recv_file)
         if not p.is_file() or not is_btrfs_stream(p, cfg):
-            print(f"Error: archive '{name}' receive_from_file must be a single "
-                  f"valid btrfs stream file", file=sys.stderr)
+            print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
             sys.exit(1)
-
-        print(f"Found stream file: {p}")
         received = receive_stream(p, backup_dir, cfg)
         if received:
-            arch = archive_name_from_received(received)
             run_hook(archive.get("post_backup_hook"), {
                 "backup": str(backup_dir / received),
                 "snapshot": "",
-                "archive": arch,
+                "archive": name,
                 "timestamp": timestamp(),
-                "snapshotdir": str(Path(cfg.get("snapshot_dir") or "")),
+                "snapshotdir": str(snap_dir or ""),
                 "backupdir": str(backup_dir),
             }, cfg)
-            apply_keep_policy(backup_dir, arch, archive["keep"], cfg)
+            apply_keep_policy(backup_dir, name, archive["keep"], cfg)
         return
 
-    # 1. Pre-snapshot hook
+    # ----- receive-only (dir) -----
+    if recv_dir and not send_dir and not send_file:
+        if not backup_dir:
+            print(f"Error: receive_from_dir requires backup_dir", file=sys.stderr)
+            sys.exit(1)
+        chk_btrfs_subvolume(backup_dir, cfg)
+        stream = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
+        if not stream:
+            log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
+            return
+        log(f"Using stream {stream} for archive {name}", 1, cfg["verbose"])
+        received = receive_stream(stream, backup_dir, cfg)
+        if received:
+            run_hook(archive.get("post_backup_hook"), {
+                "backup": str(backup_dir / received),
+                "snapshot": "",
+                "archive": name,
+                "timestamp": timestamp(),
+                "snapshotdir": str(snap_dir or ""),
+                "backupdir": str(backup_dir),
+            }, cfg)
+            apply_keep_policy(backup_dir, name, archive["keep"], cfg)
+        return
+
+    # ----- paths that create a snapshot -----
+    if not snap_dir:
+        print("Error: snapshot_dir is required for snapshot/send operations",
+              file=sys.stderr)
+        sys.exit(1)
+    chk_btrfs_subvolume(Path(subvol), cfg)
+    chk_btrfs_subvolume(snap_dir, cfg)
+
     log("Running pre-snapshot hook...", 1, cfg["verbose"])
     run_hook(archive.get("pre_snapshot_hook"), {
-        "archive": name,
-        "subvol": subvol,
-        "timestamp": timestamp(),
+        "archive": name, "subvol": subvol, "timestamp": timestamp(),
         "snapshotdir": str(snap_dir),
         "backupdir": str(backup_dir) if backup_dir else "",
     }, cfg)
 
-    # 2. Create snapshot
     log("Creating snapshot...", 1, cfg["verbose"])
     snap = create_snapshot(name, subvol, snap_dir, cfg)
 
-    # 3. Post-snapshot hook
     log("Running post-snapshot hook...", 1, cfg["verbose"])
     run_hook(archive.get("post_snapshot_hook"), {
-        "snapshot": str(snap),
-        "archive": name,
-        "timestamp": timestamp(),
+        "snapshot": str(snap), "archive": name, "timestamp": timestamp(),
         "snapshotdir": str(snap_dir),
         "backupdir": str(backup_dir) if backup_dir else "",
     }, cfg)
 
-    # 4. Backup
-    send_to_file_dir = archive.get("send_to_file")
-    snaps_only = archive.get("snaps_only", False)
+    stream_path: Path | None = None
 
-    # final check to make sure snaps_only and send_to_file aren't both set
-    if snaps_only and send_to_file_dir:
-        print(
-            f"Error: 'snaps_only' and 'send_to_file' are mutually exclusive "
-            f"(archive '{name}')",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # send to explicit file
+    if send_file:
+        stream_path = Path(send_file)
+        send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name)
 
-    if send_to_file_dir:
-        send_to_file_dir = Path(send_to_file_dir)
+    # send to directory → {archive}.{timestamp}.btrfs
+    elif send_dir:
+        chk_is_dir(send_dir, "send-to-dir")
+        stream_path = Path(send_dir) / f"{snap.name}.btrfs"
+        send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name)
 
-        log(f"Sending stream to directory {send_to_file_dir}...", 1, cfg["verbose"])
-        try:
-            stream_file = send_backup_tofile(
-                snap, snap_dir, backup_dir, send_to_file_dir, cfg, name
-            )
-        except FileExistsError:
-            raise  # already logged
-
-        log("Running post-backup hook...", 1, cfg["verbose"])
-        run_hook(archive.get("post_backup_hook"), {
-            "backup": str(stream_file),
-            "snapshot": str(snap),
-            "archive": name,
-            "timestamp": timestamp(),
-            "snapshotdir": str(snap_dir),
-            "backupdir": str(send_to_file_dir),
-        }, cfg)
-
+    # normal piped send|receive
     elif not snaps_only and backup_dir:
         log("Starting backup...", 1, cfg["verbose"])
         dest = send_backup(snap, snap_dir, backup_dir, cfg, name)
-
-        log("Running post-backup hook...", 1, cfg["verbose"])
         run_hook(archive.get("post_backup_hook"), {
-            "backup": str(dest),
-            "snapshot": str(snap),
-            "archive": name,
-            "timestamp": timestamp(),
-            "snapshotdir": str(snap_dir),
+            "backup": str(dest), "snapshot": str(snap), "archive": name,
+            "timestamp": timestamp(), "snapshotdir": str(snap_dir),
             "backupdir": str(backup_dir),
         }, cfg)
-    else:
-        log("Skipping backup (snaps-only or no backup_dir)", 1, cfg["verbose"])
-
-    # 5. Apply keep policy
-    log("Applying keep policy...", 1, cfg["verbose"])
-    apply_keep_policy(snap_dir, name, archive["keep"], cfg)
-
-    if backup_dir and not snaps_only and not send_to_file_dir:
+        apply_keep_policy(snap_dir, name, archive["keep"], cfg)
         apply_keep_policy(backup_dir, name, archive["keep"], cfg)
+        log(f"Finished archive: {name}\n", 1, cfg["verbose"])
+        return
+    else:
+        # snaps_only or no backup
+        apply_keep_policy(snap_dir, name, archive["keep"], cfg)
+        log(f"Finished archive: {name}\n", 1, cfg["verbose"])
+        return
 
+    # If we sent to a file/dir, optionally receive it
+    if stream_path and (recv_file or recv_dir or send_file and recv_file):
+        # both file options → same file; both dir options → just-created file
+        if not backup_dir:
+            print("Error: receive requires backup_dir", file=sys.stderr)
+            sys.exit(1)
+        chk_btrfs_subvolume(backup_dir, cfg)
+        received = receive_stream(stream_path, backup_dir, cfg)
+        if received:
+            run_hook(archive.get("post_backup_hook"), {
+                "backup": str(backup_dir / received),
+                "snapshot": str(snap),
+                "archive": name,
+                "timestamp": timestamp(),
+                "snapshotdir": str(snap_dir),
+                "backupdir": str(backup_dir),
+            }, cfg)
+            apply_keep_policy(backup_dir, name, archive["keep"], cfg)
+
+    # keep on snapshots whenever we created one
+    apply_keep_policy(snap_dir, name, archive["keep"], cfg)
     log(f"Finished archive: {name}\n", 1, cfg["verbose"])
 
 # ---------------------------------------------------------------------------
@@ -1063,21 +1165,17 @@ Examples:
         action="store_true",
         help="Only create snapshots; skip the backup step"
     )
-    parser.add_argument(
-        "--send-to-file",
-        type=str,
-        metavar="DIR",
-        help="Send the backup stream to a file in DIR instead of btrfs receive. "
-             "Only one archive may be specified when using this option."
-    )
-    parser.add_argument(
-        "--receive-from-file",
-        type=str,
-        metavar="PATH",
-        help="Receive btrfs send stream(s) from FILE or DIRECTORY into --backup-dir. "
-             "Mutually exclusive with --snaps-only and --send-to-file. "
-             "When given on the CLI only the receive operation is performed."
-    )
+    parser.add_argument("--send-to-file", type=str, metavar="FILE",
+        help="Send stream to FILE (archive-specific). Exactly one archive required. "
+             "Mutually exclusive with --snaps-only and the *-dir options.")
+    parser.add_argument("--receive-from-file", type=str, metavar="FILE",
+        help="Receive stream from FILE (archive-specific). Exactly one archive required. "
+             "If used with --send-to-file, both must name the same file.")
+    parser.add_argument("--send-to-dir", type=str, metavar="DIR",
+        help="Write per-archive streams into DIR as {archive}.{timestamp}.btrfs. "
+             "Global; applies to CLI archives or all config archives.")
+    parser.add_argument("--receive-from-dir", type=str, metavar="DIR",
+        help="Receive newest matching stream for each archive from DIR.")
     parser.add_argument(
         "--sudo",
         action="store_true",
@@ -1124,26 +1222,30 @@ Examples:
     # parse them args...
     args = parser.parse_args()
 
-    # Enforce CLI mutual exclusion for receive-from-file
-    if getattr(args, "receive_from_file", None) and args.snaps_only:
-        print("Error: --receive-from-file and --snaps-only are mutually exclusive",
+    # various pre-checks for certain options and option combinations
+    # snaps-only and either of the send-to-* or recv-from-* don't make sense
+    # so we'll flag that...
+    if args.snaps_only and (args.send_to_file or args.receive_from_file
+                            or args.send_to_dir or args.receive_from_dir):
+        print("Error: --snaps-only is mutually exclusive with send/receive file and directory options",
               file=sys.stderr)
         return 1
-    if getattr(args, "receive_from_file", None) and args.send_to_file:
-        print("Error: --receive-from-file and --send-to-file are mutually exclusive",
+    # don't mix file specific send/recv options with dir versions of the options
+    if (args.send_to_file or args.receive_from_file) and (args.send_to_dir or args.receive_from_dir):
+        print("Error: cannot mix --send-to-file/--receive-from-file with "
+              "--send-to-dir/--receive-from-dir", file=sys.stderr)
+        return 1
+    # send-to-file and recv-from-file, if both present, must use the same file
+    if args.send_to_file and args.receive_from_file and args.send_to_file != args.receive_from_file:
+        print("Error: --send-to-file and --receive-from-file must name the same file",
               file=sys.stderr)
         return 1
 
-    # Enforce CLI mutual exclusion and single-archive restriction for --send-to-file
-    if args.send_to_file and args.snaps_only:
-        print("Error: --send-to-file and --snaps-only are mutually exclusive", file=sys.stderr)
-        return 1
- 
     if args.send_to_file and args.archives and len(args.archives) > 1:
         print("Error: --send-to-file may be used with only one archive", file=sys.stderr)
         return 1
 
-    # Verbosity handling 
+        # Verbosity handling 
     verbosity = args.verbose
     if args.debug:
         verbosity = 3
@@ -1162,50 +1264,16 @@ Examples:
     global_cfg["verbose"] = verbosity
     global_cfg["dry_run"] = args.dry_run
 
-    # ----- Pure CLI receive-from-file mode -----
-    if getattr(args, "receive_from_file", None):
-        if not global_cfg.get("backup_dir"):
-            print("Error: --receive-from-file requires --backup-dir", file=sys.stderr)
-            return 1
-        backup_dir = Path(global_cfg["backup_dir"])
-        chk_btrfs_subvolume(backup_dir, global_cfg)
+    # see if we're doing a recv only operation....
+    receive_only = all(
+        (a.get("receive_from_file") or a.get("receive_from_dir"))
+        and not a.get("send_to_file") and not a.get("send_to_dir")
+        and not a.get("snaps_only")
+        for a in archives
+    ) if archives else False
 
-        streams = collect_stream_files(args.receive_from_file, global_cfg)
-
-        cli_keeps = {}
-        for key in ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"):
-            val = getattr(args, key, None)
-            if val is not None:
-                cli_keeps[key] = val
-        keep = resolve_keep_policy({}, global_cfg, cli_keeps)
-
-        for stream in streams:
-            received = receive_stream(stream, backup_dir, global_cfg)
-            if received:
-                arch = archive_name_from_received(received)
-                apply_keep_policy(backup_dir, arch, keep, global_cfg)
-
-        log("All receive-from-file operations completed.", 1, global_cfg["verbose"])
-        return 0
-
-    # ----- Global config receive_from_file (runs before any archives) -----
-    if global_cfg.get("receive_from_file"):
-        if not global_cfg.get("backup_dir"):
-            print("Error: receive_from_file requires backup_dir", file=sys.stderr)
-            return 1
-        backup_dir = Path(global_cfg["backup_dir"])
-        chk_btrfs_subvolume(backup_dir, global_cfg)
-
-        streams = collect_stream_files(global_cfg["receive_from_file"], global_cfg)
-        keep = {k: global_cfg.get(k, 0) for k in
-                ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly")}
-        for stream in streams:
-            received = receive_stream(stream, backup_dir, global_cfg)
-            if received:
-                arch = archive_name_from_received(received)
-                apply_keep_policy(backup_dir, arch, keep, global_cfg)
-
-    if not global_cfg.get("snapshot_dir"):
+    # if not doing just a recv, then taking snapshots and snapshot_dir is needed
+    if not receive_only and not global_cfg.get("snapshot_dir"):
         print("--snapshot-dir is required", file=sys.stderr)
         return 1
 
