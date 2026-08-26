@@ -136,6 +136,27 @@ BTRFS_SEND_A_PATH = 0x000F
 # First command is tiny (path + UUIDs); 64 KiB is plenty
 _STREAM_PREFIX_SIZE = 64 * 1024
 
+# CRC32C (Castagnoli) — polynomial 0x1EDC6F41 reflected
+def _crc32c_table() -> list[int]:
+    table = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x82F63B78  # reflected Castagnoli
+            else:
+                crc >>= 1
+        table.append(crc)
+    return table
+
+_CRC32C_TAB = _crc32c_table()
+
+def crc32c(data: bytes, crc: int = 0) -> int:
+    """CRC32C with initial seed 0 (btrfs send stream convention)."""
+    for b in data:
+        crc = _CRC32C_TAB[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc & 0xFFFFFFFF
+
 def _read_file_prefix(path: Path, cfg: dict, size: int = _STREAM_PREFIX_SIZE) -> bytes | None:
     """Read the first `size` bytes of path, using sudo -n when configured."""
     path = Path(path)
@@ -176,16 +197,22 @@ def _parse_stream_prefix(data: bytes) -> str | None:
 
     if offset + 10 > len(data):
         return None
-    len_data, cmd, _crc = struct.unpack_from("<IHI", data, offset)
-    offset += 10
+    len_data, cmd, stored_crc = struct.unpack_from("<IHI", data, offset)
 
     if cmd not in (BTRFS_SEND_C_SUBVOL, BTRFS_SEND_C_SNAPSHOT):
         return None
-    if len_data <= 0 or offset + len_data > len(data):
+    if len_data <= 0 or offset + 10 + len_data > len(data):
         # Command body not fully in prefix — treat as invalid / too large
         return None
 
-    body = data[offset:offset + len_data]
+    # CRC covers command header + body, with CRC field set to 0
+    cmd_region = bytearray(data[offset:offset + 10 + len_data])
+    struct.pack_into("<I", cmd_region, 6, 0)  # zero checksum field
+    calc_crc = crc32c(bytes(cmd_region), 0)
+    if calc_crc != stored_crc:
+        return None
+
+    body = data[offset + 10:offset + 10 + len_data]
     pos = 0
     while pos + 4 <= len(body):
         tlv_type, tlv_len = struct.unpack_from("<HH", body, pos)
