@@ -317,19 +317,19 @@ The shortest keep policy time interval is 1 hour for bubtrsnap.  So multiple
 backups within the same hour will be subject to pruning by any keep policy.
 The most recent snapshot/backups from that hour will be kept in those cases.
 
-## Default (no keep options set)
+### Default (no keep options set)
 
 If no `keep_*` values are set on the CLI or in the config file (all remain
 `0`), **pruning is skipped**. Existing snapshots and backups are left as they
 are.
 
-## Weekly boundary
+### Weekly boundary
 
 **Weekly keeps are aligned to Saturday** (23:59), matching btrbu. The week
 boundary used when selecting weeklies is the most recent Saturday at or before
 a candidate timestamp.
 
-## Other boundaries
+### Other boundaries
 
 | Interval | Boundary used when walking backward |
 |----------|-------------------------------------|
