@@ -14,6 +14,7 @@ import sys
 import tomllib
 import re
 import struct
+import calendar
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,14 @@ def run(cmd: list[str],
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M")
+
+def parse_ts(name: str) -> datetime | None:
+    try:
+        # expected form archive.YYYYMMDDHHMM
+        ts = name.rsplit(".", 1)[-1]
+        return datetime.strptime(ts, "%Y%m%d%H%M")
+    except Exception:
+        return None
 
 def format_keep_policy(keep: dict) -> str:
     """Return a short human-readable summary of the keep policy."""
@@ -892,24 +901,73 @@ _KEEP_REASON = {
     "1": "newest",
 }
 
-def parse_ts(name: str) -> datetime | None:
-    try:
-        # expected form archive.YYYYMMDDHHMM
-        ts = name.rsplit(".", 1)[-1]
-        return datetime.strptime(ts, "%Y%m%d%H%M")
-    except Exception:
-        return None
-
 def _ts_str(dt: datetime) -> str:
     return dt.strftime("%Y%m%d%H%M")
 
 def _parse_ts_str(ts: str) -> datetime:
     return datetime.strptime(ts, "%Y%m%d%H%M")
 
-_ARCHIVE_TS_RE = re.compile(r"^(.+)\.(\d{12})$")
+def _end_of_hour(dt: datetime) -> datetime:
+    return dt.replace(minute=59, second=0, microsecond=0)
 
+def _end_of_day(dt: datetime) -> datetime:
+    return dt.replace(hour=23, minute=59, second=0, microsecond=0)
+
+def _prev_hour(ts: str, hrs_cnt: int) -> str:
+    t = _parse_ts_str(ts) - timedelta(hours=hrs_cnt)
+    return _ts_str(_end_of_hour(t))
+
+def _prev_day(ts: str, days_cnt: int) -> str:
+    t = _parse_ts_str(ts) - timedelta(days=days_cnt)
+    return _ts_str(_end_of_day(t))
+
+def _prev_week(ts: str, week_cnt: int) -> str:
+    """Most recent Saturday at or before ts, then week_cnt weeks further back."""
+    t = _parse_ts_str(ts)
+    # Saturday = weekday 5 (Mon=0 … Sun=6)
+    days_since_sat = (t.weekday() - 5) % 7
+    if days_since_sat != 0:
+        t = t - timedelta(days=days_since_sat)
+    t = t - timedelta(weeks=week_cnt)
+    return _ts_str(_end_of_day(t))
+
+def _last_day_of_month(year: int, month: int) -> datetime:
+    last = calendar.monthrange(year, month)[1]
+    return datetime(year, month, last, 23, 59, 0, 0)
+
+def _prev_month(ts: str, months_cnt: int) -> str:
+    """Last day of the target month (23:59), matching btrbu semantics."""
+    t = _parse_ts_str(ts)
+    last_this = _last_day_of_month(t.year, t.month)
+
+    if months_cnt != 0:
+        y, m = t.year, t.month - months_cnt
+        while m <= 0:
+            m += 12
+            y -= 1
+        return _ts_str(_last_day_of_month(y, m))
+
+    if t.day != last_this.day:
+        # not last day of month → last day of previous month
+        if t.month == 1:
+            return _ts_str(_last_day_of_month(t.year - 1, 12))
+        return _ts_str(_last_day_of_month(t.year, t.month - 1))
+
+    return _ts_str(last_this)
+
+def _prev_year(ts: str, years_cnt: int) -> str:
+    t = _parse_ts_str(ts)
+    if years_cnt != 0:
+        return _ts_str(datetime(t.year - years_cnt, 12, 31, 23, 59, 0, 0))
+    if t.month != 12 or t.day != 31:
+        return _ts_str(datetime(t.year - 1, 12, 31, 23, 59, 0, 0))
+    return _ts_str(datetime(t.year, 12, 31, 23, 59, 0, 0))
+
+_ARCHIVE_TS_RE = re.compile(r"^(.+)\.(\d{12})$")
 def iter_archive_items(directory: Path, archive: str):
     """Yield (timestamp_str, path) for exact archive.YYYYMMDDHHMM entries."""
+    if not directory.is_dir():
+        return
     for p in directory.iterdir():
         if not p.is_dir() and not p.is_symlink():
             # snapshots/backups are subvolumes (dirs); skip plain files
@@ -925,62 +983,6 @@ def iter_archive_items(directory: Path, archive: str):
         if parse_ts(p.name) is None:
             continue
         yield ts, p
-
-def _prev_hour(ts: str, hrs_cnt: int) -> str:
-    t = _parse_ts_str(ts) - timedelta(hours=hrs_cnt)
-    return f"{t.year:04d}{t.month:02d}{t.day:02d}{t.hour:02d}59"
-
-def _prev_day(ts: str, days_cnt: int) -> str:
-    t = _parse_ts_str(ts) - timedelta(days=days_cnt)
-    return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
-
-def _prev_week(ts: str, week_cnt: int) -> str:
-    """Most recent Saturday at or before ts, then week_cnt weeks further back."""
-    t = _parse_ts_str(ts)
-    # Python: Monday=0 ... Sunday=6.  btrbu used Sunday=1 ... Saturday=7.
-    # Align to previous Saturday (or same day if already Saturday).
-    # Saturday in Python weekday() is 5.
-    days_since_sat = (t.weekday() - 5) % 7
-    if days_since_sat != 0:
-        t = t - timedelta(days=days_since_sat)
-    t = t - timedelta(weeks=week_cnt)
-    return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
-
-def _prev_month(ts: str, months_cnt: int) -> str:
-    """Last day of the target month (23:59), matching btrbu semantics."""
-    t = _parse_ts_str(ts)
-    # last day of current month
-    if t.month == 12:
-        last_this = datetime(t.year + 1, 1, 1) - timedelta(days=1)
-    else:
-        last_this = datetime(t.year, t.month + 1, 1) - timedelta(days=1)
-
-    if months_cnt != 0:
-        # last day of (month - months_cnt)
-        y, m = t.year, t.month - months_cnt
-        while m <= 0:
-            m += 12
-            y -= 1
-        # day=0 of next month => last day of target month
-        if m == 12:
-            t = datetime(y + 1, 1, 1) - timedelta(days=1)
-        else:
-            t = datetime(y, m + 1, 1) - timedelta(days=1)
-        return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
-    elif t.day != last_this.day:
-        # not last day of month → last day of previous month
-        t = datetime(t.year, t.month, 1) - timedelta(days=1)
-        return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
-    else:
-        return f"{t.year:04d}{t.month:02d}{t.day:02d}2359"
-
-def _prev_year(ts: str, years_cnt: int) -> str:
-    t = _parse_ts_str(ts)
-    if years_cnt != 0:
-        return f"{t.year - years_cnt:04d}12312359"
-    if t.month != 12 or t.day != 31:
-        return f"{t.year - 1:04d}12312359"
-    return f"{t.year:04d}12312359"
 
 def _get_keeps(
     timestamps: list[str],
@@ -1144,6 +1146,14 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         log(
             f"No keep policy specified for {archive} – skipping pruning "
             f"(default: leave existing snapshots/backups untouched)",
+            1,
+            cfg["verbose"],
+        )
+        return
+
+    if not directory.is_dir():
+        log(
+            f"Directory '{directory}' does not exist – skipping keep policy for {archive}",
             1,
             cfg["verbose"],
         )
