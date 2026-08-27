@@ -1,5 +1,5 @@
 bubtrsnap
-=====
+=========
 
 Based on my previous [btrbu][] project, bubtrsnap is a rewrite of it using
 Grok.  It is a python3 based project and is a superior implenatation, imho.
@@ -26,12 +26,11 @@ python3 installation.
 
 [btrbu]: https://github.com/lama7/btrbu
 
-Usage
------
+## Usage
 
 For simple snapshot and backup needs, a command can be as simple as:
 
-bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup archive1=/path/to/subvolume
+    bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup archive1=/path/to/subvolume
 
 Assuming a start from nothing, this will take a snapshot of
 `/path/to/subvolume` and place it in `/pool/snapshots` with a timestamp suffix.
@@ -53,19 +52,22 @@ More than 1 archive can be specified on the command line:
     bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup archive1=/path/to/subvolume archive2=/path/to/subvolume2
 
 These archives will share the same snapshot and backup destination, but
-obviously have different names qualified with a timestamp.
+obviously have different names qualified with a timestamp.  
+
+All archive related processing is completed before the next one is processed.
+Normal archive processing start with pre-snapshot hooks followed by the
+snapshot, post-snapshot hooks, backup, post-backup hooks and then any keep
+policy is applied.
 
 For a full list of options and their explanations, `bubtrsnap --help` is
 useful.
 
-Configuration Files
--------------------
+## Configuration Files
 
 At some point, if backing up several different subvolumes for instance, a
-configuration file might become desirable to make the command line more
-manageable.  bubtrsnap will look for a configuration file in
-`~/.config/bubtrsnap.toml` if no file is specified on the command line.
-Alternatively:
+configuration file will make the command line more manageable.  bubtrsnap will
+look for a configuration file in `~/.config/bubtrsnap.toml` if no file is
+specified on the command line.  Alternatively:
 
     bubtrsnap --config=/path/to/myconfig
 
@@ -93,13 +95,14 @@ Configuration files use TOML formatting and look like:
 ```
 
 If an option can be specified on the command line, it can also be specified in
-the configuration file.  Be sure to susbstitute a `'_'` for any `'-'`
-characters in the command line option.  So the `--snapshot-dir` option would be
-specified as `snapshot_dir` in a configuration file.
+the configuration file.  CLI options map to configuration settings by
+susbstituting a `'_'` for any `'-'` characters in the command line option.  So
+the `--snapshot-dir` option would be specified as `snapshot_dir` in a
+configuration file.
 
 Configuration files for bubtrsnap have a global section and then archive
 sections.  Global settings in a configuration file apply to all archives
-declared in the file and and archive declared on the command line.  So setting
+declared in the file and any archive declared on the command line.  So setting
 default `snapshot_dir` and `backup_dir` settings is a good way to go to keep
 CLI entry to a minimum.  Any configuration file setting is over-ridden by a CLI
 option specification.  So if setting up a new archive, setting a new
@@ -123,14 +126,16 @@ or to process 2:
 
     bubtrsnap archive2 archive3
 
-Want to change the keep all archives?
+Want to change the keep policy for all archives?
 
-    bubtrnap keep-daily 5 keep-weekly 2
+    bubtrsnap keep-daily 5 keep-weekly 2
 
 Note that this policy is only used for that 1 command.  No alterations are made
-to the configuration file.
+to the configuration file.  Also, any keep intervals not specified are set to 0
+so no archives will be kept at hourly, monthly or yearly intervals in the above
+example.
 
-Archive sections are defined be a header which names the archive and then a
+Archive sections are defined by a header which names the archive and then a
 `subvolume = "/path/to/subvolume"` entry.  Within an archive section, all key
 value pairs are specific to that archive.  Options set in the archive take
 precedence over global settings.
@@ -148,124 +153,140 @@ Several options are global only:
 + `snapshot_dir`
 + `backup_dir`
 + `sudo`
++ `verbose`
++ `send_to_dir`
++ `receive_from_dir`
+
+The following options can only be used with an archive:
+
++ `subvolume`  # required for an archive
++ `send_to_file`
++ `receive_from_file`
++ `pre_snapshot_hook`
++ `post_snapshot_hook`
++ `post_backup_hook`
+
+The `verbose` option has several levels for increased messaging on the CLI or
+for logging purposes if running bubtrsnap from a cron job.  By default,
+bubtrsnap is quiet and will only report errors.  Verbose 1 will report general
+flow messages.  Increasing the number will cause `btrfs` commands to be
+reported.  To be able to get the maximum information on flow and commands, use
+`debug` on the CLI.
 
 Finally, the `dry-run` option is not honored in the configuration file.  Simply
 add it the the CLI to see how bubtrsnap will proceed with a configuration.
 
 [keep policy]: #keep-policy
 
-Option: send-to-file
---------------------
+## Stream Files: send_to_file/receive_from_file
 
-A new feature unique to bubtrsnap is the `send-to-file` option which leverages
-the ability of btrfs to send it's data to a file rather than another btrfs
-filesystem. This is to facilitate backups of very large archives where a raw
+It is possible to take advanage of btrfs' ability to send to or to receive from
+a file using the appropriately named `send_to_file` and/or `receive_from_file`
+options.  This is to facilitate backups of very large archives where a raw
 send-receive could get interrupted due to the time it takes for the transfer.
-This option is still being developed but as of now, the option takes a
-directory destination for the resulting file of the `btrfs send -f` command.  
-The command will include a parent subvolume or clone sources so the resulting
-file can contain incremental information to be used.  Finally, no `btrfs
-receive` operation is performed, only the file is created. It is left to the
-user to use the resulting file as they deem appropriate.
 
-Alternatively, the option can be placed in a configuration file and assigned to
+Both of these options take a file name for an argument.  In the case of
+`send_to_file` the file names the destination file for the stream data.  This
+file cannot be a pre-existing file.  For `receive_from_file` the file names the
+source for a `btrfs receive` operation and the destination will be
+`backup_dir`.  The options can be used individually or together on the CLI.
+When `send_to_file` is specified no backup processing will be performed (no
+`btrfs receive`).  Processing will stop when post-snapshot hooks are complete.
+In the case of `receive_from_file`, the snapshotting steps are skipped and
+processing **STARTS** at the backup step.  Any post-backup hooks will be
+processed as well.  In both cases, the keep policy will be applied to the
+appropriate area.  If both are used on the CLI, then processing is essentially
+normal with the exception that the stream file is used essentially as a staging
+step.  When specifying both, the same file **MUST** be named for both options.
+
+An example CLI command (assuming a configuration file is setup):
+
+    bubtrsnap --receive-from-file ~/btrfsstreams/archive.btrfs
+
+or using both:
+
+    bubtrsnap --send-to-file ~/btrfsstreams/archive.btrfs --receive-from-file ~/btrfsstreams/archive.btrfs archive1
+
+Alternatively, the options can be placed in a configuration file and assigned to
 an archive like so:
 
 ```
     [archive1]
     subvolume = "/home/user/"
-    send_to_file = "/home/user/btrfsfiles"
+    send_to_file = "/home/user/btrfsstreams/archive1stream.btrfs
 ```
 
-If the `send_to_file` option is present for an archive, effectively the `backup_dir` 
-option is overridden.  So no receive operation is performed.  If `send_to_file` is 
-set in the global section like below:
+or together:
 
 ```
     backup_dir = "/pool/backups"
     snapshot_dir = "/snapshots"
     sudo = true
-    send_to_file = "~/btrfsstreams"
 
     [archive1]
     subvolume = "~/another/silly/path"
+    send_to_file = "/home/user/btrfsstreams/archive1stream.btrfs
+    receive_from_file = "/home/user/btrfsstreams/archive1stream.btrfs"
     .
     .
     .
 ```
 
-Then the setting will apply to **ALL** archive in the configuration and can only be 
-overridden by an archive specific `send_to_file` setting.
-
-The option is mutually exclusive with the `--snaps-only` option and when used
+The options are mutually exclusive with the `--snaps-only` option and when used
 on the command line, only 1 `archive=subvolume`, or alternatively the name of
-an archive section in the configuration file, may be specified.  If either of
-these options is also used in the command line then bubtrsnap exits with an
-error.
+an archive section in the configuration file, may be specified.  
 
-Option: receive-from-file
--------------------------
+## Stream Directories: send_to_dir/receive_from_dir
 
-The companion to `send-to-file` is the `receive-from-file` option.  It allows
-bubtrsnap to restore (or initially populate) a backup location from one or more
-btrfs send-stream files previously created with `btrfs send -f` (or with
-bubtrsnap’s own `--send-to-file`).
+If you wish for stream files to be used with multiple archives, then
+`send_to_dir` and `receive_from_dir` are available.  These are similar to their
+file counterparts.  They are available from the CLI or a configuration file.
+They are a global only setting in a configuration file.  Also, no mixing and
+matching of the `dir` and `file` options are allowed.
 
-On the command line the option accepts either a single stream file **or** a
-directory containing stream files:
+From a usage standpoint, they result in generally the same processing except
+that all send and receive operations will be through stream files in the
+specified directories.  The `send_to_dir` will write a file with a name like
+`archivename.YYYYMMDDHHMMSS.btrfs`.  The `receive_from_dir` will scan the
+directory for the most recent stream file that matches the current archive
+being worked on.  The received file will go into `backup_dir`.  Again, they can
+be specified individually or together.  If both are specified, the file
+resulting from the send will be used for the ensuing receive operation.  These
+options are also mutually exclusive with the `snaps-only` option.
+
+An examples for the CLI:
+
+    bubtrsnap --send-to-dir ~/btrfsstreams/ archive1 archive2 archive3=/some/subvolume
+
+So archive1, archive2 and archive3 (which isn't setup in the configuration
+file) will all have stream files put into `~/btrfsstreams/` which must
+pre-exist.  
+
+In a configuration file:
 
 ```
-    bubtrsnap --backup-dir=/backup --receive-from-file=/path/to/stream.btrfs
-    bubtrsnap --backup-dir=/backup --receive-from-file=/path/to/stream-directory
-```
+    backup_dir = "/pool/backups"
+    snapshot_dir = "/snapshots"
+    sudo = true
 
-When a directory is given, bubtrsnap scans it, lists every valid btrfs stream
-file it finds (in sorted name order) and receives each one in turn.  Stream
-validity is checked with `btrfs receive --dump -f`.
-
-Important behaviours:
-
-* `--backup-dir` (or the corresponding `backup_dir` setting) is mandatory.
-* The option is mutually exclusive with both `--snaps-only` and `--send-to-file`.
-* When used on the CLI, **only** the receive operation is performed; any archives
-  defined in a configuration file are ignored.
-* If a received subvolume already exists in the destination, a warning is printed
-  to stderr and processing continues with the remaining files.  Any other error
-  from `btrfs receive` aborts the run.
-* After a successful receive the configured keep policy is applied to the
-  newly-created subvolume (the archive name is taken from the conventional
-  `archive.YYYYMMddhhmm` naming).
-
-In a configuration file the option may appear either globally or inside an
-archive section.  The global setting can be a directory or a specific stream
-file.  When set in an archive section, it **must** be a specfic stream file.
-
-* Global Example(with directory setting):
-```
-    receive_from_file = "/path/to/streams"
+    receive_from_dir = "~/btrfsstreams/"
 
     [archive1]
-    subvolume = "/home/user"
+    subvolume = "~/another/silly/path"
+    keep_daily = 7
+    .
+    .
+    .
 ```
 
-* Archive Example:
-```
-    receive_from_file = "/path/to/archive1.202608181200.btrfs"
-```
+In this instance, any archives in the configuration file will skip snapshot
+processing and a btrfs stream file will be searched for in the specified directory. 
+If a stream file is not found, processing for that archive completes and the
+next archive is dealt with.
 
-When specified globally it is processed first, before any archives.  When
-specified on an individual archive, snapshot creation and the associated
-pre-/post-snapshot hooks are skipped; only the receive, the post-backup hook
-(if any) and the keep policy are executed.
+## Keep Policy
 
-USAGE NOTE:  It is not possible to link the output from a `send_to_file` operation
-to a `receive_from_file` operation in a single command.  That said, the resulting
-file from from a `send_to_file` can be used in a subsequent `receive_from_file`.
-
-Keep Policy
------------
-
-The keep policy for bubtrsnap is a direct port of from [btrbu][] which was
+The keep policy for bubtrsnap is a direct port from [btrbu][] which was
 inspired by the [borgbackup][] policy.  It uses hourly, daily, weekly, monthly
 and yearly timeframes to determine what to keep.  The relevant options are
 `keep-hourly`, `keep-daily`, `keep-weekly`, `keep-monthly` and `keep-yearly`
@@ -285,10 +306,12 @@ all those and only those snapshot and backups that meet the keep policy
 criteria will be kept.  Note that the keep policy applies to BOTH snapshots AND
 backups.
 
-Keeps can be specified on the CLI or via a configuration file.  If specified on
-the CLI, keeps are dealt with as all or nothing.  That is, any keep NOT
-specified on the CLI is treated as 0 keeps at that interval.  As an example,
-consider the following CLI command:
+Keeps can be specified on the CLI or via a configuration file.  Keeps are dealt
+with as all or nothing.  Keeps specified on the CLI, in the global section or
+for a specific archive are independent of each other.  Keeps from the CLI take
+precedence over global and archive settings while archive specific keeps take
+precedence over global settings.  Any unspecified keep is set to 0 at that
+interval. As an example, consider the following CLI command:
 
     bubtrsnap --keep-daily 5 myarchive=/some/subvolume
 
@@ -341,8 +364,7 @@ a candidate timestamp.
 
 [borgbackup]: https://borgbackup.org
 
-Hooks
------
+## Hooks
 
 Hooks allow for external programs to be coordinated with the creation of
 snapshots and backups.  There are 3 types of hooks:  pre-snapshot,
