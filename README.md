@@ -2,7 +2,7 @@ bubtrsnap
 =========
 
 Based on my previous [btrbu][] project, bubtrsnap is a rewrite of it using
-Grok.  It is a python3 based project and is a superior implenatation, imho.
+Grok.  It is a python3 based project and is a superior implementation, imho.
 
 More formally, bubtrsnap is a(nother) btrfs snapshot and backup management
 script.  Like btrbu before it, bubtrsnap will bootstrap itself if no backups
@@ -195,9 +195,9 @@ When `send_to_file` is specified no backup processing will be performed (no
 In the case of `receive_from_file`, the snapshotting steps are skipped and
 processing **STARTS** at the backup step.  Any post-backup hooks will be
 processed as well.  In both cases, the keep policy will be applied to the
-appropriate area.  If both are used on the CLI, then processing is essentially
-normal with the exception that the stream file is used essentially as a staging
-step.  When specifying both, the same file **MUST** be named for both options.
+appropriate area.  If both are used on the CLI, then processing is normal with
+the exception that the stream file is used essentially as a staging step.  When
+specifying both, the same file **MUST** be named for both options.
 
 An example CLI command (assuming a configuration file is setup):
 
