@@ -467,24 +467,6 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             else:
                 global_cfg[key] = value
 
-    # expand directory paths for paths specified like "~/"
-    if "send_to_dir" in global_cfg and global_cfg["send_to_dir"]:
-        global_cfg["send_to_dir"] = expand_path(global_cfg["send_to_dir"])
-    if "receive_from_dir" in global_cfg and global_cfg["receive_from_dir"]:
-        global_cfg["receive_from_dir"] = expand_path(global_cfg["receive_from_dir"])
-    if "stage_dir" in global_cfg and global_cfg["stage_dir"]:
-        global_cfg["stage_dir"] = expand_path(global_cfg["stage_dir"])
-
-    # Config: stage_dir is mutually exclusive with send_to_dir / receive_from_dir
-    if global_cfg.get("stage_dir") and (
-        global_cfg.get("send_to_dir") or global_cfg.get("receive_from_dir")
-        ):
-        print(
-            "Error: stage_dir cannot be combined with send_to_dir or receive_from_dir",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     # Apply global CLI overrides
     if cli.snapshot_dir:
         global_cfg["snapshot_dir"] = cli.snapshot_dir
@@ -495,34 +477,96 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     if getattr(cli, "snaps_only", False):
         global_cfg["snaps_only"] = True
 
-    # Global CLI dir overrides
-    if getattr(cli, "send_to_dir", None):
-        cli.send_to_dir = expand_path(cli.send_to_dir)
-        chk_is_dir(cli.send_to_dir, "send-to-dir")
-        global_cfg["send_to_dir"] = cli.send_to_dir
-        global_cfg["stage_dir"] = None
-    if getattr(cli, "receive_from_dir", None):
-        cli.receive_from_dir = expand_path(cli.receive_from_dir)
-        chk_is_dir(cli.receive_from_dir, "receive-from-dir")
-        global_cfg["receive_from_dir"] = cli.receive_from_dir
-        global_cfg["stage_dir"] = None
-    if getattr(cli, "stage_dir", None):
-        cli.stage_dir = expand_path(cli.stage_dir)
-        chk_is_dir(cli.stage_dir, "stage-dir")
-        global_cfg["stage_dir"] = cli.stage_dir
-        # CLI stage_dir clears conflicting dir options from config
+    # -------------------------------------------------------------------------
+    # Six file-related options resolution
+    #   CLI  >  archive-specific  >  global
+    # If ANY of the six appear on the CLI, config file settings for all six
+    # are ignored (as if they were not present in the config).
+    # -------------------------------------------------------------------------
+    FILE_RELATED_CLI = (
+        "send_to_file",
+        "receive_from_file",
+        "stage_file",
+        "send_to_dir",
+        "receive_from_dir",
+        "stage_dir",
+    )
+
+    cli_send_file = expand_path(cli.send_to_file) if getattr(cli, "send_to_file", None) else None
+    cli_recv_file = expand_path(cli.receive_from_file) if getattr(cli, "receive_from_file", None) else None
+    cli_stage_file = expand_path(cli.stage_file) if getattr(cli, "stage_file", None) else None
+    cli_send_dir = expand_path(cli.send_to_dir) if getattr(cli, "send_to_dir", None) else None
+    cli_recv_dir = expand_path(cli.receive_from_dir) if getattr(cli, "receive_from_dir", None) else None
+    cli_stage_dir = expand_path(cli.stage_dir) if getattr(cli, "stage_dir", None) else None
+
+    cli_has_file_related = any(
+        getattr(cli, name, None) for name in FILE_RELATED_CLI
+    )
+
+    # Validate dirs when provided on CLI
+    if cli_send_dir:
+        chk_is_dir(cli_send_dir, "send-to-dir")
+    if cli_recv_dir:
+        chk_is_dir(cli_recv_dir, "receive-from-dir")
+    if cli_stage_dir:
+        chk_is_dir(cli_stage_dir, "stage-dir")
+
+    # Expand config global dirs only when CLI is not driving file-related opts
+    if not cli_has_file_related:
+        if global_cfg.get("send_to_dir"):
+            global_cfg["send_to_dir"] = expand_path(global_cfg["send_to_dir"])
+        if global_cfg.get("receive_from_dir"):
+            global_cfg["receive_from_dir"] = expand_path(global_cfg["receive_from_dir"])
+        if global_cfg.get("stage_dir"):
+            global_cfg["stage_dir"] = expand_path(global_cfg["stage_dir"])
+        if global_cfg.get("stage_dir") and (
+            global_cfg.get("send_to_dir") or global_cfg.get("receive_from_dir")
+        ):
+            print(
+                "Error: stage_dir cannot be combined with send_to_dir or receive_from_dir",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        # CLI owns this layer: strip config globals so they cannot leak through
         global_cfg["send_to_dir"] = None
         global_cfg["receive_from_dir"] = None
+        global_cfg["stage_dir"] = None
 
-    cli_send_file = getattr(cli, "send_to_file", None)
-    if cli_send_file:
-        cli_send_file = expand_path(cli_send_file)
-    cli_recv_file = getattr(cli, "receive_from_file", None)
-    if cli_recv_file:
-        cli_recv_file = expand_path(cli_recv_file)
-    cli_stage_file = getattr(cli, "stage_file", None)
+    # --- mutual exclusion on CLI (unchanged rules) ---
+    file_related = [
+        ("--send-to-file", cli_send_file),
+        ("--receive-from-file", cli_recv_file),
+        ("--stage-file", cli_stage_file),
+        ("--send-to-dir", cli_send_dir),
+        ("--receive-from-dir", cli_recv_dir),
+        ("--stage-dir", cli_stage_dir),
+    ]
     if cli_stage_file:
-        cli_stage_file = expand_path(cli_stage_file)
+        others = [n for n, v in file_related if n != "--stage-file" and v]
+        if others:
+            print(
+                f"Error: --stage-file is mutually exclusive with {', '.join(others)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if cli_stage_dir:
+        others = [n for n, v in file_related if n != "--stage-dir" and v]
+        if others:
+            print(
+                f"Error: --stage-dir is mutually exclusive with {', '.join(others)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if (cli_send_file or cli_recv_file or cli_stage_file) and (
+        cli_send_dir or cli_recv_dir or cli_stage_dir
+    ):
+        print(
+            "Error: cannot mix file options with directory options on the CLI",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # CLI keep options
     cli_keeps = {}
@@ -533,48 +577,6 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
 
     # now process any archives from the CLI
     cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
-
-    # ---- CLI mutual exclusion among the six file-related options ----
-    file_related = [
-        ("--send-to-file", cli_send_file),
-        ("--receive-from-file", cli_recv_file),
-        ("--stage-file", cli_stage_file),
-        ("--send-to-dir", getattr(cli, "send_to_dir", None)),
-        ("--receive-from-dir", getattr(cli, "receive_from_dir", None)),
-        ("--stage-dir", getattr(cli, "stage_dir", None)),
-    ]
-    # stage_file exclusive with the other five
-    if cli_stage_file:
-        others = [n for n, v in file_related if n != "--stage-file" and v]
-        if others:
-            print(
-                f"Error: --stage-file is mutually exclusive with {', '.join(others)}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-    if getattr(cli, "stage_dir", None):
-        others = [n for n, v in file_related if n != "--stage-dir" and v]
-        if others:
-            print(
-                f"Error: --stage-dir is mutually exclusive with {', '.join(others)}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-    # Do not mix *_file with *_dir on the CLI
-    cli_any_file = bool(cli_send_file or cli_recv_file or cli_stage_file)
-    cli_any_dir = bool(
-        getattr(cli, "send_to_dir", None)
-        or getattr(cli, "receive_from_dir", None)
-        or getattr(cli, "stage_dir", None)
-    )
-    if cli_any_file and cli_any_dir:
-        print(
-            "Error: cannot mix file options (--send-to-file/--receive-from-file/--stage-file) "
-            "with directory options (--send-to-dir/--receive-from-dir/--stage-dir)",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     # Single-archive requirement for file options
     single_archive_opts = cli_send_file or cli_recv_file or cli_stage_file
@@ -594,6 +596,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                 file=sys.stderr,
             )
             sys.exit(1)
+
 
     # iterate through archives from CLI or config file and set them up
     archives_to_process = []
@@ -638,6 +641,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         name = raw["name"]
         subvol = raw.get("subvolume")
 
+        # archive subvolume must exist and be a valid btrfs subvolume
         if not subvol:
             print(f"Error: archive '{name}' has no subvolume defined.", file=sys.stderr)
             sys.exit(1)
@@ -647,49 +651,54 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             print(f"Error: subvolume path does not exist: {subvol}", file=sys.stderr)
             sys.exit(1)
 
-        # ----- Per-archive file options (CLI overrides archive section) -----
-        send_file = cli_send_file if cli_send_file is not None else raw.get("send_to_file")
-        recv_file = cli_recv_file if cli_recv_file is not None else raw.get("receive_from_file")
-        stage_file = cli_stage_file if cli_stage_file is not None else raw.get("stage_file")
-
-        if send_file:
-            send_file = expand_path(send_file)
-        if recv_file:
-            recv_file = expand_path(recv_file)
-        if stage_file:
-            stage_file = expand_path(stage_file)
-
-        # Config rule: stage_file cannot combine with send_to_file / receive_from_file
-        if stage_file and (send_file or recv_file):
-            print(
-                f"Error in archive '{name}': stage_file cannot be combined with "
-                f"send_to_file or receive_from_file",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        # Global dir options (CLI already applied to global_cfg)
-        send_dir = global_cfg.get("send_to_dir")
-        recv_dir = global_cfg.get("receive_from_dir")
-        stage_dir = global_cfg.get("stage_dir")
-
-        has_file_opts = bool(send_file or recv_file or stage_file)
-
-        # File options on an archive suppress all global dir options for that archive
-        if has_file_opts:
-            send_dir = None
-            recv_dir = None
-            stage_dir = None
+        if cli_has_file_related:
+            # Rule 1: CLI only — ignore all config file-related options
+            send_file = cli_send_file
+            recv_file = cli_recv_file
+            stage_file = cli_stage_file
+            send_dir = cli_send_dir
+            recv_dir = cli_recv_dir
+            stage_dir = cli_stage_dir
         else:
-            # stage_dir vs send/receive dirs already rejected globally when both set
-            pass
+            # Rules 2 & 3: archive-specific first; global only if none
+            send_file = raw.get("send_to_file")
+            recv_file = raw.get("receive_from_file")
+            stage_file = raw.get("stage_file")
+            if send_file:
+                send_file = expand_path(send_file)
+            if recv_file:
+                recv_file = expand_path(recv_file)
+            if stage_file:
+                stage_file = expand_path(stage_file)
 
-        snaps_only = ( True if getattr(cli, "snaps_only", False) else
-                        raw.get("snaps_only", global_cfg.get("snaps_only", False)))
+            if stage_file and (send_file or recv_file):
+                print(
+                    f"Error in archive '{name}': stage_file cannot be combined with "
+                    f"send_to_file or receive_from_file",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
+            archive_has_file_opts = bool(send_file or recv_file or stage_file)
+            if archive_has_file_opts:
+                # Rule 2: archive-specific only — no global dirs
+                send_dir = None
+                recv_dir = None
+                stage_dir = None
+            else:
+                # Rule 3: globals apply only when archive has no file opts
+                send_dir = global_cfg.get("send_to_dir")
+                recv_dir = global_cfg.get("receive_from_dir")
+                stage_dir = global_cfg.get("stage_dir")
+
+        snaps_only = (
+            True
+            if getattr(cli, "snaps_only", False)
+            else raw.get("snaps_only", global_cfg.get("snaps_only", False))
+        )
         if snaps_only and (
             send_file or recv_file or stage_file or send_dir or recv_dir or stage_dir
-            ):
+        ):
             print(
                 f"Error in archive '{name}': snaps_only is mutually exclusive "
                 f"with send/receive/stage file and directory options",
