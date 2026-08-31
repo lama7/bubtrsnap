@@ -792,7 +792,7 @@ def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
         # Debug level only
         log(f"{path}: UUID={uuid}  Received UUID={received_uuid}", 3, cfg["verbose"])
         return uuid, received_uuid
-    except subprocess.CalledExceptionError:
+    except subprocess.CalledProcessError:
         log(f"Failed to get UUIDs for {path}", 3, cfg["verbose"])
         return None, None
 
