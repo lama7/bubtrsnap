@@ -968,11 +968,6 @@ def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: 
             if ts:
                 snapshots.append((ts, p, uuid))
 
-    # Skip remote queries in dry-run mode
-    if cfg.get("dry_run"):
-        log("Skipping SSH parent lookup (dry-run)", 3, cfg["verbose"])
-        return []
-
     # Collect received UUIDs from remote backup side
     # Need to run `btrfs subvolume show` on each subvolume to get Received UUID
     received_uuids = set()
@@ -2142,11 +2137,7 @@ Examples:
         print("Error: --remote and --remote-dir must be specified together", file=sys.stderr)
         return 1
 
-#    if args.send_to_file and args.archives and len(args.archives) > 1:
-#        print("Error: --send-to-file may be used with only one archive", file=sys.stderr)
-#        return 1
-
-        # Verbosity handling 
+    # Verbosity handling 
     verbosity = args.verbose
     if args.debug:
         verbosity = 3
@@ -2184,16 +2175,6 @@ Examples:
     if not archives:
         print("No archives to process.", file=sys.stderr)
         return 1
-
-# I'm commenting this out for now because it's duplicative.  It's checked during archive
-# processing as well.  I'm removing it here because backup_dir is now configurable on a
-# per archive basis so it's easier to catch when processing the archive.  I want to make
-# sure removing it here doesn't break anything is all.
-    # Make sure snapshot_dir and backup_dir are valid btrfs subvolumes
-    # otherwise, what are we doing here?
-#    log("Verifying snapshot and backups directories are valid btrfs subvolumes...", 1, global_cfg["verbose"])
-#    for path in [ global_cfg["snapshot_dir"], global_cfg["backup_dir"] ]:
-#        chk_btrfs_subvolume(path, global_cfg)
 
     # Process each archive fully
     for archive in archives:
