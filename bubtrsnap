@@ -338,6 +338,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "keep_yearly": int,
     "remote": str,
     "remote_dir": str,
+    "backup_dir": str,
 }
 
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
@@ -504,6 +505,11 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         global_cfg["remote"] = cli_remote
     if cli_remote_dir is not None:
         global_cfg["remote_dir"] = cli_remote_dir
+    
+    # Track if CLI explicitly set backup_dir for precedence over archive-specific config
+    cli_backup_dir = getattr(cli, "backup_dir", None)
+    if cli_backup_dir is not None:
+        global_cfg["backup_dir"] = cli_backup_dir
 
     # -------------------------------------------------------------------------
     # Six file-related options resolution
@@ -744,6 +750,12 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         else:
             remote = raw.get("remote", global_cfg.get("remote"))
             remote_dir = raw.get("remote_dir", global_cfg.get("remote_dir"))
+        
+        # Resolve backup_dir with precedence: CLI > archive-specific > global
+        if cli_backup_dir is not None:
+            backup_dir = cli_backup_dir
+        else:
+            backup_dir = raw.get("backup_dir", global_cfg.get("backup_dir"))
 
         entry = {
             "name": name,
@@ -757,6 +769,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             "stage_dir": stage_dir,
             "remote": remote,
             "remote_dir": remote_dir,
+            "backup_dir": backup_dir,
             "pre_snapshot_hook": raw.get("pre_snapshot_hook"),
             "post_snapshot_hook": raw.get("post_snapshot_hook"),
             "post_backup_hook": raw.get("post_backup_hook"),
@@ -920,56 +933,87 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path, cfg: dict, arc
     if cfg.get("dry_run"):
         if remote and remote_dir:
             ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
-            log(f"[dry-run] {' '.join(send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
+            if backup_dir:
+                log(f"[dry-run] {' '.join(send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
+                log(f"[dry-run] {' '.join(send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
+            else:
+                log(f"[dry-run] {' '.join(send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
         else:
             log(f"[dry-run] {' '.join(send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
         return dest
 
-    if remote and remote_dir:
-        # SSH mode: send | ssh remote btrfs receive remote_dir
+    # If both backup_dir (local) and remote_dir (SSH) are set, we need to tee the stream
+    # We'll use 'tee' to duplicate the stream: send | tee >(btrfs receive backup_dir) | ssh remote btrfs receive remote_dir
+    # Actually, simpler: run send twice - once for local, once for SSH
+    # But that's inefficient. Better: use btrfs send once and tee to both
+    
+    has_local = backup_dir is not None
+    has_remote = remote and remote_dir
+
+    if has_remote:
         ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
         log(f"{' '.join(send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
-
-        start_time = datetime.now()
-
-        send_proc = subprocess.Popen(send_cmd,
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL)
-        ssh_proc = subprocess.Popen(ssh_recv,
-                                    stdin=send_proc.stdout,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-        send_proc.stdout.close()
-        ssh_proc.communicate()
-
-        elapsed = (datetime.now() - start_time).total_seconds()
-        log(f"btrfs send/receive (SSH) completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-
-        if ssh_proc.returncode != 0:
-            raise RuntimeError("btrfs receive via SSH failed")
-    else:
-        # Local mode (original behavior)
+    
+    if has_local:
         recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
-
-        # Level 2 shows the actual command
         log(f"{' '.join(send_cmd)} | {' '.join(recv_cmd)}", 2, cfg["verbose"])
 
-        start_time = datetime.now()
+    start_time = datetime.now()
 
-        send_proc = subprocess.Popen(send_cmd,
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL)
-        recv_proc = subprocess.Popen(recv_cmd,
-                                     stdin=send_proc.stdout,
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+    if has_remote and has_local:
+        # Both local and remote: tee the send output to both
+        # send | tee >(btrfs receive local) | ssh remote btrfs receive remote
+        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
+        recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
+        
+        # Use tee with process substitution (requires bash)
+        # For portability, we'll run send twice - once for each destination
+        # This is simpler and more portable than tee with process substitution
+        
+        # First: local receive
+        log("Sending to local backup...", 1, cfg["verbose"])
+        send_proc1 = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        recv_proc1 = subprocess.Popen(recv_cmd, stdin=send_proc1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc1.stdout.close()
+        recv_proc1.communicate()
+        
+        if recv_proc1.returncode != 0:
+            raise RuntimeError("btrfs receive (local) failed")
+        
+        # Second: SSH receive
+        log(f"Sending to SSH remote {remote}...", 1, cfg["verbose"])
+        send_proc2 = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ssh_proc2 = subprocess.Popen(ssh_recv, stdin=send_proc2.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc2.stdout.close()
+        ssh_proc2.communicate()
+        
+        if ssh_proc2.returncode != 0:
+            raise RuntimeError("btrfs receive via SSH failed")
+            
+    elif has_remote:
+        # SSH only
+        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
+        send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ssh_proc = subprocess.Popen(ssh_recv, stdin=send_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc.stdout.close()
+        ssh_proc.communicate()
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        log(f"btrfs send/receive (SSH) completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+        
+        if ssh_proc.returncode != 0:
+            raise RuntimeError("btrfs receive via SSH failed")
+    elif has_local:
+        # Local only (original behavior)
+        recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
+        send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        recv_proc = subprocess.Popen(recv_cmd, stdin=send_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         send_proc.stdout.close()
         recv_proc.communicate()
-
+        
         elapsed = (datetime.now() - start_time).total_seconds()
-        # Level 1 shows the timing summary
         log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-
+        
         if recv_proc.returncode != 0:
             raise RuntimeError("btrfs receive failed")
 
@@ -1495,6 +1539,11 @@ def process_archive(archive: dict, cfg: dict) -> None:
         staged = True
     elif stage_file:
         staged = True
+
+    # Use per-archive backup_dir if set, otherwise fall back to global
+    archive_backup_dir = archive.get("backup_dir")
+    backup_dir = Path(archive_backup_dir) if archive_backup_dir else (Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None)
+    snap_dir = Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None
 
     # ----- receive-only (file) -----
     if recv_file and not send_file:
