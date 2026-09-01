@@ -382,12 +382,12 @@ def validate_config(file_cfg: dict) -> None:
                 print(f"Error: 'subvolume' in {context} cannot be empty", file=sys.stderr)
                 sys.exit(1)
 
-            # remote and remote_dir must be used together per-archive
+            # remote and remote_dir - remote_dir requires remote, but remote can be used alone
             has_remote = "remote" in value
             has_remote_dir = "remote_dir" in value
-            if has_remote != has_remote_dir:
-                print(f"Error: 'remote' and 'remote_dir' must be specified together in {context}", file=sys.stderr)
-                sys.exit(1)
+            if has_remote_dir and not has_remote:
+                # remote_dir at archive level needs a remote (will check global/CLI later)
+                pass  # We'll validate after resolution
 
         else:
             # ----- Global option -----
@@ -397,12 +397,12 @@ def validate_config(file_cfg: dict) -> None:
                 sys.exit(1)
             _check_type(key, value, ALLOWED_GLOBAL_OPTIONS[key], "global configuration")
 
-    # Global remote and remote_dir must be used together
+    # Global remote_dir requires remote (but remote can be used alone)
     has_global_remote = "remote" in file_cfg
     has_global_remote_dir = "remote_dir" in file_cfg
-    if has_global_remote != has_global_remote_dir:
-        print("Error: 'remote' and 'remote_dir' must be specified together in global configuration", file=sys.stderr)
-        sys.exit(1)
+    if has_global_remote_dir and not has_global_remote:
+        # global remote_dir needs a remote (will check CLI later)
+        pass  # We'll validate after resolution
 
 
 def load_toml(path: Path) -> dict[str, Any]:
@@ -751,6 +751,11 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             remote = raw.get("remote", global_cfg.get("remote"))
             remote_dir = raw.get("remote_dir", global_cfg.get("remote_dir"))
         
+        # Validate: if remote_dir is set, remote must also be set (from any level)
+        if remote_dir and not remote:
+            print(f"Error in archive '{name}': 'remote_dir' requires 'remote' to be set (global, per-archive, or CLI)", file=sys.stderr)
+            sys.exit(1)
+        
         # Resolve backup_dir with precedence: CLI > archive-specific > global
         if cli_backup_dir is not None:
             backup_dir = cli_backup_dir
@@ -798,10 +803,33 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
             stderr=subprocess.DEVNULL,
             check=True)
         log(f"\t{dir} is a valid btrfs subvolume", 2, cfg["verbose"])
-                                    
+                                   
     except subprocess.CalledProcessError:
         print(f"Error: '{dir}' is not a btrfs subvolume "
         f"(required for snapshot/backup/receive operations)", file=sys.stderr)
+        sys.exit(1)
+
+def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict):
+    """Check if a remote directory is a btrfs subvolume via SSH."""
+    # Build SSH command: ssh remote sudo -n btrfs subvolume show remote_dir
+    sudo_prefix = ["sudo", "-n"] if cfg.get("sudo") else []
+    ssh_cmd = ["ssh", remote] + sudo_prefix + ["btrfs", "subvolume", "show", remote_dir]
+    
+    if cfg.get("dry_run"):
+        log(f"[dry-run] {' '.join(ssh_cmd)}", 2, cfg["verbose"])
+        return
+    
+    try:
+        result = subprocess.run(ssh_cmd, check=True, capture_output=True, text=True, timeout=30)
+        log(f"\t{remote}:{remote_dir} is a valid btrfs subvolume", 2, cfg["verbose"])
+    except subprocess.CalledProcessError as e:
+        print(f"Error: '{remote}:{remote_dir}' is not a btrfs subvolume "
+              f"(required for snapshot/backup/receive operations)", file=sys.stderr)
+        if e.stderr:
+            print(f"  SSH error: {e.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"Error: SSH connection to {remote} timed out", file=sys.stderr)
         sys.exit(1)
 
 def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Path:
@@ -1552,6 +1580,11 @@ def process_archive(archive: dict, cfg: dict) -> None:
                   file=sys.stderr)
             sys.exit(1)
         chk_btrfs_subvolume(backup_dir, cfg)
+        # Check remote_dir if configured
+        remote = archive.get("remote")
+        remote_dir = archive.get("remote_dir")
+        if remote and remote_dir:
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
         p = Path(recv_file)
         if not p.is_file() or not is_btrfs_stream(p, cfg):
             print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
@@ -1576,6 +1609,11 @@ def process_archive(archive: dict, cfg: dict) -> None:
             print(f"Error: receive_from_dir requires backup_dir", file=sys.stderr)
             sys.exit(1)
         chk_btrfs_subvolume(backup_dir, cfg)
+        # Check remote_dir if configured
+        remote = archive.get("remote")
+        remote_dir = archive.get("remote_dir")
+        if remote and remote_dir:
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
         stream = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
         if not stream:
             log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
@@ -1631,6 +1669,11 @@ def process_archive(archive: dict, cfg: dict) -> None:
     # normal piped send|receive
     elif not snaps_only and backup_dir:
         log("Starting backup...", 1, cfg["verbose"])
+        # Check remote_dir if configured
+        remote = archive.get("remote")
+        remote_dir = archive.get("remote_dir")
+        if remote and remote_dir:
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
         dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
         run_hook(archive.get("post_backup_hook"), {
             "backup": str(dest), "snapshot": str(snap), "archive": name,
@@ -1661,6 +1704,12 @@ def process_archive(archive: dict, cfg: dict) -> None:
             print("Error: receive requires backup_dir", file=sys.stderr)
             sys.exit(1)
         chk_btrfs_subvolume(backup_dir, cfg)
+        
+        # Check remote_dir if configured
+        remote = archive.get("remote")
+        remote_dir = archive.get("remote_dir")
+        if remote and remote_dir:
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
 
         # Note that by this point, recv_file and recv_dir should NOT both be set. We took
         # care with configuration rules that should prevent that combination.  In fact, 
