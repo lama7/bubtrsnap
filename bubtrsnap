@@ -1739,11 +1739,12 @@ def process_archive(archive: dict, cfg: dict) -> None:
     Processing for send_to_dir and recv_from_dir uses same processing flow except it will
     handle multiple archives versus a single archive for the file variant 
     """
+
+    # start with setup...
     name = archive["name"]
     subvol = archive["subvolume"]
-    snap_dir = Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None
-    backup_dir = Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None
 
+    # now we can provide some quick logging...
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
 
     send_file = archive.get("send_to_file")
@@ -1772,12 +1773,12 @@ def process_archive(archive: dict, cfg: dict) -> None:
     archive_backup_dir = archive.get("backup_dir")
     backup_dir = Path(archive_backup_dir) if archive_backup_dir else (Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None)
     snap_dir = Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None
+    remote = archive.get("remote")
+    remote_dir = archive.get("remote_dir")
 
     # ----- receive-only (file) -----
     if recv_file and not send_file:
         # Need either backup_dir (local) or remote_dir (SSH)
-        remote = archive.get("remote")
-        remote_dir = archive.get("remote_dir")
         if not backup_dir and not (remote and remote_dir):
             print(f"Error: archive '{name}' receive_from_file requires backup_dir or remote_dir (with remote)",
                   file=sys.stderr)
@@ -1808,8 +1809,6 @@ def process_archive(archive: dict, cfg: dict) -> None:
     # ----- receive-only (dir) -----
     if recv_dir and not send_dir and not send_file:
         # Need either backup_dir (local) or remote_dir (SSH)
-        remote = archive.get("remote")
-        remote_dir = archive.get("remote_dir")
         if not backup_dir and not (remote and remote_dir):
             print(f"Error: receive_from_dir requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
@@ -1863,10 +1862,6 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
     stream_path: Path | None = None
 
-    # Resolve remote/remote_dir early for condition checks
-    remote = archive.get("remote")
-    remote_dir = archive.get("remote_dir")
-
     if send_file:
         stream_path = Path(send_file)
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
@@ -1910,8 +1905,6 @@ def process_archive(archive: dict, cfg: dict) -> None:
     )
     if do_receive:
         # Need either backup_dir (local) or remote_dir (SSH)
-        remote = archive.get("remote")
-        remote_dir = archive.get("remote_dir")
         if not backup_dir and not (remote and remote_dir):
             print("Error: receive requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
