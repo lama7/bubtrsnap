@@ -1516,6 +1516,97 @@ def iter_archive_items(directory: Path, archive: str):
             continue
         yield ts, p
 
+
+def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict):
+    """
+    Yield (timestamp_str, remote_subvol_path) for exact archive.YYYYMMDDHHMM entries
+    on a remote SSH host. Mirrors iter_archive_items but queries via SSH.
+    """
+    # Build SSH command to list subvolumes
+    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir))
+    try:
+        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        log(f"Failed to list subvolumes on {remote}:{remote_dir}", 3, cfg["verbose"])
+        return
+
+    for line in result.stdout.splitlines():
+        # Parse: ID 256 gen 1234 top level 5 path lama7.20260831...
+        parts = line.split()
+        path_idx = -1
+        for i, part in enumerate(parts):
+            if part == "path" and i + 1 < len(parts):
+                path_idx = i + 1
+                break
+        if path_idx >= 0:
+            remote_subvol = parts[path_idx]
+            # Match archive pattern
+            m = _ARCHIVE_TS_RE.match(remote_subvol)
+            if not m:
+                continue
+            if m.group(1) != archive:
+                continue
+            ts = m.group(2)
+            if parse_ts(remote_subvol) is None:
+                continue
+            # Yield timestamp and full remote path
+            yield ts, f"{remote_dir}/{remote_subvol}"
+
+
+def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict) -> None:
+    """
+    Apply the given keep policy to backups of an archive on a remote SSH host.
+    Mirrors apply_keep_policy but operates via SSH.
+    """
+    keep_values = [
+        keep.get("keep_hourly", 0),
+        keep.get("keep_daily", 0),
+        keep.get("keep_weekly", 0),
+        keep.get("keep_monthly", 0),
+        keep.get("keep_yearly", 0),
+    ]
+    if not any(v > 0 for v in keep_values):
+        log(
+            f"No keep policy specified for {archive} on SSH remote – skipping pruning",
+            1,
+            cfg["verbose"],
+        )
+        return
+
+    log(f"Keep policy for {archive} on SSH remote {remote}:{remote_dir}: {format_keep_policy(keep)}", 1, cfg["verbose"])
+    log(f"Applying to {archive} in {remote}:{remote_dir}:", 1, cfg["verbose"])
+
+    items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg))
+    if not items:
+        log(f"\tNo prior archives for {archive} found in {remote}:{remote_dir}", 1, cfg["verbose"])
+        return
+
+    # ascending timestamp order (btrbu style)
+    items.sort(key=lambda x: x[0])
+    ts_list = [t for t, _ in items]
+
+    keeps = build_keep_set(ts_list, keep)
+
+    for t, remote_path in items:
+        if t in keeps:
+            reason = _KEEP_REASON.get(keeps[t], keeps[t])
+            log(f"\tKeeping {remote_path} ({reason})", 1, cfg["verbose"])
+        else:
+            log(f"\tPruning {remote_path}", 1, cfg["verbose"])
+            # Build SSH delete command
+            delete_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "delete", remote_path))
+            try:
+                run(delete_cmd,
+                    dry_run=cfg.get("dry_run", False),
+                    verbosity=cfg["verbose"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True)
+            except subprocess.CalledProcessError:
+                print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
+                sys.exit(1)
+
 def _get_keeps(
     timestamps: list[str],
     keep_tbl: dict[str, str],
@@ -1803,6 +1894,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             }, cfg)
             if backup_dir:
                 apply_keep_policy(backup_dir, name, archive["keep"], cfg)
+            if remote and remote_dir:
+                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
         return
 
 
@@ -1833,6 +1926,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             }, cfg)
             if backup_dir:
                 apply_keep_policy(backup_dir, name, archive["keep"], cfg)
+            if remote and remote_dir:
+                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
         return
 
     # ----- paths that create a snapshot -----
@@ -1886,6 +1981,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
         apply_keep_policy(snap_dir, name, archive["keep"], cfg)
         if backup_dir:
             apply_keep_policy(backup_dir, name, archive["keep"], cfg)
+        if remote and remote_dir:
+            apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
     else:
@@ -1957,6 +2054,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             }, cfg)
             if backup_dir:
                 apply_keep_policy(backup_dir, name, archive["keep"], cfg)
+            if remote and remote_dir:
+                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
 
         if staged and stream_path is not None:
             remove_stage_file(stream_path, cfg)
