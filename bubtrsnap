@@ -1083,6 +1083,7 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         # Both local and remote: run send twice - once for each destination
         # First: local receive
         log("Sending to local backup...", 1, cfg["verbose"])
+        recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
         send_proc1 = subprocess.Popen(local_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         recv_proc1 = subprocess.Popen(recv_cmd, stdin=send_proc1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         send_proc1.stdout.close()
