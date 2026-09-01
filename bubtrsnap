@@ -968,20 +968,46 @@ def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: 
             if ts:
                 snapshots.append((ts, p, uuid))
 
+    # Skip remote queries in dry-run mode
+    if cfg.get("dry_run"):
+        log("Skipping SSH parent lookup (dry-run)", 3, cfg["verbose"])
+        return []
+
     # Collect received UUIDs from remote backup side
+    # Need to run `btrfs subvolume show` on each subvolume to get Received UUID
     received_uuids = set()
     cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir))
     try:
         result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
                      check=True, capture_output=True, text=True)
         for line in result.stdout.splitlines():
-            # Parse: ID 256 gen 1234 top level 5 uuid abcdef path lama7.20260831...
-            # or similar format
+            # Parse: ID 256 gen 1234 top level 5 path lama7.20260831...
+            # Extract the path (subvolume name)
             parts = line.split()
+            path_idx = -1
             for i, part in enumerate(parts):
-                if part == "uuid" and i + 1 < len(parts):
-                    received_uuids.add(parts[i + 1])
+                if part == "path" and i + 1 < len(parts):
+                    path_idx = i + 1
                     break
+            if path_idx >= 0:
+                remote_subvol = parts[path_idx]
+                # Only process subvolumes matching our archive pattern
+                if remote_subvol.startswith(f"{archive}."):
+                    # Run btrfs subvolume show on this specific subvolume to get Received UUID
+                    show_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "show", f"{remote_dir}/{remote_subvol}"))
+                    try:
+                        show_result = run(show_cmd, dry_run=False, verbosity=cfg["verbose"],
+                                          check=True, capture_output=True, text=True)
+                        # Parse output for Received UUID
+                        for show_line in show_result.stdout.splitlines():
+                            show_line = show_line.strip()
+                            if show_line.startswith("Received UUID:"):
+                                received_uuid = show_line.split(":", 1)[1].strip()
+                                if received_uuid and received_uuid != "-":
+                                    received_uuids.add(received_uuid)
+                                break
+                    except subprocess.CalledProcessError:
+                        log(f"Failed to show subvolume {remote_subvol} on {remote}:{remote_dir}", 3, cfg["verbose"])
     except subprocess.CalledProcessError:
         log(f"Failed to list subvolumes on {remote}:{remote_dir}", 3, cfg["verbose"])
 
