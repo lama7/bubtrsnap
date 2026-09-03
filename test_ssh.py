@@ -38,7 +38,7 @@ def _ns(**kwargs):
         send_to_dir=None,
         receive_from_dir=None,
         stage_dir=None,
-        sudo=False,
+        local_sudo=False,
         keep_hourly=None,
         keep_daily=None,
         keep_weekly=None,
@@ -134,7 +134,7 @@ class TestSSHValidation(unittest.TestCase):
         mock_result.stdout = "1"
         mock_run.return_value = mock_result
 
-        cfg = {"sudo": True, "verbose": 0, "dry_run": False}
+        cfg = {"local_sudo": True, "verbose": 0, "dry_run": False}
         bs.chk_btrfs_subvolume_ssh("user@host", "/remote/path", cfg)
         mock_run.assert_called_once()
 
@@ -142,7 +142,7 @@ class TestSSHValidation(unittest.TestCase):
     def test_chk_btrfs_subvolume_ssh_failure(self, mock_run):
         mock_run.side_effect = subprocess.CalledProcessError(1, "cmd", stderr="Not a btrfs subvolume")
 
-        cfg = {"sudo": True, "verbose": 0, "dry_run": False}
+        cfg = {"local_sudo": True, "verbose": 0, "dry_run": False}
         with self.assertRaises(SystemExit):
             bs.chk_btrfs_subvolume_ssh("user@host", "/remote/path", cfg)
 
@@ -161,7 +161,7 @@ class TestIterArchiveItemsSSH(unittest.TestCase):
         """).strip()
         mock_run.return_value = mock_result
 
-        cfg = {"sudo": True, "verbose": 0, "dry_run": False}
+        cfg = {"local_sudo": True, "verbose": 0, "dry_run": False}
         items = list(bs.iter_archive_items_ssh("user@host", "/remote/backup", "lama7", cfg))
 
         self.assertEqual(len(items), 3)
@@ -179,7 +179,7 @@ class TestIterArchiveItemsSSH(unittest.TestCase):
         """).strip()
         mock_run.return_value = mock_result
 
-        cfg = {"sudo": True, "verbose": 0, "dry_run": False}
+        cfg = {"local_sudo": True, "verbose": 0, "dry_run": False}
         items = list(bs.iter_archive_items_ssh("user@host", "/remote/backup", "lama7", cfg))
 
         self.assertEqual(len(items), 2)
@@ -190,7 +190,7 @@ class TestIterArchiveItemsSSH(unittest.TestCase):
     def test_iter_archive_items_ssh_empty_on_failure(self, mock_run):
         mock_run.side_effect = subprocess.CalledProcessError(1, "cmd", stderr="Permission denied")
 
-        cfg = {"sudo": True, "verbose": 0, "dry_run": False}
+        cfg = {"local_sudo": True, "verbose": 0, "dry_run": False}
         items = list(bs.iter_archive_items_ssh("user@host", "/remote/backup", "lama7", cfg))
 
         self.assertEqual(items, [])
@@ -205,7 +205,7 @@ class TestIterArchiveItemsSSH(unittest.TestCase):
         """).strip()
         mock_run.return_value = mock_result
 
-        cfg = {"sudo": True, "verbose": 0, "dry_run": False}
+        cfg = {"local_sudo": True, "verbose": 0, "dry_run": False}
         items = list(bs.iter_archive_items_ssh("user@host", "/remote/backup", "lama7", cfg))
 
         self.assertEqual(len(items), 2)
@@ -222,7 +222,7 @@ class TestIterArchiveItemsSSH(unittest.TestCase):
 
         mock_run.side_effect = run_mock
 
-        cfg = {"sudo": True, "verbose": 0, "dry_run": True}
+        cfg = {"local_sudo": True, "verbose": 0, "dry_run": True}
         items = list(bs.iter_archive_items_ssh("user@host", "/remote/backup", "lama7", cfg))
 
         self.assertEqual(items, [])
@@ -243,7 +243,7 @@ class TestApplyKeepPolicySSH(unittest.TestCase):
 
         mock_run.side_effect = run_mock
 
-        cfg = {"sudo": True, "verbose": 1, "dry_run": True}
+        cfg = {"local_sudo": True, "verbose": 1, "dry_run": True}
 
         with patch.object(bs, "iter_archive_items_ssh") as mock_iter:
             mock_iter.return_value = [
@@ -270,7 +270,7 @@ class TestApplyKeepPolicySSH(unittest.TestCase):
 
     @patch("bubtrsnap.run")
     def test_apply_keep_policy_ssh_prunes_old(self, mock_run):
-        cfg = {"sudo": True, "verbose": 1, "dry_run": False}
+        cfg = {"local_sudo": True, "verbose": 1, "dry_run": False}
 
         def run_mock(cmd, **kwargs):
             mock = MagicMock()
@@ -308,9 +308,9 @@ class TestFindParentsSSH(unittest.TestCase):
     """Test find_parents_ssh mirrors local find_parents logic."""
 
     @patch("bubtrsnap.run")
-    def test_find_parents_ssh_dry_run_returns_empty(self, mock_run):
-        """Dry-run should skip SSH calls and return empty list."""
-        cfg = {"sudo": True, "verbose": 1, "dry_run": True}
+    def test_find_parents_ssh_dry_run_executes_readonly(self, mock_run):
+        """Dry-run should execute read-only SSH calls (list, show) but return empty list since no real data."""
+        cfg = {"local_sudo": True, "verbose": 1, "dry_run": True}
 
         def run_mock(cmd, **kwargs):
             if kwargs.get("dry_run", False):
@@ -322,8 +322,10 @@ class TestFindParentsSSH(unittest.TestCase):
         snap_dir = Path("/snapshots")
         parents = bs.find_parents_ssh("lama7", snap_dir, "user@host", "/remote/backup", cfg)
 
+        # Dry-run executes read-only commands but run() returns None, so function returns empty
         self.assertEqual(parents, [])
-        mock_run.assert_not_called()
+        # Verify SSH commands were attempted (run was called)
+        self.assertTrue(mock_run.called)
 
     @patch("bubtrsnap.run")
     def test_find_parents_ssh_matches_received_uuid(self, mock_run):
@@ -375,7 +377,7 @@ class TestFindParentsSSH(unittest.TestCase):
             (snap_dir / "lama7.202608290230").mkdir()
             (snap_dir / "lama7.202608300230").mkdir()
 
-            cfg = {"sudo": True, "verbose": 1, "dry_run": False}
+            cfg = {"local_sudo": True, "verbose": 1, "dry_run": False}
             parents = bs.find_parents_ssh("lama7", snap_dir, "user@host", "/remote/backup", cfg)
 
             # Should find matches for all 3 remote subvolumes

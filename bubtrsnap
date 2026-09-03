@@ -26,13 +26,14 @@ from typing import Any
 DEFAULT_CONFIG = {
     "snapshot_dir": None,
     "backup_dir": None,
-    "sudo": False,
+    "local_sudo": False,
     "snaps_only": False,
     "send_to_dir": None,
     "receive_from_dir": None,
     "stage_dir": None,
     "remote": None,
     "remote_dir": None,
+    "remote_sudo": False,
     # Global default keep policy
     "keep_hourly": 0,
     "keep_daily": 0,
@@ -63,6 +64,7 @@ def log(msg: str, level: int, verbosity: int) -> None:
 # ---------------------------------------------------------------------------
 def run(cmd: list[str],
         dry_run: bool = False,
+        read_only: bool = False,
         verbosity: int = 0,
         **kwargs) -> subprocess.CompletedProcess | None:
     """
@@ -70,10 +72,28 @@ def run(cmd: list[str],
     
     Extra keyword arguments are passed directly to subprocess.run().
     Common ones: check=True, capture_output=True, text=True, etc.
+    
+    Args:
+        dry_run: If True, normally skips execution and logs [dry-run] prefix.
+        read_only: If True AND dry_run is True, still executes the command
+                   (read-only operations like list/show/validate should run
+                   during dry-run to give the user a realistic preview).
+                   Returns None so callers that check for None don't proceed
+                   with write operations.
     """
     pretty = " ".join(str(c) for c in cmd)
 
     if dry_run:
+        if read_only:
+            # Read-only operations execute during dry-run for realistic preview
+            log(pretty, 2, verbosity)
+            try:
+                return subprocess.run(cmd, **kwargs)
+            except subprocess.CalledProcessError:
+                raise
+            except Exception as e:
+                log(f"[dry-run] {cmd[0]} failed: {e}", 2, verbosity)
+                return None
         log(f"[dry-run] {pretty}", 2, verbosity)
         return None
 
@@ -172,7 +192,7 @@ def crc32c(data: bytes, crc: int = 0) -> int:
 def _read_file_prefix(path: Path, cfg: dict, size: int = _STREAM_PREFIX_SIZE) -> bytes | None:
     """Read the first `size` bytes of path, using sudo -n when configured."""
     path = Path(path)
-    if cfg.get("sudo"):
+    if cfg.get("local_sudo"):
         # dd: portable, no partial-line issues; status=none keeps stderr quiet
         cmd = [
             "sudo", "-n", "dd",
@@ -288,7 +308,7 @@ def remove_stage_file(path: Path, cfg: dict) -> None:
     if not path.exists():
         return
     try:
-        if cfg.get("sudo"):
+        if cfg.get("local_sudo"):
             subprocess.run(
                 ["sudo", "-n", "rm", "-f", str(path)],
                 check=False,
@@ -306,13 +326,14 @@ def remove_stage_file(path: Path, cfg: dict) -> None:
 ALLOWED_GLOBAL_OPTIONS = {
     "snapshot_dir": str,
     "backup_dir": str,
-    "sudo": bool,
+    "local_sudo": bool,
     "snaps_only": bool,
     "send_to_dir": str,
     "receive_from_dir": str,
     "stage_dir": str,
     "remote": str,
     "remote_dir": str,
+    "remote_sudo": bool,
     "keep_hourly": int,
     "keep_daily": int,
     "keep_weekly": int,
@@ -338,6 +359,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "keep_yearly": int,
     "remote": str,
     "remote_dir": str,
+    "remote_sudo": bool,
     "backup_dir": str,
 }
 
@@ -493,8 +515,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         global_cfg["snapshot_dir"] = cli.snapshot_dir
     if cli.backup_dir:
         global_cfg["backup_dir"] = cli.backup_dir
-    if cli.sudo:
-        global_cfg["sudo"] = True
+    if cli.local_sudo:
+        global_cfg["local_sudo"] = True
     if getattr(cli, "snaps_only", False):
         global_cfg["snaps_only"] = True
     
@@ -743,13 +765,15 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             )
             sys.exit(1)
 
-        # Resolve remote/remote_dir with precedence: CLI > archive-specific > global
-        if cli_remote is not None and cli_remote_dir is not None:
-            remote = cli_remote
-            remote_dir = cli_remote_dir
+        # Resolve remote/remote_dir/remote_sudo with precedence: CLI > archive-specific > global
+        if getattr(cli, "remote", None) is not None and getattr(cli, "remote_dir", None) is not None:
+            remote = cli.remote
+            remote_dir = cli.remote_dir
+            remote_sudo = getattr(cli, "remote_sudo", False)
         else:
             remote = raw.get("remote", global_cfg.get("remote"))
             remote_dir = raw.get("remote_dir", global_cfg.get("remote_dir"))
+            remote_sudo = raw.get("remote_sudo", global_cfg.get("remote_sudo", False))
         
         # Validate: if remote_dir is set, remote must also be set (from any level)
         if remote_dir and not remote:
@@ -774,6 +798,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             "stage_dir": stage_dir,
             "remote": remote,
             "remote_dir": remote_dir,
+            "remote_sudo": remote_sudo,
             "backup_dir": backup_dir,
             "pre_snapshot_hook": raw.get("pre_snapshot_hook"),
             "post_snapshot_hook": raw.get("post_snapshot_hook"),
@@ -787,9 +812,10 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
 # ---------------------------------------------------------------------------
 # Functions that use btrfs commands
 # ---------------------------------------------------------------------------
-def btrfs_cmd(cfg: dict, *args: str) -> list[str]:
+def btrfs_cmd(cfg: dict, *args: str, sudo: bool | None = None) -> list[str]:
     cmd = ["btrfs"]
-    if cfg.get("sudo"):
+    use_sudo = sudo if sudo is not None else cfg.get("local_sudo", False)
+    if use_sudo:
         cmd = ["sudo", "-n"] + cmd
     return cmd + list(args)
 
@@ -809,18 +835,18 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
         f"(required for snapshot/backup/receive operations)", file=sys.stderr)
         sys.exit(1)
 
-def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict):
+def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False):
     """Check if a remote directory is a btrfs subvolume via SSH."""
     # Build SSH command: ssh remote sudo -n btrfs subvolume show remote_dir
-    sudo_prefix = ["sudo", "-n"] if cfg.get("sudo") else []
+    sudo_prefix = ["sudo", "-n"] if remote_sudo else []
     ssh_cmd = ["ssh", remote] + sudo_prefix + ["btrfs", "subvolume", "show", remote_dir]
     
-    if cfg.get("dry_run"):
-        log(f"[dry-run] {' '.join(ssh_cmd)}", 2, cfg["verbose"])
-        return
-    
+    # Always execute validation during dry-run (read-only operation)
     try:
-        result = subprocess.run(ssh_cmd, check=True, capture_output=True, text=True, timeout=30)
+        result = run(ssh_cmd,
+                     dry_run=False,
+                     verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True, timeout=30)
         log(f"\t{remote}:{remote_dir} is a valid btrfs subvolume", 2, cfg["verbose"])
     except subprocess.CalledProcessError as e:
         print(f"Error: '{remote}:{remote_dir}' is not a btrfs subvolume "
@@ -879,12 +905,12 @@ def get_subvol_uuids(path: Path, cfg: dict) -> tuple[str | None, str | None]:
         return None, None
 
 
-def get_subvol_uuids_ssh(remote: str, remote_path: str, cfg: dict) -> tuple[str | None, str | None]:
+def get_subvol_uuids_ssh(remote: str, remote_path: str, cfg: dict, remote_sudo: bool = False) -> tuple[str | None, str | None]:
     """
     Returns (UUID, Received UUID) for a btrfs subvolume on a remote host via SSH.
     Returns (None, None) on failure.
     """
-    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "show", remote_path))
+    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "show", remote_path, sudo=False), remote_sudo)
     try:
         result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
                      check=True, capture_output=True, text=True)
@@ -950,7 +976,7 @@ def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) 
     return result
 
 
-def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: str, cfg: dict) -> list[Path]:
+def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False) -> list[Path]:
     """
     Find previous snapshots in snapshot_dir that have already been
     successfully received to remote_dir via SSH (matched by UUID ↔ Received UUID).
@@ -971,10 +997,15 @@ def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: 
     # Collect received UUIDs from remote backup side
     # Need to run `btrfs subvolume show` on each subvolume to get Received UUID
     received_uuids = set()
-    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir))
+    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir, sudo=False), remote_sudo)
     try:
-        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+        # Always execute read-only listing during dry-run
+        result = run(cmd,
+                     dry_run=False,
+                     verbosity=cfg["verbose"],
                      check=True, capture_output=True, text=True)
+        if result is None:
+            return []
         for line in result.stdout.splitlines():
             # Parse: ID 256 gen 1234 top level 5 path lama7.20260831...
             # Extract the path (subvolume name)
@@ -989,10 +1020,15 @@ def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: 
                 # Only process subvolumes matching our archive pattern
                 if remote_subvol.startswith(f"{archive}."):
                     # Run btrfs subvolume show on this specific subvolume to get Received UUID
-                    show_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "show", f"{remote_dir}/{remote_subvol}"))
+                    show_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "show", f"{remote_dir}/{remote_subvol}", sudo=False), remote_sudo)
                     try:
-                        show_result = run(show_cmd, dry_run=False, verbosity=cfg["verbose"],
+                        # Always execute read-only show during dry-run
+                        show_result = run(show_cmd,
+                                          dry_run=False,
+                                          verbosity=cfg["verbose"],
                                           check=True, capture_output=True, text=True)
+                        if show_result is None:
+                            continue
                         # Parse output for Received UUID
                         for show_line in show_result.stdout.splitlines():
                             show_line = show_line.strip()
@@ -1027,21 +1063,23 @@ def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: 
 # ---------------------------------------------------------------------------
 # SSH Helpers
 # ---------------------------------------------------------------------------
-def build_ssh_cmd(remote: str, remote_cmd: list[str]) -> list[str]:
+def build_ssh_cmd(remote: str, remote_cmd: list[str], remote_sudo: bool = False) -> list[str]:
     """Build an SSH command to run remote_cmd on the remote host."""
-    return ["ssh", remote] + remote_cmd
+    sudo_prefix = ["sudo", "-n"] if remote_sudo else []
+    return ["ssh", remote] + sudo_prefix + remote_cmd
 
 
-def build_ssh_receive_cmd(remote: str, remote_dir: str, cfg: dict) -> list[str]:
+def build_ssh_receive_cmd(remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False) -> list[str]:
     """Build the remote btrfs receive command via SSH."""
-    recv_cmd = btrfs_cmd(cfg, "receive", remote_dir)
-    return build_ssh_cmd(remote, recv_cmd)
+    recv_cmd = btrfs_cmd(cfg, "receive", remote_dir, sudo=False)
+    return build_ssh_cmd(remote, recv_cmd, remote_sudo)
 
 
 def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: dict, archive: str, archive_cfg: dict | None = None) -> Path:
     # Check if SSH remote is configured
     remote = archive_cfg.get("remote") if archive_cfg else cfg.get("remote")
     remote_dir = archive_cfg.get("remote_dir") if archive_cfg else cfg.get("remote_dir")
+    remote_sudo = archive_cfg.get("remote_sudo") if archive_cfg else cfg.get("remote_sudo", False)
 
     dest = backup_dir / snap.name if backup_dir else Path(snap.name)
 
@@ -1049,7 +1087,7 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
     local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
     
     # Find parents for SSH destination
-    ssh_parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg) if (remote and remote_dir) else []
+    ssh_parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo) if (remote and remote_dir) else []
 
     # Build parent arguments for local destination
     local_send_cmd = btrfs_cmd(cfg, "send")
@@ -1066,7 +1104,7 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
     # For dry-run, show what would happen
     if cfg.get("dry_run"):
         if remote and remote_dir:
-            ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
+            ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
             if backup_dir:
                 if local_parents:
                     log(f"Incremental send using {len(local_parents)} local parent(s) + {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
@@ -1116,7 +1154,7 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         # Second: SSH receive
         log(f"Sending to SSH remote {remote}...", 1, cfg["verbose"])
         send_proc2 = subprocess.Popen(ssh_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
+        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
         ssh_proc2 = subprocess.Popen(ssh_recv, stdin=send_proc2.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         send_proc2.stdout.close()
         ssh_proc2.communicate()
@@ -1162,12 +1200,13 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     # Check if SSH remote is configured
     remote = archive_cfg.get("remote") if archive_cfg else cfg.get("remote")
     remote_dir = archive_cfg.get("remote_dir") if archive_cfg else cfg.get("remote_dir")
+    remote_sudo = archive_cfg.get("remote_sudo") if archive_cfg else cfg.get("remote_sudo", False)
 
     # Find parents for local destination
     local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
-
+    
     # Find parents for SSH destination
-    ssh_parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg) if (remote and remote_dir) else []
+    ssh_parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo) if (remote and remote_dir) else []
 
     # Build parent arguments for local destination
     local_send_cmd = btrfs_cmd(cfg, "send")
@@ -1176,7 +1215,7 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     local_send_cmd += ["-f", str(stream_file), str(snap)]
 
     # Build parent arguments for SSH destination
-    ssh_send_cmd = btrfs_cmd(cfg, "send")
+    ssh_send_cmd = btrfs_cmd(cfg, "send", sudo=False)
     for i, p in enumerate(ssh_parents):
         ssh_send_cmd += ["-p" if i == 0 else "-c", str(p)]
     ssh_send_cmd += ["-f", str(stream_file), str(snap)]
@@ -1188,7 +1227,7 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
 
     if cfg.get("dry_run"):
         if remote and remote_dir:
-            ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
+            ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
             if backup_dir:
                 if local_parents:
                     log(f"Incremental send using {len(local_parents)} local parent(s) + {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
@@ -1221,7 +1260,7 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         return stream_file
 
     if has_remote:
-        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
+        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
         log(f"{' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
 
     if has_local:
@@ -1517,18 +1556,24 @@ def iter_archive_items(directory: Path, archive: str):
         yield ts, p
 
 
-def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict):
+def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict, remote_sudo: bool = False):
     """
     Yield (timestamp_str, remote_subvol_path) for exact archive.YYYYMMDDHHMM entries
     on a remote SSH host. Mirrors iter_archive_items but queries via SSH.
     """
     # Build SSH command to list subvolumes
-    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir))
+    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir, sudo=False), remote_sudo)
     try:
-        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+        # Always execute read-only listing during dry-run
+        result = run(cmd,
+                     dry_run=False,
+                     verbosity=cfg["verbose"],
                      check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError:
         log(f"Failed to list subvolumes on {remote}:{remote_dir}", 3, cfg["verbose"])
+        return
+
+    if result is None:
         return
 
     for line in result.stdout.splitlines():
@@ -1552,60 +1597,6 @@ def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict
                 continue
             # Yield timestamp and full remote path
             yield ts, f"{remote_dir}/{remote_subvol}"
-
-
-def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict) -> None:
-    """
-    Apply the given keep policy to backups of an archive on a remote SSH host.
-    Mirrors apply_keep_policy but operates via SSH.
-    """
-    keep_values = [
-        keep.get("keep_hourly", 0),
-        keep.get("keep_daily", 0),
-        keep.get("keep_weekly", 0),
-        keep.get("keep_monthly", 0),
-        keep.get("keep_yearly", 0),
-    ]
-    if not any(v > 0 for v in keep_values):
-        log(
-            f"No keep policy specified for {archive} on SSH remote – skipping pruning",
-            1,
-            cfg["verbose"],
-        )
-        return
-
-    log(f"Keep policy for {archive} on SSH remote {remote}:{remote_dir}: {format_keep_policy(keep)}", 1, cfg["verbose"])
-    log(f"Applying to {archive} in {remote}:{remote_dir}:", 1, cfg["verbose"])
-
-    items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg))
-    if not items:
-        log(f"\tNo prior archives for {archive} found in {remote}:{remote_dir}", 1, cfg["verbose"])
-        return
-
-    # ascending timestamp order (btrbu style)
-    items.sort(key=lambda x: x[0])
-    ts_list = [t for t, _ in items]
-
-    keeps = build_keep_set(ts_list, keep)
-
-    for t, remote_path in items:
-        if t in keeps:
-            reason = _KEEP_REASON.get(keeps[t], keeps[t])
-            log(f"\tKeeping {remote_path} ({reason})", 1, cfg["verbose"])
-        else:
-            log(f"\tPruning {remote_path}", 1, cfg["verbose"])
-            # Build SSH delete command
-            delete_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "delete", remote_path))
-            try:
-                run(delete_cmd,
-                    dry_run=cfg.get("dry_run", False),
-                    verbosity=cfg["verbose"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True)
-            except subprocess.CalledProcessError:
-                print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
-                sys.exit(1)
 
 def _get_keeps(
     timestamps: list[str],
@@ -1753,6 +1744,59 @@ def build_keep_set(ts_list: list[str], keep: dict) -> dict[str, str]:
 
     return keeps
 
+def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict, remote_sudo: bool = False) -> None:
+    """
+    Apply the given keep policy to backups of an archive on a remote SSH host.
+    Mirrors apply_keep_policy but operates via SSH.
+    """
+    keep_values = [
+        keep.get("keep_hourly", 0),
+        keep.get("keep_daily", 0),
+        keep.get("keep_weekly", 0),
+        keep.get("keep_monthly", 0),
+        keep.get("keep_yearly", 0),
+    ]
+    if not any(v > 0 for v in keep_values):
+        log(
+            f"No keep policy specified for {archive} on SSH remote – skipping pruning",
+            1,
+            cfg["verbose"],
+        )
+        return
+
+    log(f"Keep policy for {archive} on SSH remote {remote}:{remote_dir}: {format_keep_policy(keep)}", 1, cfg["verbose"])
+    log(f"Applying to {archive} in {remote}:{remote_dir}:", 1, cfg["verbose"])
+
+    items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg, remote_sudo))
+    if not items:
+        log(f"\tNo prior archives for {archive} found in {remote}:{remote_dir}", 1, cfg["verbose"])
+        return
+
+    # ascending timestamp order (btrbu style)
+    items.sort(key=lambda x: x[0])
+    ts_list = [t for t, _ in items]
+
+    keeps = build_keep_set(ts_list, keep)
+
+    for t, remote_path in items:
+        if t in keeps:
+            reason = _KEEP_REASON.get(keeps[t], keeps[t])
+            log(f"\tKeeping {remote_path} ({reason})", 1, cfg["verbose"])
+        else:
+            log(f"\tPruning {remote_path}", 1, cfg["verbose"])
+            # Build SSH delete command
+            delete_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "delete", remote_path, sudo=False))
+            try:
+                run(delete_cmd,
+                    dry_run=cfg.get("dry_run", False),
+                    verbosity=cfg["verbose"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True)
+            except subprocess.CalledProcessError:
+                print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
+                sys.exit(1)
+
 def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> None:
     """
     Apply the given keep policy to snapshots or backups of an archive.
@@ -1877,7 +1921,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
         if backup_dir:
             chk_btrfs_subvolume(backup_dir, cfg)
         if remote and remote_dir:
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
+            remote_sudo = archive.get("remote_sudo", False)
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
         p = Path(recv_file)
         if not p.is_file() or not is_btrfs_stream(p, cfg):
             print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
@@ -1895,7 +1940,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             if backup_dir:
                 apply_keep_policy(backup_dir, name, archive["keep"], cfg)
             if remote and remote_dir:
-                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
+                remote_sudo = archive.get("remote_sudo", False)
+                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
         return
 
 
@@ -1908,7 +1954,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
         if backup_dir:
             chk_btrfs_subvolume(backup_dir, cfg)
         if remote and remote_dir:
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
+            remote_sudo = archive.get("remote_sudo", False)
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
         stream = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
         if not stream:
             log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
@@ -1927,7 +1974,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             if backup_dir:
                 apply_keep_policy(backup_dir, name, archive["keep"], cfg)
             if remote and remote_dir:
-                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
+                remote_sudo = archive.get("remote_sudo", False)
+                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
         return
 
     # ----- paths that create a snapshot -----
@@ -1969,7 +2017,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
         log("Starting backup...", 1, cfg["verbose"])
         # Check remote_dir if configured
         if remote and remote_dir:
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
+            remote_sudo = archive.get("remote_sudo", False)
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
         if backup_dir:
             chk_btrfs_subvolume(backup_dir, cfg)
         dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
@@ -1982,7 +2031,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
         if backup_dir:
             apply_keep_policy(backup_dir, name, archive["keep"], cfg)
         if remote and remote_dir:
-            apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
+            remote_sudo = archive.get("remote_sudo", False)
+            apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
     else:
@@ -2010,7 +2060,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
         
         # Check remote_dir if configured
         if remote and remote_dir:
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg)
+            remote_sudo = archive.get("remote_sudo", False)
+            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
 
         # Note that by this point, recv_file and recv_dir should NOT both be set. We took
         # care with configuration rules that should prevent that combination.  In fact, 
@@ -2055,7 +2106,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             if backup_dir:
                 apply_keep_policy(backup_dir, name, archive["keep"], cfg)
             if remote and remote_dir:
-                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg)
+                remote_sudo = archive.get("remote_sudo", False)
+                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
 
         if staged and stream_path is not None:
             remove_stage_file(stream_path, cfg)
@@ -2135,9 +2187,15 @@ Examples:
              "Can be set globally or per-archive in config file."
     )
     parser.add_argument(
-        "--sudo",
+        "--remote-sudo",
         action="store_true",
-        help="Run btrfs commands with 'sudo -n'"
+        help="Run btrfs commands on SSH remote with 'sudo -n'. "
+             "Can be set globally or per-archive in config file."
+    )
+    parser.add_argument(
+        "--local-sudo",
+        action="store_true",
+        help="Run local btrfs commands with 'sudo -n'"
     )
 
     # Keep policy (CLI keeps are all-or-nothing)

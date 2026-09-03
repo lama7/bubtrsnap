@@ -33,7 +33,7 @@ def _ns(**kwargs):
         send_to_dir=None,
         receive_from_dir=None,
         stage_dir=None,
-        sudo=False,
+        local_sudo=False,
         keep_hourly=None,
         keep_daily=None,
         keep_weekly=None,
