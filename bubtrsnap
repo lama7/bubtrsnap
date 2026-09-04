@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
     "sudo": False,
     "snaps_only": False,
     "send_to_dir": None,
-    "receive_from_dir": None,    
+    "receive_from_dir": None,   
     "stage_dir": None,
     # Global default keep policy
     "keep_hourly": 0,
@@ -37,8 +37,20 @@ DEFAULT_CONFIG = {
     "keep_weekly": 0,
     "keep_monthly": 0,
     "keep_yearly": 0,
+    "week_startday": "sunday",
     "verbose": 0,
     "dry_run": False,
+}
+
+# Day name to weekday (Mon=0 ... Sun=6)
+_DAY_TO_WEEKDAY = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
 }
 
 # ---------------------------------------------------------------------------
@@ -307,13 +319,14 @@ ALLOWED_GLOBAL_OPTIONS = {
     "sudo": bool,
     "snaps_only": bool,
     "send_to_dir": str,
-    "receive_from_dir": str,    
+    "receive_from_dir": str,   
     "stage_dir": str,
     "keep_hourly": int,
     "keep_daily": int,
     "keep_weekly": int,
     "keep_monthly": int,
     "keep_yearly": int,
+    "week_startday": str,
     "verbose": int,
     "dry_run": bool,
 }
@@ -332,6 +345,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "keep_weekly": int,
     "keep_monthly": int,
     "keep_yearly": int,
+    "week_startday": str,
 }
 
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
@@ -341,6 +355,12 @@ def _check_type(name: str, value: Any, expected_type: type, context: str) -> Non
             print(f"Error: '{name}' in {context} must be a string, got {type(value).__name__}",
                   file=sys.stderr)
             sys.exit(1)
+        # Special validation for week_startday
+        if name == "week_startday":
+            if value.lower() not in _DAY_TO_WEEKDAY:
+                print(f"Error: '{name}' in {context} must be one of: monday, tuesday, wednesday, thursday, friday, saturday, sunday",
+                      file=sys.stderr)
+                sys.exit(1)
     elif expected_type is int:
         if not isinstance(value, int) or isinstance(value, bool):  # bool is subclass of int
             print(f"Error: '{name}' in {context} must be an integer, got {type(value).__name__}",
@@ -476,6 +496,13 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         global_cfg["sudo"] = True
     if getattr(cli, "snaps_only", False):
         global_cfg["snaps_only"] = True
+    if getattr(cli, "week_startday", None):
+        ws = cli.week_startday.lower()
+        if ws not in _DAY_TO_WEEKDAY:
+            print(f"Error: --week-startday must be one of: monday, tuesday, wednesday, thursday, friday, saturday, sunday",
+                  file=sys.stderr)
+            sys.exit(1)
+        global_cfg["week_startday"] = ws
 
     # -------------------------------------------------------------------------
     # Six file-related options resolution
@@ -720,6 +747,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             "post_snapshot_hook": raw.get("post_snapshot_hook"),
             "post_backup_hook": raw.get("post_backup_hook"),
             "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
+            "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
+            "force_keep": getattr(cli, "keep", None),
         }
         resolved.append(entry)
 
@@ -1041,13 +1070,18 @@ def _prev_day(ts: str, days_cnt: int) -> str:
     t = _parse_ts_str(ts) - timedelta(days=days_cnt)
     return _ts_str(_end_of_day(t))
 
-def _prev_week(ts: str, week_cnt: int) -> str:
-    """Most recent Saturday at or before ts, then week_cnt weeks further back."""
+def _prev_week(ts: str, week_cnt: int, week_start_day: int = 6) -> str:
+    """Most recent week-end day at or before ts, then week_cnt weeks further back.
+    
+    week_start_day: 0=Monday ... 6=Sunday (the day the week STARTS).
+    The week END day is (week_start_day - 1) % 7.
+    """
     t = _parse_ts_str(ts)
-    # Saturday = weekday 5 (Mon=0 … Sun=6)
-    days_since_sat = (t.weekday() - 5) % 7
-    if days_since_sat != 0:
-        t = t - timedelta(days=days_since_sat)
+    # Week end day = day before week start day
+    week_end_day = (week_start_day - 1) % 7
+    days_since_end = (t.weekday() - week_end_day) % 7
+    if days_since_end != 0:
+        t = t - timedelta(days=days_since_end)
     t = t - timedelta(weeks=week_cnt)
     return _ts_str(_end_of_day(t))
 
@@ -1136,7 +1170,7 @@ def _get_keeps(
             i -= 1
     return oldest_keep
 
-def build_keep_set(ts_list: list[str], keep: dict) -> dict[str, str]:
+def build_keep_set(ts_list: list[str], keep: dict, week_start_day: int = 6) -> dict[str, str]:
     """
     Port of btrbu bldKeepList (table-driven interval loop).
 
@@ -1193,8 +1227,8 @@ def build_keep_set(ts_list: list[str], keep: dict) -> dict[str, str]:
         (
             "w",
             counts["w"],
-            _prev_week,
-            lambda newest, old: _prev_week(_prev_day(old or newest, 1), 0),
+            lambda ts, cnt: _prev_week(ts, cnt, week_start_day),
+            lambda newest, old: _prev_week(_prev_day(old or newest, 1), 0, week_start_day),
         ),
         (
             "m",
@@ -1291,7 +1325,22 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
     items.sort(key=lambda x: x[0])
     ts_list = [t for t, _ in items]
 
-    keeps = build_keep_set(ts_list, keep)
+    # Parse week_startday from config
+    week_startday_str = cfg.get("week_startday", "sunday").lower()
+    week_start_day = _DAY_TO_WEEKDAY.get(week_startday_str, 6)
+
+    # Handle force_keep: validate timestamp exists for this archive
+    force_keep = cfg.get("force_keep")
+    if force_keep:
+        if force_keep not in ts_list:
+            print(f"Error: --keep timestamp '{force_keep}' not found for archive '{archive}'", file=sys.stderr)
+            sys.exit(1)
+
+    keeps = build_keep_set(ts_list, keep, week_start_day)
+
+    # Apply force_keep
+    if force_keep:
+        keeps[force_keep] = "forced"
 
     for t, p in items:
         if t in keeps:
@@ -1594,6 +1643,13 @@ Examples:
     parser.add_argument("--keep-weekly", type=int, metavar="N", help="Number of weekly snapshots/backups to retain")
     parser.add_argument("--keep-monthly", type=int, metavar="N", help="Number of monthly snapshots/backups to retain")
     parser.add_argument("--keep-yearly", type=int, metavar="N", help="Number of yearly snapshots/backups to retain")
+    parser.add_argument("--week-startday", type=str, metavar="DAY",
+        help="Day that starts the week: monday..sunday (default: sunday)")
+
+    # Per-archive forced keep
+    parser.add_argument("--keep", type=str, metavar="TIMESTAMP",
+        help="Force keep of a specific timestamp for the archive (format: YYYYMMDDhhmmss). "
+             "Must match an existing snapshot/backup for the archive. Archive-specific only.")
 
     # Verbosity
     parser.add_argument(
