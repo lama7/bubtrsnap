@@ -93,6 +93,29 @@ def run(cmd: list[str],
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M")
 
+def _merge_force_keep(config_val: str | None, cli_val: list[str] | None) -> list[str]:
+    """Merge force_keep from config (comma-separated string) and CLI (list of strings).
+    
+    Returns a list of timestamp strings (12-digit format).
+    """
+    result = []
+    # Config value: comma-separated string
+    if config_val:
+        for ts in config_val.split(","):
+            ts = ts.strip()
+            if ts:
+                result.append(ts)
+    # CLI value: list from append action
+    if cli_val:
+        for item in cli_val:
+            if item:
+                # Also support comma-separated in CLI
+                for ts in item.split(","):
+                    ts = ts.strip()
+                    if ts:
+                        result.append(ts)
+    return result
+
 def parse_ts(name: str) -> datetime | None:
     try:
         # expected form archive.YYYYMMDDHHMM
@@ -346,6 +369,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "keep_monthly": int,
     "keep_yearly": int,
     "week_startday": str,
+    "force_keep": str,
 }
 
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
@@ -361,6 +385,15 @@ def _check_type(name: str, value: Any, expected_type: type, context: str) -> Non
                 print(f"Error: '{name}' in {context} must be one of: monday, tuesday, wednesday, thursday, friday, saturday, sunday",
                       file=sys.stderr)
                 sys.exit(1)
+        # Special validation for force_keep (timestamp format YYYYMMDDhhmm)
+        if name == "force_keep":
+            # Split by comma and validate each timestamp
+            timestamps = [t.strip() for t in value.split(",")]
+            for ts in timestamps:
+                if len(ts) != 12 or not ts.isdigit():
+                    print(f"Error: '{name}' in {context} must be a comma-separated list of timestamps in YYYYMMDDhhmm format",
+                          file=sys.stderr)
+                    sys.exit(1)
     elif expected_type is int:
         if not isinstance(value, int) or isinstance(value, bool):  # bool is subclass of int
             print(f"Error: '{name}' in {context} must be an integer, got {type(value).__name__}",
@@ -748,7 +781,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             "post_backup_hook": raw.get("post_backup_hook"),
             "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
             "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
-            "force_keep": getattr(cli, "keep", None),
+            "force_keep": _merge_force_keep(raw.get("force_keep"), getattr(cli, "keep", None)),
         }
         resolved.append(entry)
 
@@ -1329,18 +1362,25 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
     week_startday_str = cfg.get("week_startday", "sunday").lower()
     week_start_day = _DAY_TO_WEEKDAY.get(week_startday_str, 6)
 
-    # Handle force_keep: validate timestamp exists for this archive
-    force_keep = cfg.get("force_keep")
-    if force_keep:
-        if force_keep not in ts_list:
-            print(f"Error: --keep timestamp '{force_keep}' not found for archive '{archive}'", file=sys.stderr)
-            sys.exit(1)
+    # Handle force_keep: validate timestamps exist for this archive
+    force_keep_list = cfg.get("force_keep", [])
+    if force_keep_list:
+        for ts in force_keep_list:
+            if ts not in ts_list:
+                print(f"Error: --keep timestamp '{ts}' not found for archive '{archive}'", file=sys.stderr)
+                sys.exit(1)
 
-    keeps = build_keep_set(ts_list, keep, week_start_day)
+    # Apply forced keeps first - these are guaranteed to be kept
+    keeps = {}
+    for ts in force_keep_list:
+        keeps[ts] = "forced"
 
-    # Apply force_keep
-    if force_keep:
-        keeps[force_keep] = "forced"
+    # Now apply keep policy to remaining timestamps
+    policy_keeps = build_keep_set(ts_list, keep, week_start_day)
+    # Add policy keeps, but don't overwrite forced ones
+    for ts, reason in policy_keeps.items():
+        if ts not in keeps:
+            keeps[ts] = reason
 
     for t, p in items:
         if t in keeps:
@@ -1647,8 +1687,9 @@ Examples:
         help="Day that starts the week: monday..sunday (default: sunday)")
 
     # Per-archive forced keep
-    parser.add_argument("--keep", type=str, metavar="TIMESTAMP",
-        help="Force keep of a specific timestamp for the archive (format: YYYYMMDDhhmmss). "
+    parser.add_argument("--keep", type=str, metavar="TIMESTAMP", action="append",
+        help="Force keep of a specific timestamp for the archive (format: YYYYMMDDhhmm). "
+             "Can be specified multiple times. Comma-separated list also accepted. "
              "Must match an existing snapshot/backup for the archive. Archive-specific only.")
 
     # Verbosity
