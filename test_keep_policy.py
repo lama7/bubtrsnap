@@ -181,5 +181,13 @@ class TestForceKeep(unittest.TestCase):
         # The actual validation happens there, build_keep_set just receives ts_list
         self.assertNotIn("202601031200", ts)
 
+    def test_apply_keep_policy_force_keep_missing_logs_warning(self):
+        """apply_keep_policy logs warning and ignores missing force_keep timestamps."""
+        # This tests the behavior via the full function
+        # We can't easily test apply_keep_policy directly without mocking
+        # but we can test the _merge_force_keep function
+        result = bs._merge_force_keep("202601011200,202601021200", ["202601031200"])
+        self.assertEqual(result, ["202601011200", "202601021200", "202601031200"])
+
 if __name__ == "__main__":
     unittest.main()

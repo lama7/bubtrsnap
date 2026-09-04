@@ -635,6 +635,22 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         if val is not None:
             cli_keeps[key] = val
 
+    # CLI force_keep options (--keep) - requires exactly one archive total
+    cli_force_keep = getattr(cli, "keep", None)
+    if cli_force_keep:
+        # Count total archives that would be processed
+        cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
+        n_cli = len(cli_archives)
+        n_cfg = len(raw_archives)
+        total_archives = n_cli if n_cli > 0 else n_cfg
+        if total_archives != 1:
+            print(
+                "Error: --keep requires exactly one archive to process "
+                f"(found {total_archives})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # now process any archives from the CLI
     cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
 
@@ -1365,10 +1381,13 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
     # Handle force_keep: validate timestamps exist for this archive
     force_keep_list = cfg.get("force_keep", [])
     if force_keep_list:
+        valid_force_keep = []
         for ts in force_keep_list:
             if ts not in ts_list:
-                print(f"Error: --keep timestamp '{ts}' not found for archive '{archive}'", file=sys.stderr)
-                sys.exit(1)
+                log(f"Warning: --keep timestamp '{ts}' not found for archive '{archive}' – ignoring", 1, cfg["verbose"])
+            else:
+                valid_force_keep.append(ts)
+        force_keep_list = valid_force_keep
 
     # Apply forced keeps first - these are guaranteed to be kept
     keeps = {}
