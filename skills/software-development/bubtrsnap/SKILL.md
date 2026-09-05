@@ -115,7 +115,7 @@ When both `backup_dir` (local) and `remote_dir` + `remote` are set, bubtrsnap se
 - **Config validation** runs before archive resolution — invalid types exit early
 - **Timestamp format** is `YYYYMMDDhhmm` (12 digits) — NOT `YYYYMMDDhhmmss`
 - **Week boundaries**: default `sunday` start → week ends `saturday` (backward compat)
-- **Force keeps** (`--keep` / `force_keep`) are applied BEFORE policy, logged as `"forced"`
+- **Force keeps** (`--keep` / `keep`) are applied BEFORE policy, logged as `"forced"`
 - **`--keep` requires exactly one archive** — validated in `load_and_resolve_archives()`
 - **SSH commands use `sudo -n`** when `sudo`/`remote_sudo` set — requires passwordless sudo
 - **Remote validation** checks `remote_dir` is a btrfs subvolume via SSH

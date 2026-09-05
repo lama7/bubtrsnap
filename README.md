@@ -178,7 +178,7 @@ The following options can only be used with an archive:
 + `remote_sudo`
 + `backup_dir`
 + `week_startday`
-+ `force_keep`
++ `keep`
 
 The `verbose` option has several levels for increased messaging on the CLI or
 for logging purposes if running bubtrsnap from a cron job.  By default,
@@ -469,13 +469,13 @@ If no `keep_*` values are set on the CLI or in the config file (all remain
 `0`), **pruning is skipped**. Existing snapshots and backups are left as they
 are.
 
-### Forced keeps (--keep / force_keep)
+### Forced keeps (--keep / keep)
 
-The `--keep` CLI option (config: `force_keep`) allows forcing retention of
+The `--keep` CLI option (config: `keep`) allows forcing retention of
 specific timestamps that would otherwise be pruned by the keep policy.
 
 - **CLI**: `--keep TIMESTAMP` — can be specified multiple times
-- **Config**: `force_keep = "202601011200,202601021200"` (comma-separated list, archive section only)
+- **Config**: `keep = "202601011200,202601021200"` (comma-separated list, archive section only)
 - **Format**: `YYYYMMDDhhmm` (12 digits)
 - **Behavior**: Forced keeps are applied **first**, then the keep policy runs on the remaining timestamps
 - **Validation**: The timestamp must exist for the archive being processed; missing timestamps log a warning and are ignored
@@ -490,7 +490,7 @@ Example config:
 ```toml
 [archive1]
 subvolume = "/path/to/subvol"
-force_keep = "202601011200,202601021200"
+keep = "202601011200,202601021200"
 ```
 
 **Note**: `--keep` requires exactly one archive to be processed (whether specified on CLI or from config).

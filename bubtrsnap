@@ -115,8 +115,8 @@ def run(cmd: list[str],
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M")
 
-def _merge_force_keep(config_val: str | None, cli_val: list[str] | None) -> list[str]:
-    """Merge force_keep from config (comma-separated string) and CLI (list of strings).
+def _merge_keep(config_val: str | None, cli_val: list[str] | None) -> list[str]:
+    """Merge keep from config (comma-separated string) and CLI (list of strings).
     
     Returns a list of timestamp strings (12-digit format).
     """
@@ -394,7 +394,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "keep_monthly": int,
     "keep_yearly": int,
     "week_startday": str,
-    "force_keep": str,
+    "forced_keep": str,
     "remote": str,
     "remote_dir": str,
     "remote_sudo": bool,
@@ -414,8 +414,8 @@ def _check_type(name: str, value: Any, expected_type: type, context: str) -> Non
                 print(f"Error: '{name}' in {context} must be one of: monday, tuesday, wednesday, thursday, friday, saturday, sunday",
                       file=sys.stderr)
                 sys.exit(1)
-        # Special validation for force_keep (timestamp format YYYYMMDDhhmm)
-        if name == "force_keep":
+        # Special validation for forced_keep (timestamp format YYYYMMDDhhmm)
+        if name == "forced_keep":
             # Split by comma and validate each timestamp
             timestamps = [t.strip() for t in value.split(",")]
             for ts in timestamps:
@@ -691,9 +691,9 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         if val is not None:
             cli_keeps[key] = val
 
-    # CLI force_keep options (--keep) - requires exactly one archive total
-    cli_force_keep = getattr(cli, "keep", None)
-    if cli_force_keep:
+    # CLI keep options (--keep) - requires exactly one archive total
+    cli_keep = getattr(cli, "keep", None)
+    if cli_keep:
         # Count total archives that would be processed
         cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
         n_cli = len(cli_archives)
@@ -881,7 +881,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             "post_backup_hook": raw.get("post_backup_hook"),
             "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
             "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
-            "force_keep": _merge_force_keep(raw.get("force_keep"), getattr(cli, "keep", None)),
+            "forced_keep": _merge_keep(raw.get("keep"), getattr(cli, "keep", None)),
         }
         resolved.append(entry)
 
@@ -1925,20 +1925,20 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
     week_startday_str = cfg.get("week_startday", "sunday").lower()
     week_start_day = _DAY_TO_WEEKDAY.get(week_startday_str, 6)
 
-    # Handle force_keep: validate timestamps exist for this archive
-    force_keep_list = cfg.get("force_keep", [])
-    if force_keep_list:
-        valid_force_keep = []
-        for ts in force_keep_list:
+    # Handle forced_keep: validate timestamps exist for this archive
+    forced_keep_list = cfg.get("forced_keep", [])
+    if forced_keep_list:
+        valid_forced_keep = []
+        for ts in forced_keep_list:
             if ts not in ts_list:
                 log(f"Warning: --keep timestamp '{ts}' not found for archive '{archive}' – ignoring", 1, cfg["verbose"])
             else:
-                valid_force_keep.append(ts)
-        force_keep_list = valid_force_keep
+                valid_forced_keep.append(ts)
+        forced_keep_list = valid_forced_keep
 
     # Apply forced keeps first - these are guaranteed to be kept
     keeps = {}
-    for ts in force_keep_list:
+    for ts in forced_keep_list:
         keeps[ts] = "forced"
 
     # Now apply keep policy to remaining timestamps

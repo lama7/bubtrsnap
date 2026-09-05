@@ -185,8 +185,8 @@ class TestForceKeep(unittest.TestCase):
         """apply_keep_policy logs warning and ignores missing force_keep timestamps."""
         # This tests the behavior via the full function
         # We can't easily test apply_keep_policy directly without mocking
-        # but we can test the _merge_force_keep function
-        result = bs._merge_force_keep("202601011200,202601021200", ["202601031200"])
+        # but we can test the _merge_keep function
+        result = bs._merge_keep("202601011200,202601021200", ["202601031200"])
         self.assertEqual(result, ["202601011200", "202601021200", "202601031200"])
 
 if __name__ == "__main__":
