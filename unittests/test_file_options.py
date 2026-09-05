@@ -11,7 +11,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 def _load():
-    path = Path(__file__).resolve().parent / "bubtrsnap"
+    path = Path(__file__).resolve().parent.parent / "bubtrsnap"
     if not path.is_file():
         raise FileNotFoundError(f"Cannot find bubtrsnap at {path}")
     return SourceFileLoader("bubtrsnap", str(path)).load_module()
