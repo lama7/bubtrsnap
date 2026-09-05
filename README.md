@@ -163,6 +163,7 @@ Several options are global only:
 + `remote`
 + `remote_dir`
 + `remote_sudo`
++ `week_startday`
 
 The following options can only be used with an archive:
 
@@ -176,6 +177,8 @@ The following options can only be used with an archive:
 + `remote_dir`
 + `remote_sudo`
 + `backup_dir`
++ `week_startday`
++ `force_keep`
 
 The `verbose` option has several levels for increased messaging on the CLI or
 for logging purposes if running bubtrsnap from a cron job.  By default,
@@ -466,11 +469,49 @@ If no `keep_*` values are set on the CLI or in the config file (all remain
 `0`), **pruning is skipped**. Existing snapshots and backups are left as they
 are.
 
+### Forced keeps (--keep / force_keep)
+
+The `--keep` CLI option (config: `force_keep`) allows forcing retention of
+specific timestamps that would otherwise be pruned by the keep policy.
+
+- **CLI**: `--keep TIMESTAMP` — can be specified multiple times
+- **Config**: `force_keep = "202601011200,202601021200"` (comma-separated list, archive section only)
+- **Format**: `YYYYMMDDhhmm` (12 digits)
+- **Behavior**: Forced keeps are applied **first**, then the keep policy runs on the remaining timestamps
+- **Validation**: The timestamp must exist for the archive being processed; missing timestamps log a warning and are ignored
+- **Archive-specific only** — not a global option
+
+Example CLI:
+```
+bubtrsnap --keep 202601011200 --keep 202601021200 archive1=/path/to/subvol
+```
+
+Example config:
+```toml
+[archive1]
+subvolume = "/path/to/subvol"
+force_keep = "202601011200,202601021200"
+```
+
+**Note**: `--keep` requires exactly one archive to be processed (whether specified on CLI or from config).
+
 ### Weekly boundary
 
-**Weekly keeps are aligned to Saturday** (23:59), matching btrbu. The week
-boundary used when selecting weeklies is the most recent Saturday at or before
-a candidate timestamp.
+**Weekly keeps are aligned to the day before `week_startday`** (default: Saturday, since `week_startday` defaults to `sunday`). The week boundary used when selecting weeklies is the most recent such day at or before a candidate timestamp (23:59).
+
+The `week_startday` option (CLI: `--week-startday`, config: `week_startday`) controls which day the week starts on. Accepted values: `monday` through `sunday`. The week ends on the day before the start day.
+
+| `week_startday` | Week ends on (weekly boundary) |
+|-----------------|--------------------------------|
+| `monday`        | Sunday                         |
+| `tuesday`       | Monday                         |
+| `wednesday`     | Tuesday                        |
+| `thursday`      | Wednesday                      |
+| `friday`        | Thursday                       |
+| `saturday`      | Friday                         |
+| `sunday` (default) | Saturday                    |
+
+This can be set globally or per-archive in the config file, or via `--week-startday` on the CLI.
 
 ### Other boundaries
 
@@ -478,7 +519,7 @@ a candidate timestamp.
 |----------|-------------------------------------|
 | Hourly   | Previous hour at minute 59          |
 | Daily    | Previous calendar day at 23:59      |
-| Weekly   | Saturday 23:59                      |
+| Weekly   | Day before `week_startday` at 23:59 |
 | Monthly  | Last day of the target month 23:59  |
 | Yearly   | December 31 23:59                   |
 

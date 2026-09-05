@@ -2313,7 +2313,7 @@ Examples:
     parser.add_argument("--keep-monthly", type=int, metavar="N", help="Number of monthly snapshots/backups to retain")
     parser.add_argument("--keep-yearly", type=int, metavar="N", help="Number of yearly snapshots/backups to retain")
     parser.add_argument("--week-startday", type=str, metavar="DAY",
-        help="Day that starts the week: monday..sunday (default: sunday)")
+        help="Day that starts the week: monday..sunday (default: sunday). Affects keep policy weekly boundary.")
 
     # Per-archive forced keep
     parser.add_argument("--keep", type=str, metavar="TIMESTAMP", action="append",
