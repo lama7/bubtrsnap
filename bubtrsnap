@@ -31,8 +31,8 @@ DEFAULT_CONFIG = {
     "send_to_dir": None,
     "receive_from_dir": None,
     "stage_dir": None,
-    "remote": None,
-    "remote_dir": None,
+    "remote_host": None,
+    "remote_path": None,
     "remote_sudo": False,
     # Global default keep policy
     "keep_hourly": 0,
@@ -366,8 +366,8 @@ ALLOWED_GLOBAL_OPTIONS = {
     "send_to_dir": str,
     "receive_from_dir": str,
     "stage_dir": str,
-    "remote": str,
-    "remote_dir": str,
+    "remote_host": str,
+    "remote_path": str,
     "remote_sudo": bool,
     "keep_hourly": int,
     "keep_daily": int,
@@ -395,8 +395,8 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "keep_yearly": int,
     "week_startday": str,
     "forced_keep": str,
-    "remote": str,
-    "remote_dir": str,
+    "remote_host": str,
+    "remote_path": str,
     "remote_sudo": bool,
     "backup_dir": str,
 }
@@ -457,11 +457,11 @@ def validate_config(file_cfg: dict) -> None:
                 print(f"Error: 'subvolume' in {context} cannot be empty", file=sys.stderr)
                 sys.exit(1)
 
-            # remote and remote_dir - remote_dir requires remote, but remote can be used alone
-            has_remote = "remote" in value
-            has_remote_dir = "remote_dir" in value
-            if has_remote_dir and not has_remote:
-                # remote_dir at archive level needs a remote (will check global/CLI later)
+            # remote and remote_path - remote_path requires remote_host, but remote_host can be used alone
+            has_remote = "remote_host" in value
+            has_remote_path = "remote_path" in value
+            if has_remote_path and not has_remote:
+                # remote_path at archive level needs a remote_host (will check global/CLI later)
                 pass  # We'll validate after resolution
 
         else:
@@ -472,11 +472,11 @@ def validate_config(file_cfg: dict) -> None:
                 sys.exit(1)
             _check_type(key, value, ALLOWED_GLOBAL_OPTIONS[key], "global configuration")
 
-    # Global remote_dir requires remote (but remote can be used alone)
-    has_global_remote = "remote" in file_cfg
-    has_global_remote_dir = "remote_dir" in file_cfg
-    if has_global_remote_dir and not has_global_remote:
-        # global remote_dir needs a remote (will check CLI later)
+    # Global remote_path requires remote_host (but remote_host can be used alone)
+    has_global_remote = "remote_host" in file_cfg
+    has_global_remote_path = "remote_path" in file_cfg
+    if has_global_remote_path and not has_global_remote:
+        # global remote_path needs a remote_host (will check CLI later)
         pass  # We'll validate after resolution
 
 
@@ -580,13 +580,16 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             sys.exit(1)
         global_cfg["week_startday"] = ws
 
-    # Track if CLI explicitly set remote/remote_dir (for precedence over archive-specific config)
-    cli_remote = getattr(cli, "remote", None)
-    cli_remote_dir = getattr(cli, "remote_dir", None)
-    if cli_remote is not None:
-        global_cfg["remote"] = cli_remote
-    if cli_remote_dir is not None:
-        global_cfg["remote_dir"] = cli_remote_dir
+    # Track if CLI explicitly set remote/remote_path/remote_sudo (for precedence over archive-specific config)
+    cli_remote_host = getattr(cli, "remote_host", None)
+    cli_remote_path = getattr(cli, "remote_path", None)
+    cli_remote_sudo = getattr(cli, "remote_sudo", None)
+    if cli_remote_host is not None:
+        global_cfg["remote_host"] = cli_remote_host
+    if cli_remote_path is not None:
+        global_cfg["remote_path"] = cli_remote_path
+    if cli_remote_sudo is not None:
+        global_cfg["remote_sudo"] = cli_remote_sudo
 
     # Track if CLI explicitly set backup_dir for precedence over archive-specific config
     cli_backup_dir = getattr(cli, "backup_dir", None)
@@ -791,9 +794,10 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             send_dir = cli_send_dir
             recv_dir = cli_recv_dir
             stage_dir = cli_stage_dir
-            # CLI remote/remote_dir override everything
-            remote = cli_remote
-            remote_dir = cli_remote_dir
+            # CLI remote/remote_path override everything
+            remote_host = cli_remote_host
+            remote_path = cli_remote_path
+            remote_sudo = cli_remote_sudo
         else:
             # Rules 2 & 3: archive-specific first; global only if none
             send_file = raw.get("send_to_file")
@@ -841,19 +845,19 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             )
             sys.exit(1)
 
-        # Resolve remote/remote_dir/remote_sudo with precedence: CLI > archive-specific > global
-        if getattr(cli, "remote", None) is not None and getattr(cli, "remote_dir", None) is not None:
-            remote = cli.remote
-            remote_dir = cli.remote_dir
-            remote_sudo = getattr(cli, "remote_sudo", False)
+        # Resolve remote/remote_path/remote_sudo with precedence: CLI > archive-specific > global
+        if cli_remote_host is not None and cli_remote_path is not None:
+            remote_host = cli_remote_host
+            remote_path = cli_remote_path
+            remote_sudo = cli_remote_sudo or False
         else:
-            remote = raw.get("remote", global_cfg.get("remote"))
-            remote_dir = raw.get("remote_dir", global_cfg.get("remote_dir"))
+            remote_host = raw.get("remote_host", global_cfg.get("remote_host"))
+            remote_path = raw.get("remote_path", global_cfg.get("remote_path"))
             remote_sudo = raw.get("remote_sudo", global_cfg.get("remote_sudo", False))
-        
-        # Validate: if remote_dir is set, remote must also be set (from any level)
-        if remote_dir and not remote:
-            print(f"Error in archive '{name}': 'remote_dir' requires 'remote' to be set (global, per-archive, or CLI)", file=sys.stderr)
+
+        # Validate: if remote_path is set, remote_host must also be set (from any level)
+        if remote_path and not remote_host:
+            print(f"Error in archive '{name}': 'remote_path' requires 'remote_host' to be set (global, per-archive, or CLI)", file=sys.stderr)
             sys.exit(1)
         
         # Resolve backup_dir with precedence: CLI > archive-specific > global
@@ -863,26 +867,26 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             backup_dir = raw.get("backup_dir", global_cfg.get("backup_dir"))
 
         entry = {
-            "name": name,
-            "subvolume": str(subvol_path),
-            "snaps_only": snaps_only,
-            "send_to_file": send_file,
-            "receive_from_file": recv_file,
-            "stage_file": stage_file,
-            "send_to_dir": send_dir,
-            "receive_from_dir": recv_dir,
-            "stage_dir": stage_dir,
-            "remote": remote,
-            "remote_dir": remote_dir,
-            "remote_sudo": remote_sudo,
-            "backup_dir": backup_dir,
-            "pre_snapshot_hook": raw.get("pre_snapshot_hook"),
-            "post_snapshot_hook": raw.get("post_snapshot_hook"),
-            "post_backup_hook": raw.get("post_backup_hook"),
-            "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
-            "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
-            "forced_keep": _merge_keep(raw.get("keep"), getattr(cli, "keep", None)),
-        }
+                    "name": name,
+                    "subvolume": str(subvol_path),
+                    "snaps_only": snaps_only,
+                    "send_to_file": send_file,
+                    "receive_from_file": recv_file,
+                    "stage_file": stage_file,
+                    "send_to_dir": send_dir,
+                    "receive_from_dir": recv_dir,
+                    "stage_dir": stage_dir,
+                    "remote_host": remote_host,
+                    "remote_path": remote_path,
+                    "remote_sudo": remote_sudo,
+                    "backup_dir": backup_dir,
+                    "pre_snapshot_hook": raw.get("pre_snapshot_hook"),
+                    "post_snapshot_hook": raw.get("post_snapshot_hook"),
+                    "post_backup_hook": raw.get("post_backup_hook"),
+                    "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
+                    "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
+                    "forced_keep": _merge_keep(raw.get("forced_keep"), getattr(cli, "keep", None)),
+                }
         resolved.append(entry)
 
     return global_cfg, resolved
@@ -2324,12 +2328,12 @@ Examples:
              "options and with --snaps-only.",
     )
     parser.add_argument(
-        "--remote", type=str, metavar="USER@HOST",
-        help="SSH remote in user@host format for sending backups over SSH. "
+        "--remote-host", type=str, metavar="USER@HOST",
+        help="SSH remote host in user@host format for sending backups over SSH. "
              "Can be set globally or per-archive in config file."
     )
     parser.add_argument(
-        "--remote-dir", type=str, metavar="DIR",
+        "--remote-path", type=str, metavar="DIR",
         help="Target directory on the SSH remote for receiving backups. "
              "Can be set globally or per-archive in config file."
     )

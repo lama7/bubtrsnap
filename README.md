@@ -160,8 +160,8 @@ Several options are global only:
 + `send_to_dir`
 + `receive_from_dir`
 + `stage_dir`
-+ `remote`
-+ `remote_dir`
++ `remote_host`
++ `remote_path`
 + `remote_sudo`
 + `week_startday`
 
@@ -173,8 +173,8 @@ The following options can only be used with an archive:
 + `pre_snapshot_hook`
 + `post_snapshot_hook`
 + `post_backup_hook`
-+ `remote`
-+ `remote_dir`
++ `remote_host`
++ `remote_path`
 + `remote_sudo`
 + `backup_dir`
 + `week_startday`
@@ -200,10 +200,10 @@ to set up a local backup directory.
 
 ### Basic remote backup
 
-Specify both `--remote` (user@host) and `--remote-dir` (target btrfs
+Specify both `--remote-host` (user@host) and `--remote-path` (target btrfs
 subvolume directory on the remote).  For example:
 
-    bubtrsnap --snapshot-dir=/pool/snapshots --remote user@backuphost --remote-dir /btrfs/backups archive1=/path/to/subvolume
+    bubtrsnap --snapshot-dir=/pool/snapshots --remote-host user@backuphost --remote-path /btrfs/backups archive1=/path/to/subvolume
 
 This will:
 
@@ -214,17 +214,17 @@ This will:
 The remote directory must be a btrfs subvolume.  bubtrsnap validates this
 automatically (via SSH) before attempting the receive.
 
-### When `remote_dir` requires `remote`
+### When `remote_path` requires `remote_host`
 
-`--remote-dir` (or `remote_dir` in config) always requires `--remote` to also
+`--remote-path` (or `remote_path` in config) always requires `--remote-host` to also
 be set — from the CLI, a per-archive config section, or globally.  If
-`remote_dir` is set but `remote` is missing, bubtrsnap will abort with an
-error.  `remote` can be used on its own (for example if you only want SSH
-validation or hooks to target a host), but `remote_dir` cannot stand alone.
+`remote_path` is set but `remote_host` is missing, bubtrsnap will abort with an
+error.  `remote_host` can be used on its own (for example if you only want SSH
+validation or hooks to target a host), but `remote_path` cannot stand alone.
 
 ### Local and remote destinations together
 
-If you configure both `backup_dir` (local) and `remote`/`remote_dir` (SSH),
+If you configure both `backup_dir` (local) and `remote_host`/`remote_path` (SSH),
 bubtrsnap will send the backup to **both** destinations in a single run.  The
 send is performed twice — once targeting the local receive and once targeting
 the SSH receive — using the same snapshot as the source.  This lets you keep a
@@ -234,13 +234,13 @@ Example:
 
     bubtrsnap --snapshot-dir=/pool/snapshots \
         --backup-dir=/local/backups \
-        --remote user@backuphost \
-        --remote-dir /btrfs/backups \
+        --remote-host user@backuphost \
+        --remote-path /btrfs/backups \
         archive1=/path/to/subvolume
 
 Precedence still applies: CLI settings win over per-archive settings, which win
-over global settings.  If you set `--remote` and `--remote-dir` on the CLI,
-they override any remote/remote_dir values from the config for the archives
+over global settings.  If you set `--remote-host` and `--remote-path` on the CLI,
+they override any remote_host/remote_path values from the config for the archives
 being processed.
 
 ### Per-archive remote settings
@@ -252,17 +252,17 @@ Remote settings can be attached to an individual archive in the config file:
 
     [archive1]
     subvolume = "/home"
-    remote = "user@backuphost"
-    remote_dir = "/btrfs/backups"
+    remote_host = "user@backuphost"
+    remote_path = "/btrfs/backups"
     remote_sudo = true
 
     [archive2]
     subvolume = "/var/lib"
-    # uses global remote/remote_dir if set, otherwise no SSH backup
+    # uses global remote_host/remote_path if set, otherwise no SSH backup
 ```
 
 Each archive can have its own remote host, target directory, and sudo
-preference.  Global `remote`/`remote_dir`/`remote_sudo` values are used for any
+preference.  Global `remote_host`/`remote_path`/`remote_sudo` values are used for any
 archive that does not override them.
 
 ### Remote sudo
@@ -275,7 +275,7 @@ setup for NOPASSWD fornthis to work properly.
 
 ### SSH validation and parent matching
 
-Before sending, bubtrsnap validates that the remote `remote_dir` is a btrfs
+Before sending, bubtrsnap validates that the remote `remote_path` is a btrfs
 subvolume (via SSH).  When determining incremental parents for an SSH backup,
 bubtrsnap lists the remote subvolumes, inspects each one's Received UUID, and
 matches them against local snapshot UUIDs — the same logic it uses for local

@@ -48,6 +48,9 @@ def _ns(**kwargs):
         debug=False,
         dry_run=False,
         archives=[],
+        remote_host=None,
+        remote_path=None,
+        remote_sudo=False,
     )
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -66,19 +69,19 @@ class TestSSHConfigPrecedence(unittest.TestCase):
                 cfg,
                 f"""
                 snapshot_dir = "{td_path}"
-                remote = "global@host"
-                remote_dir = "/global/remote"
+                remote_host = "global@host"
+                remote_path = "/global/remote"
                 [a]
                 subvolume = "{sub}"
-                remote = "archive@host"
-                remote_dir = "/archive/remote"
+                remote_host = "archive@host"
+                remote_path = "/archive/remote"
                 """,
             )
-            cli = _ns(remote="cli@host", remote_dir="/cli/remote", archives=["a"])
+            cli = _ns(remote_host="cli@host", remote_path="/cli/remote", archives=["a"])
             _global, archives = bs.load_and_resolve_archives(cli, cfg)
             a = archives[0]
-            self.assertEqual(a["remote"], "cli@host")
-            self.assertEqual(a["remote_dir"], "/cli/remote")
+            self.assertEqual(a["remote_host"], "cli@host")
+            self.assertEqual(a["remote_path"], "/cli/remote")
 
     def test_archive_remote_overrides_global(self):
         with tempfile.TemporaryDirectory() as td:
@@ -90,20 +93,20 @@ class TestSSHConfigPrecedence(unittest.TestCase):
                 cfg,
                 f"""
                 snapshot_dir = "{td_path}"
-                remote = "global@host"
-                remote_dir = "/global/remote"
+                remote_host = "global@host"
+                remote_path = "/global/remote"
                 [a]
                 subvolume = "{sub}"
-                remote = "archive@host"
-                remote_dir = "/archive/remote"
+                remote_host = "archive@host"
+                remote_path = "/archive/remote"
                 """,
             )
             _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
             a = archives[0]
-            self.assertEqual(a["remote"], "archive@host")
-            self.assertEqual(a["remote_dir"], "/archive/remote")
+            self.assertEqual(a["remote_host"], "archive@host")
+            self.assertEqual(a["remote_path"], "/archive/remote")
 
-    def test_remote_without_remote_dir_is_valid(self):
+    def test_remote_host_without_remote_path_is_valid(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             sub = td_path / "subvol_a"
@@ -113,15 +116,15 @@ class TestSSHConfigPrecedence(unittest.TestCase):
                 cfg,
                 f"""
                 snapshot_dir = "{td_path}"
-                remote = "global@host"
+                remote_host = "global@host"
                 [a]
                 subvolume = "{sub}"
                 """,
             )
             _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
             a = archives[0]
-            self.assertEqual(a["remote"], "global@host")
-            self.assertIsNone(a["remote_dir"])
+            self.assertEqual(a["remote_host"], "global@host")
+            self.assertIsNone(a["remote_path"])
 
 
 class TestSSHValidation(unittest.TestCase):
