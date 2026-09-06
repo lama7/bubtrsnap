@@ -10,7 +10,7 @@ import textwrap
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 def _load():
     path = Path(__file__).resolve().parent.parent / "bubtrsnap"
@@ -400,6 +400,67 @@ class TestSSHKeepPolicyIntegration(unittest.TestCase):
             mock_keep.return_value = None
             # The actual integration is tested by running the script with --dry-run
             pass
+
+
+class TestSCPReceive(unittest.TestCase):
+    """Test SCP-based SSH receive functionality."""
+
+    @patch("bubtrsnap.run")
+    def test_scp_and_receive_dry_run(self, mock_run):
+        """_scp_and_receive should log SCP and SSH commands in dry-run."""
+        import subprocess
+        from pathlib import Path
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False}
+
+        result = bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
+
+        self.assertEqual(result, "test.202608280230")
+        # In dry-run mode, the function returns early and logs via log()
+        # The actual scp/ssh commands are not executed via run()
+        # Verify the function returns the expected stem
+        self.assertEqual(result, stream.stem)
+
+    @patch("bubtrsnap.run")
+    def test_scp_and_receive_scp_failure(self, mock_run):
+        """_scp_and_receive should exit on SCP failure."""
+        import subprocess
+        from pathlib import Path
+        
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False}
+        
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["scp", "..."], returncode=1, stderr="connection refused"
+        )
+        
+        with self.assertRaises(SystemExit):
+            bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
+
+    @patch("bubtrsnap.subprocess.Popen")
+    @patch("bubtrsnap.subprocess.run")
+    def test_scp_and_receive_receive_failure(self, mock_run, mock_popen):
+        """_scp_and_receive should exit on SSH receive failure."""
+        import subprocess
+        from pathlib import Path
+        
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False}
+        
+        # SCP succeeds
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["scp", "..."], returncode=0, stdout="", stderr=""
+        )
+        
+        # SSH receive fails
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "error: no space left")
+        mock_proc.returncode = 1
+        mock_popen.return_value = mock_proc
+        
+        with self.assertRaises(SystemExit):
+            bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
 
 
 if __name__ == "__main__":
