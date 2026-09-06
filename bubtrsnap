@@ -2149,13 +2149,23 @@ def process_archive(archive: dict, cfg: dict) -> None:
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
-    # Receive after send-to-file / send-to-dir when receive_* or staging is set
+    # Receive after send-to-file / send-to-dir when receive_* or staging is set,
+    # OR when send_to_dir is used with remote/remote_dir (auto-receive to SSH)
+    auto_ssh_receive = (
+        send_dir
+        and remote
+        and remote_dir
+        and not recv_file
+        and not recv_dir
+        and not staged
+    )
     do_receive = bool(
         stream_path
         and (
             recv_file
             or recv_dir
             or staged
+            or auto_ssh_receive
         )
     )
     if do_receive:
@@ -2172,7 +2182,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
             chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
 
         # Note that by this point, recv_file and recv_dir should NOT both be set. We took
-        # care with configuration rules that should prevent that combination.  In fact, 
+        # care with configuration rules that should prevent that combination.  In fact,
         # from out little logic assignment above, only 1 of recv_file, recv_dir or staged
         # should be set by the time this code is executed...
         # if stage_dir or stage_file was set, then use the stream_path from the send
@@ -2185,13 +2195,16 @@ def process_archive(archive: dict, cfg: dict) -> None:
         elif recv_dir:
             # use stream_path from the send if recv_dir and send_dir are the same
             if recv_dir == send_dir:
-                recv_path = stream_path  
+                recv_path = stream_path 
             else:  # different recv_dir and send_dir...
                 # search the recv_dir for the most recent stream file for this archive
                 recv_path = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
                 if not recv_path:
                     log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
                     return
+        # auto SSH receive: use the stream file we just created
+        elif auto_ssh_receive:
+            recv_path = stream_path
         else:
             # some combination we didn't anticipate go us to this point...
             print("Should never get here...", file=sys.stderr)

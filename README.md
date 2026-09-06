@@ -395,6 +395,40 @@ processing and a btrfs stream file will be searched for in the specified directo
 If a stream file is not found, processing for that archive completes and the
 next archive is dealt with.
 
+### SSH Remote Receive with send_to_dir
+
+When `send_to_dir` is combined with `remote` and `remote_dir` (and no explicit
+`receive_from_file`, `receive_from_dir`, or staging options), bubtrsnap will:
+
+1. Create the snapshot
+2. Write the btrfs stream to a file in `send_to_dir` (with incremental parents)
+3. Automatically receive that stream file to the SSH remote via `cat <file> | ssh remote btrfs receive remote_dir`
+4. Apply keep policy on the remote
+
+This enables a fully automated single-command workflow: snapshot locally, stream to file, transfer and receive on remote — all in one bubtrsnap run.
+
+Example CLI:
+```
+bubtrsnap --snapshot-dir /snapshots \
+    --send-to-dir /local/streams \
+    --remote user@backuphost \
+    --remote-dir /btrfs/backups \
+    archive1=/path/to/subvol
+```
+
+Example config:
+```toml
+snapshot_dir = "/snapshots"
+send_to_dir = "/local/streams"
+remote = "user@backuphost"
+remote_dir = "/btrfs/backups"
+
+[archive1]
+subvolume = "/path/to/subvol"
+```
+
+Note: The local stream file is retained after transfer (not deleted). Use `--stage-dir` if you want automatic cleanup.
+
 ## Staging: stage_file / stage_dir
 
 `--stage-file` and `--stage-dir` are convenience options that combine a send-to
