@@ -28,8 +28,8 @@ DEFAULT_CONFIG = {
     "backup_dir": None,
     "local_sudo": False,
     "snaps_only": False,
-    "send_to_dir": None,
-    "receive_from_dir": None,
+    "export_dir": None,
+    "import_dir": None,
     "stage_dir": None,
     "remote_host": None,
     "remote_path": None,
@@ -363,8 +363,8 @@ ALLOWED_GLOBAL_OPTIONS = {
     "backup_dir": str,
     "local_sudo": bool,
     "snaps_only": bool,
-    "send_to_dir": str,
-    "receive_from_dir": str,
+    "export_dir": str,
+    "import_dir": str,
     "stage_dir": str,
     "remote_host": str,
     "remote_path": str,
@@ -382,8 +382,8 @@ ALLOWED_GLOBAL_OPTIONS = {
 ALLOWED_ARCHIVE_OPTIONS = {
     "subvolume": str,
     "snaps_only": bool,
-    "send_to_file": str,
-    "receive_from_file": str,
+    "export_file": str,
+    "import_file": str,
     "stage_file": str,
     "pre_snapshot_hook": str,
     "post_snapshot_hook": str,
@@ -603,19 +603,19 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     # are ignored (as if they were not present in the config).
     # -------------------------------------------------------------------------
     FILE_RELATED_CLI = (
-        "send_to_file",
-        "receive_from_file",
+        "export_file",
+        "import_file",
         "stage_file",
-        "send_to_dir",
-        "receive_from_dir",
+        "export_dir",
+        "import_dir",
         "stage_dir",
     )
 
-    cli_send_file = expand_path(cli.send_to_file) if getattr(cli, "send_to_file", None) else None
-    cli_recv_file = expand_path(cli.receive_from_file) if getattr(cli, "receive_from_file", None) else None
+    cli_export_file = expand_path(cli.export_file) if getattr(cli, "export_file", None) else None
+    cli_import_file = expand_path(cli.import_file) if getattr(cli, "import_file", None) else None
     cli_stage_file = expand_path(cli.stage_file) if getattr(cli, "stage_file", None) else None
-    cli_send_dir = expand_path(cli.send_to_dir) if getattr(cli, "send_to_dir", None) else None
-    cli_recv_dir = expand_path(cli.receive_from_dir) if getattr(cli, "receive_from_dir", None) else None
+    cli_export_dir = expand_path(cli.export_dir) if getattr(cli, "export_dir", None) else None
+    cli_import_dir = expand_path(cli.import_dir) if getattr(cli, "import_dir", None) else None
     cli_stage_dir = expand_path(cli.stage_dir) if getattr(cli, "stage_dir", None) else None
 
     cli_has_file_related = any(
@@ -623,42 +623,42 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     )
 
     # Validate dirs when provided on CLI
-    if cli_send_dir:
-        chk_is_dir(cli_send_dir, "send-to-dir")
-    if cli_recv_dir:
-        chk_is_dir(cli_recv_dir, "receive-from-dir")
+    if cli_export_dir:
+        chk_is_dir(cli_export_dir, "export-dir")
+    if cli_import_dir:
+        chk_is_dir(cli_import_dir, "import-from-dir")
     if cli_stage_dir:
         chk_is_dir(cli_stage_dir, "stage-dir")
 
     # Expand config global dirs only when CLI is not driving file-related opts
     if not cli_has_file_related:
-        if global_cfg.get("send_to_dir"):
-            global_cfg["send_to_dir"] = expand_path(global_cfg["send_to_dir"])
-        if global_cfg.get("receive_from_dir"):
-            global_cfg["receive_from_dir"] = expand_path(global_cfg["receive_from_dir"])
+        if global_cfg.get("export_dir"):
+            global_cfg["export_dir"] = expand_path(global_cfg["export_dir"])
+        if global_cfg.get("import_dir"):
+            global_cfg["import_dir"] = expand_path(global_cfg["import_dir"])
         if global_cfg.get("stage_dir"):
             global_cfg["stage_dir"] = expand_path(global_cfg["stage_dir"])
         if global_cfg.get("stage_dir") and (
-            global_cfg.get("send_to_dir") or global_cfg.get("receive_from_dir")
+            global_cfg.get("export_dir") or global_cfg.get("import_dir")
         ):
             print(
-                "Error: stage_dir cannot be combined with send_to_dir or receive_from_dir",
+                "Error: stage_dir cannot be combined with export_dir or import_dir",
                 file=sys.stderr,
             )
             sys.exit(1)
     else:
         # CLI owns this layer: strip config globals so they cannot leak through
-        global_cfg["send_to_dir"] = None
-        global_cfg["receive_from_dir"] = None
+        global_cfg["export_dir"] = None
+        global_cfg["import_dir"] = None
         global_cfg["stage_dir"] = None
 
     # --- mutual exclusion on CLI (unchanged rules) ---
     file_related = [
-        ("--send-to-file", cli_send_file),
-        ("--receive-from-file", cli_recv_file),
+        ("--export-file", cli_export_file),
+        ("--import-file", cli_import_file),
         ("--stage-file", cli_stage_file),
-        ("--send-to-dir", cli_send_dir),
-        ("--receive-from-dir", cli_recv_dir),
+        ("--export-dir", cli_export_dir),
+        ("--import-dir", cli_import_dir),
         ("--stage-dir", cli_stage_dir),
     ]
     if cli_stage_file:
@@ -678,8 +678,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             )
             sys.exit(1)
 
-    if (cli_send_file or cli_recv_file or cli_stage_file) and (
-        cli_send_dir or cli_recv_dir or cli_stage_dir
+    if (cli_export_file or cli_import_file or cli_stage_file) and (
+        cli_export_dir or cli_import_dir or cli_stage_dir
     ):
         print(
             "Error: cannot mix file options with directory options on the CLI",
@@ -714,19 +714,19 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
 
     # Single-archive requirement for file options
-    single_archive_opts = cli_send_file or cli_recv_file or cli_stage_file
+    single_archive_opts = cli_export_file or cli_import_file or cli_stage_file
     if single_archive_opts:
         n_cli = len(cli_archives) if cli_archives else 0
         n_cfg = len(raw_archives)
         if n_cli > 1:
             print(
-                "Error: --send-to-file/--receive-from-file/--stage-file require exactly one archive",
+                "Error: --export-file/--import-file/--stage-file require exactly one archive",
                 file=sys.stderr,
             )
             sys.exit(1)
         if n_cli == 0 and n_cfg != 1:
             print(
-                "Error: --send-to-file/--receive-from-file/--stage-file with no CLI archive "
+                "Error: --export-file/--import-file/--stage-file with no CLI archive "
                 "require exactly one archive in the configuration file",
                 file=sys.stderr,
             )
@@ -788,11 +788,11 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
 
         if cli_has_file_related:
             # Rule 1: CLI only — ignore all config file-related options
-            send_file = cli_send_file
-            recv_file = cli_recv_file
+            send_file = cli_export_file
+            recv_file = cli_import_file
             stage_file = cli_stage_file
-            send_dir = cli_send_dir
-            recv_dir = cli_recv_dir
+            send_dir = cli_export_dir
+            recv_dir = cli_import_dir
             stage_dir = cli_stage_dir
             # CLI remote/remote_path override everything
             remote_host = cli_remote_host
@@ -800,8 +800,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             remote_sudo = cli_remote_sudo
         else:
             # Rules 2 & 3: archive-specific first; global only if none
-            send_file = raw.get("send_to_file")
-            recv_file = raw.get("receive_from_file")
+            send_file = raw.get("export_file")
+            recv_file = raw.get("import_file")
             stage_file = raw.get("stage_file")
             if send_file:
                 send_file = expand_path(send_file)
@@ -813,7 +813,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             if stage_file and (send_file or recv_file):
                 print(
                     f"Error in archive '{name}': stage_file cannot be combined with "
-                    f"send_to_file or receive_from_file",
+                    f"export_file or import_file",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -826,8 +826,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                 stage_dir = None
             else:
                 # Rule 3: globals apply only when archive has no file opts
-                send_dir = global_cfg.get("send_to_dir")
-                recv_dir = global_cfg.get("receive_from_dir")
+                send_dir = global_cfg.get("export_dir")
+                recv_dir = global_cfg.get("import_dir")
                 stage_dir = global_cfg.get("stage_dir")
 
         snaps_only = (
@@ -870,11 +870,11 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                     "name": name,
                     "subvolume": str(subvol_path),
                     "snaps_only": snaps_only,
-                    "send_to_file": send_file,
-                    "receive_from_file": recv_file,
+                    "export_file": send_file,
+                    "import_file": recv_file,
                     "stage_file": stage_file,
-                    "send_to_dir": send_dir,
-                    "receive_from_dir": recv_dir,
+                    "export_dir": send_dir,
+                    "import_dir": recv_dir,
                     "stage_dir": stage_dir,
                     "remote_host": remote_host,
                     "remote_path": remote_path,
@@ -1399,9 +1399,9 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
             raise RuntimeError("btrfs receive failed")
 
     # Also write to file if requested (without parent args - it's a full send to file)
-    send_to_file = btrfs_cmd(cfg, "send", "-f", str(stream_file), str(snap))
-    log(f"{' '.join(send_to_file)}", 2, cfg["verbose"])
-    result = subprocess.run(send_to_file, capture_output=True, check=False)
+    export_file = btrfs_cmd(cfg, "send", "-f", str(stream_file), str(snap))
+    log(f"{' '.join(export_file)}", 2, cfg["verbose"])
+    result = subprocess.run(export_file, capture_output=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"btrfs send to file failed: {result.stderr}")
 
@@ -2003,13 +2003,13 @@ def process_archive(archive: dict, cfg: dict) -> None:
     """
     Normal processing for a single archive:
     pre-hook → snapshot → post-snapshot-hook → backup → post-backup-hook → keep policy
-    If just send_to_file:
+    If just export_file:
     pre-hook -> snapshot -> post-snapshot-hook -> send backup to file -> keep for snapshots
     If just recv_from_file:
     backup receive from file -> post-backup-hook -> keep for backups
     If both send_to and recv_from then same as Normal above except the backup uses a file
     as a staging step.
-    Processing for send_to_dir and recv_from_dir uses same processing flow except it will
+    Processing for export_dir and recv_from_dir uses same processing flow except it will
     handle multiple archives versus a single archive for the file variant 
     """
 
@@ -2020,11 +2020,11 @@ def process_archive(archive: dict, cfg: dict) -> None:
     # now we can provide some quick logging...
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
 
-    send_file = archive.get("send_to_file")
-    recv_file = archive.get("receive_from_file")
+    send_file = archive.get("export_file")
+    recv_file = archive.get("import_file")
     stage_file = archive.get("stage_file")
-    send_dir = archive.get("send_to_dir")
-    recv_dir = archive.get("receive_from_dir")
+    send_dir = archive.get("export_dir")
+    recv_dir = archive.get("import_dir")
     stage_dir = archive.get("stage_dir")
     snaps_only = archive.get("snaps_only", False)
 
@@ -2033,7 +2033,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
         send_file = stage_file
         recv_file = stage_file
 
-    # stage_dir is sugar for send_to_dir + receive_from_dir on same dir
+    # stage_dir is sugar for export_dir + import_dir on same dir
     staged = False
     if stage_dir and not (send_file or recv_file):
         send_dir = stage_dir
@@ -2053,7 +2053,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
     if recv_file and not send_file:
         # Need either backup_dir (local) or remote_dir (SSH)
         if not backup_dir and not (remote and remote_dir):
-            print(f"Error: archive '{name}' receive_from_file requires backup_dir or remote_dir (with remote)",
+            print(f"Error: archive '{name}' import_file requires backup_dir or remote_dir (with remote)",
                   file=sys.stderr)
             sys.exit(1)
         if backup_dir:
@@ -2087,7 +2087,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
     if recv_dir and not send_dir and not send_file:
         # Need either backup_dir (local) or remote_dir (SSH)
         if not backup_dir and not (remote and remote_dir):
-            print(f"Error: receive_from_dir requires backup_dir or remote_dir (with remote)", file=sys.stderr)
+            print(f"Error: import_dir requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
         if backup_dir:
             chk_btrfs_subvolume(backup_dir, cfg)
@@ -2147,7 +2147,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
         stream_path = Path(send_file)
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
     elif send_dir:
-        chk_is_dir(send_dir, "send-to-dir" if not staged else "stage-dir")
+        chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
         stream_path = Path(send_dir) / f"{snap.name}.btrfs"
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
     # normal piped send|receive
@@ -2179,8 +2179,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
-    # Receive after send-to-file / send-to-dir when receive_* or staging is set,
-    # OR when send_to_file/send_to_dir is used with remote/remote_dir (auto-receive to SSH)
+    # Receive after export-file / export-dir when receive_* or staging is set,
+    # OR when export_file/export_dir is used with remote/remote_dir (auto-receive to SSH)
     auto_ssh_receive = (
         (send_file or send_dir)
         and remote
@@ -2218,10 +2218,10 @@ def process_archive(archive: dict, cfg: dict) -> None:
         # if stage_dir or stage_file was set, then use the stream_path from the send
         if staged:
             recv_path = stream_path
-        # check for receive_from_file...
+        # check for import_file...
         elif recv_file:
             recv_path = Path(recv_file)
-        # check for receive_from_dir...
+        # check for import_dir...
         elif recv_dir:
             # use stream_path from the send if recv_dir and send_dir are the same
             if recv_dir == send_dir:
@@ -2240,7 +2240,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
             print("Should never get here...", file=sys.stderr)
             sys.exit(1)
 
-        # Non-staged: receive_from_file may differ from send_to_file
+        # Non-staged: import_file may differ from export_file
         if recv_file and send_file and not staged:
             recv_path = Path(recv_file)
 
@@ -2279,7 +2279,7 @@ Examples:
   bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup home=/home
   bubtrsnap --config=~/.config/bubtrsnap.toml
   bubtrsnap -v --snaps-only root=/
-  bubtrsnap --send-to-file /dirfor/streamdata/file/ maildir=/home/user/Maildir
+  bubtrsnap --export-file /dirfor/streamdata/file/ maildir=/home/user/Maildir
         """
     )
 
@@ -2304,27 +2304,27 @@ Examples:
         action="store_true",
         help="Only create snapshots; skip the backup step"
     )
-    parser.add_argument("--send-to-file", type=str, metavar="FILE",
+    parser.add_argument("--export-file", type=str, metavar="FILE",
         help="Send stream to FILE (archive-specific). Exactly one archive required. "
              "Mutually exclusive with --snaps-only and the *-dir options.")
-    parser.add_argument("--receive-from-file", type=str, metavar="FILE",
+    parser.add_argument("--import-file", type=str, metavar="FILE",
         help="Receive stream from FILE (archive-specific). Exactly one archive required. "
-             "If used with --send-to-file, both must name the same file.")
-    parser.add_argument("--send-to-dir", type=str, metavar="DIR",
+             "If used with --export-file, both must name the same file.")
+    parser.add_argument("--export-dir", type=str, metavar="DIR",
         help="Write per-archive streams into DIR as {archive}.{timestamp}.btrfs. "
              "Global; applies to CLI archives or all config archives.")
-    parser.add_argument("--receive-from-dir", type=str, metavar="DIR",
+    parser.add_argument("--import-dir", type=str, metavar="DIR",
         help="Receive newest matching stream for each archive from DIR.")
     parser.add_argument(
         "--stage-file", type=str, metavar="FILE",
         help="Stage via FILE: btrfs send -f FILE then receive -f FILE, then delete FILE. "
-             "Exactly one archive. Mutually exclusive with other send/receive/stage options "
+             "Exactly one archive. Mutually exclusive with other export/import/stage options "
              "and with --snaps-only.",
     )
     parser.add_argument(
         "--stage-dir", type=str, metavar="DIR",
         help="Stage via DIR: write {archive}.{timestamp}.btrfs, receive it, then delete it. "
-             "Applies to listed or all archives. Mutually exclusive with other send/receive/stage "
+             "Applies to listed or all archives. Mutually exclusive with other export/import/stage "
              "options and with --snaps-only.",
     )
     parser.add_argument(
@@ -2401,8 +2401,8 @@ Examples:
     # snaps-only and either of the send-to-*, recv-from-* or stage-* don't make
     # sense so we'll flag that...
     if args.snaps_only and (
-        args.send_to_file or args.receive_from_file or args.stage_file
-        or args.send_to_dir or args.receive_from_dir or args.stage_dir
+        args.export_file or args.import_file or args.stage_file
+        or args.export_dir or args.import_dir or args.stage_dir
     ):
         print(
             "Error: --snaps-only is mutually exclusive with send/receive/stage "
@@ -2411,8 +2411,8 @@ Examples:
         )
         return 1
 
-    if (args.send_to_file or args.receive_from_file or args.stage_file) and (
-        args.send_to_dir or args.receive_from_dir or args.stage_dir
+    if (args.export_file or args.import_file or args.stage_file) and (
+        args.export_dir or args.import_dir or args.stage_dir
     ):
         print(
             "Error: cannot mix file options with directory options",
@@ -2421,29 +2421,29 @@ Examples:
         return 1
 
     if args.stage_file and (
-        args.send_to_file or args.receive_from_file
-        or args.send_to_dir or args.receive_from_dir or args.stage_dir
+        args.export_file or args.import_file
+        or args.export_dir or args.import_dir or args.stage_dir
     ):
         print("Error: --stage-file is mutually exclusive with other send/receive/stage options",
               file=sys.stderr)
         return 1
     if args.stage_dir and (
-        args.send_to_file or args.receive_from_file or args.stage_file
-        or args.send_to_dir or args.receive_from_dir
+        args.export_file or args.import_file or args.stage_file
+        or args.export_dir or args.import_dir
     ):
         print("Error: --stage-dir is mutually exclusive with other send/receive/stage options",
               file=sys.stderr)
         return 1
 
     # don't mix file specific send/recv options with dir versions of the options
-    if (args.send_to_file or args.receive_from_file) and (args.send_to_dir or args.receive_from_dir):
-        print("Error: cannot mix --send-to-file/--receive-from-file with "
-              "--send-to-dir/--receive-from-dir", file=sys.stderr)
+    if (args.export_file or args.import_file) and (args.export_dir or args.import_dir):
+        print("Error: cannot mix --export-file/--import-file with "
+              "--export-dir/--import-dir", file=sys.stderr)
         return 1
 
-    # remote and remote_dir must be used together
-    if (args.remote and not args.remote_dir) or (args.remote_dir and not args.remote):
-        print("Error: --remote and --remote-dir must be specified together", file=sys.stderr)
+    # remote_host and remote_path must be used together
+    if (args.remote_host and not args.remote_path) or (args.remote_path and not args.remote_host):
+        print("Error: --remote-host and --remote-path must be specified together", file=sys.stderr)
         return 1
 
     # Verbosity handling 
@@ -2467,9 +2467,9 @@ Examples:
 
     # see if we're doing a recv only operation....
     receive_only = all(
-        (a.get("receive_from_file") or a.get("receive_from_dir"))
-        and not a.get("send_to_file")
-        and not a.get("send_to_dir")
+        (a.get("import_file") or a.get("import_dir"))
+        and not a.get("export_file")
+        and not a.get("export_dir")
         and not a.get("stage_file")
         and not a.get("stage_dir")
         and not a.get("snaps_only")

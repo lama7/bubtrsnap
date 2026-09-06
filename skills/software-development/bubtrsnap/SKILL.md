@@ -63,13 +63,13 @@ python3 bubtrsnap --config /path/to/config.toml --dry-run -v
 
 | Option | Config Key | Description |
 |--------|------------|-------------|
-| `--remote user@host` | `remote` | SSH target host |
-| `--remote-dir /path` | `remote_dir` | Remote btrfs subvolume directory |
+| `--remote-host user@host` | `remote_host` | SSH target host |
+| `--remote-path /path` | `remote_path` | Remote btrfs subvolume directory |
 | `--remote-sudo` | `remote_sudo` | Use `sudo -n` on remote |
 
 ### Dual-Destination Backup
 
-When both `backup_dir` (local) and `remote_dir` + `remote` are set, bubtrsnap sends to **both** in a single run. Each destination maintains its own parent snapshot for incremental send.
+When both `backup_dir` (local) and `remote_path` + `remote_host` are set, bubtrsnap sends to **both** in a single run. Each destination maintains its own parent snapshot for incremental send.
 
 ## Procedure
 
@@ -105,9 +105,9 @@ When both `backup_dir` (local) and `remote_dir` + `remote` are set, bubtrsnap se
 ### SSH remote backup workflow
 
 1. Ensure remote host has btrfs and the target directory is a subvolume
-2. Configure `remote`, `remote_dir` (and optionally `remote_sudo`) in config or CLI
+2. Configure `remote_host`, `remote_path` (and optionally `remote_sudo`) in config or CLI
 3. Run with `--dry-run -v` to verify parent snapshot matching on both sides
-4. For staged workflows: `--send-to-dir` + `--receive-from-dir` on remote
+4. For staged workflows: `--export-dir` + `--import-dir` on remote
 
 ## Pitfalls
 
