@@ -395,22 +395,33 @@ processing and a btrfs stream file will be searched for in the specified directo
 If a stream file is not found, processing for that archive completes and the
 next archive is dealt with.
 
-### SSH Remote Receive with send_to_dir
+### SSH Remote Receive with send_to_file / send_to_dir
 
-When `send_to_dir` is combined with `remote` and `remote_dir` (and no explicit
+When `send_to_file` or `send_to_dir` is combined with `remote` and `remote_dir` (and no explicit
 `receive_from_file`, `receive_from_dir`, or staging options), bubtrsnap will:
 
 1. Create the snapshot
-2. Write the btrfs stream to a file in `send_to_dir` (with incremental parents)
-3. Automatically receive that stream file to the SSH remote via `cat <file> | ssh remote btrfs receive remote_dir`
-4. Apply keep policy on the remote
+2. Write the btrfs stream to a file (`send_to_file` path or `send_to_dir`/`archive.timestamp.btrfs`)
+3. Automatically copy that stream file to the SSH remote via `scp`
+4. Receive the stream on the remote via `btrfs receive -f <temp_file> remote_dir`
+5. Clean up the temporary file on the remote
+6. Apply keep policy on the remote
 
-This enables a fully automated single-command workflow: snapshot locally, stream to file, transfer and receive on remote — all in one bubtrsnap run.
+This enables a fully automated single-command workflow: snapshot locally, stream to file, transfer via SCP, and receive on remote — all in one bubtrsnap run.
 
-Example CLI:
+Example CLI (send_to_dir):
 ```
 bubtrsnap --snapshot-dir /snapshots \
     --send-to-dir /local/streams \
+    --remote user@backuphost \
+    --remote-dir /btrfs/backups \
+    archive1=/path/to/subvol
+```
+
+Example CLI (send_to_file):
+```
+bubtrsnap --snapshot-dir /snapshots \
+    --send-to-file /local/stream.btrfs \
     --remote user@backuphost \
     --remote-dir /btrfs/backups \
     archive1=/path/to/subvol
@@ -427,7 +438,7 @@ remote_dir = "/btrfs/backups"
 subvolume = "/path/to/subvol"
 ```
 
-Note: The local stream file is retained after transfer (not deleted). Use `--stage-dir` if you want automatic cleanup.
+Note: The local stream file is retained after transfer (not deleted). Use `--stage-file` or `--stage-dir` if you want automatic cleanup.
 
 ## Staging: stage_file / stage_dir
 

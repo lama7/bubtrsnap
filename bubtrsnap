@@ -1403,64 +1403,87 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
 
     return stream_file
 
+def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False) -> str | None:
+    """Copy stream file to remote via SCP, then receive locally on remote."""
+    # SCP the stream file to a temporary location on remote
+    remote_tmp = f"/tmp/bubtrsnap-{stream.name}"
+    
+    scp_cmd = ["scp", str(stream), f"{remote}:{remote_tmp}"]
+    
+    if cfg.get("dry_run"):
+        log(f"[dry-run] {' '.join(scp_cmd)}", 2, cfg["verbose"])
+        log(f"[dry-run] ssh {remote} btrfs receive {remote_dir} -f {remote_tmp}", 2, cfg["verbose"])
+        return stream.stem
+    
+    log(f"Copying stream to remote via SCP...", 1, cfg["verbose"])
+    log(f"{' '.join(scp_cmd)}", 2, cfg["verbose"])
+    result = subprocess.run(scp_cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        print(f"Error copying stream to remote via SCP:\\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Now receive on remote using the copied file
+    recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
+    # Modify to use -f with the remote temp file
+    recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp]
+    
+    log(f"ssh {remote} {' '.join(recv_cmd[2:])}", 2, cfg["verbose"])
+    start = datetime.now()
+    
+    ssh_proc = subprocess.Popen(recv_cmd, 
+                                stdout=subprocess.PIPE, 
+                                stderr=subprocess.PIPE, 
+                                text=True)
+    ssh_stdout, ssh_stderr = ssh_proc.communicate()
+    
+    elapsed = (datetime.now() - start).total_seconds()
+    log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+    
+    stderr = (ssh_stderr or "").strip()
+    
+    # Clean up remote temp file
+    cleanup_cmd = ["ssh", remote, "rm", "-f", remote_tmp]
+    subprocess.run(cleanup_cmd, capture_output=True, check=False)
+    
+    if ssh_proc.returncode != 0:
+        if "already exists" in stderr.lower():
+            print(f"Warning: subvolume from '{stream.name}' already exists in "
+                  f"{remote_dir} – skipping", file=sys.stderr)
+            return None
+        print(f"Error receiving '{stream}' via SSH:\\n{stderr}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Extract subvolume name reported by btrfs
+    subvol_name = None
+    for line in stderr.splitlines():
+        line = line.strip()
+        if "At subvol" in line or "Receiving subvol" in line:
+            parts = line.split()
+            for i, tok in enumerate(parts):
+                if tok in ("subvol", "subvolume") and i + 1 < len(parts):
+                    subvol_name = parts[i + 1].strip("'\"")
+                    break
+            if subvol_name:
+                break
+    
+    if not subvol_name:
+        subvol_name = stream.stem
+    
+    log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
+    return subvol_name
+
+
 def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict, remote: str | None = None, remote_dir: str | None = None) -> str | None:
     """
     Execute `btrfs receive -f <stream> <backup_dir>`.
-    If remote/remote_dir provided, stream via SSH: `cat <stream> | ssh remote btrfs receive remote_dir`.
+    If remote/remote_dir provided, copy via SCP then receive locally on remote.
     If only remote/remote_dir (no backup_dir), receive only via SSH.
     Returns the received subvolume basename on success, None on 'already exists'.
     Aborts the whole program on any other error.
     """
     if remote and remote_dir:
-        # SSH mode: cat stream | ssh remote btrfs receive remote_dir
-        recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg)
-        # Use cat to stream the file over SSH
-        cat_cmd = ["cat", str(stream)]
-        
-        if cfg.get("dry_run"):
-            log(f"[dry-run] {' '.join(cat_cmd)} | ssh {remote} {' '.join(recv_cmd[2:])}", 2, cfg["verbose"])
-            return stream.stem
-        
-        log(f"{' '.join(cat_cmd)} | ssh {remote} {' '.join(recv_cmd[2:])}", 2, cfg["verbose"])
-        start = datetime.now()
-        
-        cat_proc = subprocess.Popen(cat_cmd, stdout=subprocess.PIPE)
-        ssh_proc = subprocess.Popen(recv_cmd, stdin=cat_proc.stdout, 
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        cat_proc.stdout.close()
-        ssh_stdout, ssh_stderr = ssh_proc.communicate()
-        
-        elapsed = (datetime.now() - start).total_seconds()
-        log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-        
-        stderr = (ssh_stderr or "").strip()
-        
-        if ssh_proc.returncode != 0:
-            if "already exists" in stderr.lower():
-                print(f"Warning: subvolume from '{stream.name}' already exists in "
-                      f"{remote_dir} – skipping", file=sys.stderr)
-                return None
-            print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
-            sys.exit(1)
-        
-        # Extract subvolume name reported by btrfs
-        subvol_name = None
-        for line in stderr.splitlines():
-            line = line.strip()
-            if "At subvol" in line or "Receiving subvol" in line:
-                parts = line.split()
-                for i, tok in enumerate(parts):
-                    if tok in ("subvol", "subvolume") and i + 1 < len(parts):
-                        subvol_name = parts[i + 1].strip("'\"")
-                        break
-            if subvol_name:
-                break
-        
-        if not subvol_name:
-            subvol_name = stream.stem
-        
-        log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
-        return subvol_name
+        remote_sudo = cfg.get("remote_sudo", False)
+        return _scp_and_receive(stream, remote, remote_dir, cfg, remote_sudo)
     elif backup_dir:
         # Local mode (original behavior)
         recv_cmd = btrfs_cmd(cfg, "receive", "-f", str(stream), str(backup_dir))
@@ -1489,7 +1512,7 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict, remote: str
                 print(f"Warning: subvolume from '{stream.name}' already exists in "
                       f"{backup_dir} – skipping", file=sys.stderr)
                 return None
-            print(f"Error receiving '{stream}':\n{stderr}", file=sys.stderr)
+            print(f"Error receiving '{stream}' locally:\\n{stderr}", file=sys.stderr)
             sys.exit(1)
 
         # Extract subvolume name reported by btrfs
@@ -1502,8 +1525,8 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict, remote: str
                     if tok in ("subvol", "subvolume") and i + 1 < len(parts):
                         subvol_name = parts[i + 1].strip("'\"")
                         break
-            if subvol_name:
-                break
+                if subvol_name:
+                    break
 
         if not subvol_name:
             subvol_name = stream.stem
@@ -2150,9 +2173,9 @@ def process_archive(archive: dict, cfg: dict) -> None:
         return
 
     # Receive after send-to-file / send-to-dir when receive_* or staging is set,
-    # OR when send_to_dir is used with remote/remote_dir (auto-receive to SSH)
+    # OR when send_to_file/send_to_dir is used with remote/remote_dir (auto-receive to SSH)
     auto_ssh_receive = (
-        send_dir
+        (send_file or send_dir)
         and remote
         and remote_dir
         and not recv_file
