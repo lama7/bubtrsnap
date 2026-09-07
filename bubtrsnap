@@ -1214,40 +1214,10 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
     local_send_cmd.append(str(snap))
 
     # Build parent arguments for SSH destination
-    ssh_send_cmd = btrfs_cmd(cfg, "send")
+    ssh_send_cmd = btrfs_cmd(cfg, "send", sudo=False)
     for i, p in enumerate(ssh_parents):
         ssh_send_cmd += ["-p" if i == 0 else "-c", str(p)]
     ssh_send_cmd.append(str(snap))
-
-    # For dry-run, show what would happen
-    if cfg.get("dry_run"):
-        if remote and remote_dir:
-            ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
-            if backup_dir:
-                if local_parents:
-                    log(f"Incremental send using {len(local_parents)} local parent(s) + {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
-                else:
-                    log("Full send (no matching parent found)", 1, cfg["verbose"])
-                log(f"[dry-run] {' '.join(local_send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
-                log(f"[dry-run] {' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
-            else:
-                if ssh_parents:
-                    log(f"Incremental send using {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
-                else:
-                    log("Full send (no matching parent found)", 1, cfg["verbose"])
-                log(f"[dry-run] {' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
-        elif backup_dir:
-            if local_parents:
-                log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
-            else:
-                log("Full send (no matching parent found)", 1, cfg["verbose"])
-            log(f"[dry-run] {' '.join(local_send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
-        else:
-            log("Full send (no matching parent found)", 1, cfg["verbose"])
-            log(f"[dry-run] {' '.join(ssh_send_cmd)} (no destination)", 2, cfg["verbose"])
-        return dest
-
-    start_time = datetime.now()
 
     has_local = backup_dir is not None
     has_remote = remote and remote_dir
@@ -1256,11 +1226,45 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
         return dest
 
+    # Build receive commands
+    if has_local:
+        recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
+    if has_remote:
+        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
+
+    # Log what we're about to do (same for dry-run and real execution)
+    if has_remote and has_local:
+        if local_parents:
+            log(f"Incremental send using {len(local_parents)} local parent(s) + {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
+        else:
+            log("Full send (no matching parent found)", 1, cfg["verbose"])
+        log(f"{' '.join(local_send_cmd)} | {' '.join(recv_cmd)}", 2, cfg["verbose"])
+        log(f"{' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
+    elif has_remote:
+        if ssh_parents:
+            log(f"Incremental send using {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
+        else:
+            log("Full send (no matching parent found)", 1, cfg["verbose"])
+        log(f"{' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
+    elif has_local:
+        if local_parents:
+            log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
+        else:
+            log("Full send (no matching parent found)", 1, cfg["verbose"])
+        log(f"{' '.join(local_send_cmd)} | {' '.join(recv_cmd)}", 2, cfg["verbose"])
+    else:
+        log("Full send (no matching parent found)", 1, cfg["verbose"])
+        log(f"{' '.join(ssh_send_cmd)} (no destination)", 2, cfg["verbose"])
+
+    if cfg.get("dry_run"):
+        return dest
+
+    start_time = datetime.now()
+
     if has_remote and has_local:
         # Both local and remote: run send twice - once for each destination
         # First: local receive
         log("Sending to local backup...", 1, cfg["verbose"])
-        recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
         send_proc1 = subprocess.Popen(local_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         recv_proc1 = subprocess.Popen(recv_cmd, stdin=send_proc1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         send_proc1.stdout.close()
@@ -1272,7 +1276,6 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         # Second: SSH receive
         log(f"Sending to SSH remote {remote}...", 1, cfg["verbose"])
         send_proc2 = subprocess.Popen(ssh_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
         ssh_proc2 = subprocess.Popen(ssh_recv, stdin=send_proc2.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         send_proc2.stdout.close()
         ssh_proc2.communicate()
@@ -1282,7 +1285,6 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
 
     elif has_remote:
         # SSH only
-        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg)
         send_proc = subprocess.Popen(ssh_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         ssh_proc = subprocess.Popen(ssh_recv, stdin=send_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         send_proc.stdout.close()
@@ -1295,7 +1297,6 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
             raise RuntimeError("btrfs receive via SSH failed")
     elif has_local:
         # Local only (original behavior)
-        recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
         send_proc = subprocess.Popen(local_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         recv_proc = subprocess.Popen(recv_cmd, stdin=send_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         send_proc.stdout.close()
@@ -1346,52 +1347,6 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         print("Delete it manually or choose a different path.", file=sys.stderr)
         sys.exit(1)
 
-    if cfg.get("dry_run"):
-        if remote and remote_dir:
-            ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
-            if backup_dir and not is_staged:
-                if local_parents:
-                    log(f"Incremental send using {len(local_parents)} local parent(s) + {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
-                else:
-                    log("Full send (no matching parent found)", 1, cfg["verbose"])
-                log(f"[dry-run] {' '.join(local_send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
-                log(f"[dry-run] {' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
-            else:
-                if ssh_parents:
-                    log(f"Incremental send using {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
-                else:
-                    log("Full send (no matching parent found)", 1, cfg["verbose"])
-                if backup_dir:
-                    log(f"[dry-run] {' '.join(local_send_cmd)} (to file)", 2, cfg["verbose"])
-                log(f"[dry-run] {' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
-        elif backup_dir:
-            if is_staged:
-                if local_parents:
-                    log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
-                else:
-                    log("Full send (no matching parent found)", 1, cfg["verbose"])
-                log(f"[dry-run] {' '.join(local_send_cmd)} (to file)", 2, cfg["verbose"])
-            else:
-                if local_parents:
-                    log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
-                else:
-                    log("Full send (no matching parent found)", 1, cfg["verbose"])
-                log(f"[dry-run] {' '.join(local_send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
-        else:
-            log("Full send to file (no matching parent found)", 1, cfg["verbose"])
-            log(f"[dry-run] {' '.join(local_send_cmd)} (file only)", 2, cfg["verbose"])
-        return stream_file
-
-    # For staged file operations, we only send to file (receive happens separately)
-    if is_staged:
-        log("Sending to staged file...", 1, cfg["verbose"])
-        log(f"{' '.join(local_send_cmd)}", 2, cfg["verbose"])
-        send_proc = subprocess.Popen(local_send_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        send_proc.communicate()
-        if send_proc.returncode != 0:
-            raise RuntimeError("btrfs send to file failed")
-        return stream_file
-
     has_local = backup_dir is not None
     has_remote = remote and remote_dir
 
@@ -1399,15 +1354,113 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
         return stream_file
 
-    if has_remote:
-        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
-        log(f"{' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
-
+    # Build receive commands
     if has_local:
         recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
-        log(f"{' '.join(local_send_cmd)} | {' '.join(recv_cmd)}", 2, cfg["verbose"])
+    if has_remote:
+        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
+
+    # Log what we're about to do (same for dry-run and real execution)
+    if has_remote and has_local:
+        if local_parents:
+            log(f"Incremental send using {len(local_parents)} local parent(s) + {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
+        else:
+            log("Full send (no matching parent found)", 1, cfg["verbose"])
+        if not is_staged:
+            log(f"{' '.join(local_send_cmd)} | {' '.join(recv_cmd)}", 2, cfg["verbose"])
+        else:
+            log(f"{' '.join(local_send_cmd)} (to file)", 2, cfg["verbose"])
+        log(f"{' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
+    elif has_remote:
+        if ssh_parents:
+            log(f"Incremental send using {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
+        else:
+            log("Full send (no matching parent found)", 1, cfg["verbose"])
+        if has_local:
+            log(f"{' '.join(local_send_cmd)} (to file)", 2, cfg["verbose"])
+        log(f"{' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
+    elif has_local:
+        if local_parents:
+            log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
+        else:
+            log("Full send (no matching parent found)", 1, cfg["verbose"])
+        if is_staged:
+            log(f"{' '.join(local_send_cmd)} (to file)", 2, cfg["verbose"])
+        else:
+            log(f"{' '.join(local_send_cmd)} | {' '.join(recv_cmd)}", 2, cfg["verbose"])
+    else:
+        log("Full send to file (no matching parent found)", 1, cfg["verbose"])
+        log(f"{' '.join(local_send_cmd)} (file only)", 2, cfg["verbose"])
+
+    if cfg.get("dry_run"):
+        return stream_file
+
+    # For staged file operations, we only send to file (receive happens separately)
+    if is_staged:
+        log("Sending to staged file...", 1, cfg["verbose"])
+        send_proc = subprocess.Popen(local_send_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc.communicate()
+        if send_proc.returncode != 0:
+            raise RuntimeError("btrfs send to file failed")
+        return stream_file
 
     start_time = datetime.now()
+
+    if has_remote and has_local:
+        # Both local and remote: run send twice - once for each destination
+        # First: local receive
+        log("Sending to local backup...", 1, cfg["verbose"])
+        send_proc1 = subprocess.Popen(local_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        recv_proc1 = subprocess.Popen(recv_cmd, stdin=send_proc1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc1.stdout.close()
+        recv_proc1.communicate()
+
+        if recv_proc1.returncode != 0:
+            raise RuntimeError("btrfs receive (local) failed")
+
+        # Second: SSH receive
+        log(f"Sending to SSH remote {remote}...", 1, cfg["verbose"])
+        send_proc2 = subprocess.Popen(ssh_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ssh_proc2 = subprocess.Popen(ssh_recv, stdin=send_proc2.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc2.stdout.close()
+        ssh_proc2.communicate()
+
+        if ssh_proc2.returncode != 0:
+            raise RuntimeError("btrfs receive via SSH failed")
+
+    elif has_remote:
+        # SSH only
+        send_proc = subprocess.Popen(ssh_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ssh_proc = subprocess.Popen(ssh_recv, stdin=send_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc.stdout.close()
+        ssh_proc.communicate()
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        log(f"btrfs send/receive (SSH) completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+
+        if ssh_proc.returncode != 0:
+            raise RuntimeError("btrfs receive via SSH failed")
+    elif has_local:
+        # Local only (original behavior)
+        send_proc = subprocess.Popen(local_send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        recv_proc = subprocess.Popen(recv_cmd, stdin=send_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc.stdout.close()
+        recv_proc.communicate()
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+
+        if recv_proc.returncode != 0:
+            raise RuntimeError("btrfs receive failed")
+
+    # Also write to file if requested (without parent args - it's a full send to file)
+    export_file = btrfs_cmd(cfg, "send", "-f", str(stream_file), str(snap))
+    log(f"{' '.join(export_file)}", 2, cfg["verbose"])
+    result = subprocess.run(export_file, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"btrfs send to file failed: {result.stderr}")
+
+    return stream_file
 
     if has_remote and has_local:
         # Both local and remote: run send twice - once for each destination
@@ -1471,14 +1524,16 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     remote_tmp = f"/tmp/bubtrsnap-{stream.name}"
     
     scp_cmd = ["scp", str(stream), f"{remote}:{remote_tmp}"]
-    
-    if cfg.get("dry_run"):
-        log(f"[dry-run] {' '.join(scp_cmd)}", 2, cfg["verbose"])
-        log(f"[dry-run] ssh {remote} btrfs receive {remote_dir} -f {remote_tmp}", 2, cfg["verbose"])
-        return stream.stem
-    
-    log(f"Copying stream to remote via SCP...", 1, cfg["verbose"])
+    recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
+    recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp]
+
     log(f"{' '.join(scp_cmd)}", 2, cfg["verbose"])
+    log(f"ssh {remote} {' '.join(recv_cmd[2:])}", 2, cfg["verbose"])
+
+    if cfg.get("dry_run"):
+        return stream.stem
+
+    log(f"Copying stream to remote via SCP...", 1, cfg["verbose"])
     # Use run helper for SCP so it respects dry-run and logging
     result = run(scp_cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"], capture_output=True, text=True, check=False)
     if result is None:
@@ -1486,30 +1541,26 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     if result.returncode != 0:
         print(f"Error copying stream to remote via SCP:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
-    
+
     # Now receive on remote using the copied file
-    recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
-    # Modify to use -f with the remote temp file
-    recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp]
-    
     log(f"ssh {remote} {' '.join(recv_cmd[2:])}", 2, cfg["verbose"])
     start = datetime.now()
-    
+
     ssh_proc = subprocess.Popen(recv_cmd, 
                                 stdout=subprocess.PIPE, 
                                 stderr=subprocess.PIPE, 
                                 text=True)
     ssh_stdout, ssh_stderr = ssh_proc.communicate()
-    
+
     elapsed = (datetime.now() - start).total_seconds()
     log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-    
+
     stderr = (ssh_stderr or "").strip()
-    
+
     # Clean up remote temp file
     cleanup_cmd = ["ssh", remote, "rm", "-f", remote_tmp]
     subprocess.run(cleanup_cmd, capture_output=True, check=False)
-    
+
     if ssh_proc.returncode != 0:
         if "already exists" in stderr.lower():
             print(f"Warning: subvolume from '{stream.name}' already exists in "
@@ -1553,11 +1604,11 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict, remote: str
         # Local mode (original behavior)
         recv_cmd = btrfs_cmd(cfg, "receive", "-f", str(stream), str(backup_dir))
 
+        log(f"{' '.join(recv_cmd)}", 2, cfg["verbose"])
+
         if cfg.get("dry_run"):
-            log(f"[dry-run] {' '.join(recv_cmd)}", 2, cfg["verbose"])
             return stream.stem
 
-        log(f"{' '.join(recv_cmd)}", 2, cfg["verbose"])
         start = datetime.now()
 
         result = subprocess.run(
@@ -1577,7 +1628,7 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict, remote: str
                 print(f"Warning: subvolume from '{stream.name}' already exists in "
                       f"{backup_dir} – skipping", file=sys.stderr)
                 return None
-            print(f"Error receiving '{stream}' locally:\\n{stderr}", file=sys.stderr)
+            print(f"Error receiving '{stream}' locally:\n{stderr}", file=sys.stderr)
             sys.exit(1)
 
         # Extract subvolume name reported by btrfs
