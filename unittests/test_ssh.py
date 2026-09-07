@@ -554,5 +554,76 @@ class TestSCPReceive(unittest.TestCase):
             bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
 
 
+class TestSendBackupToFile(unittest.TestCase):
+    """Test send_backup_tofile behavior for stage_file vs export_file."""
+
+    @patch("bubtrsnap.subprocess.Popen")
+    def test_send_backup_tofile_stage_file_only_sends_to_file(self, mock_popen):
+        """stage_file should only send to file, not pipe to receive."""
+        from pathlib import Path
+        import subprocess
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        snap = Path("/snapshots/lama7.202608280230")
+        snap_dir = Path("/snapshots")
+        backup_dir = Path("/backup")
+        stream_file = Path("/tmp/stage.btrfs")
+        cfg = {"local_sudo": False, "verbose": 1, "dry_run": False}
+        archive_cfg = {"stage_file": str(stream_file)}  # stage_file triggers is_staged
+
+        # Mock find_parents to return empty list
+        with patch.object(bs, "find_parents", return_value=[]):
+            result = bs.send_backup_tofile(snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg)
+
+        self.assertEqual(result, stream_file)
+        # Verify Popen was called with the send command (not piped to receive)
+        self.assertTrue(mock_popen.called)
+        call_args = mock_popen.call_args[0][0]
+        self.assertIn("-f", call_args)
+        self.assertIn(str(stream_file), call_args)
+        # Should NOT have receive command piped
+        # The function should return early for staged files
+
+    @patch("bubtrsnap.subprocess.Popen")
+    @patch("bubtrsnap.subprocess.run")
+    def test_send_backup_tofile_export_file_pipes_to_receive(self, mock_run, mock_popen):
+        """export_file (not stage_file) should pipe send to receive."""
+        from pathlib import Path
+        import subprocess
+
+        mock_send = MagicMock()
+        mock_send.communicate.return_value = (b"", b"")
+        mock_send.returncode = 0
+        mock_recv = MagicMock()
+        mock_recv.communicate.return_value = (b"", b"")
+        mock_recv.returncode = 0
+        
+        # Return send_proc first, then recv_proc
+        mock_popen.side_effect = [mock_send, mock_recv]
+        
+        # Mock subprocess.run for the final export to file
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["btrfs", "send", "-f", "/tmp/export.btrfs", "..."], 
+            returncode=0, stdout="", stderr=""
+        )
+
+        snap = Path("/snapshots/lama7.202608280230")
+        snap_dir = Path("/snapshots")
+        backup_dir = Path("/backup")
+        stream_file = Path("/tmp/export.btrfs")
+        cfg = {"local_sudo": False, "verbose": 1, "dry_run": False}
+        archive_cfg = {"export_file": str(stream_file)}  # export_file, not stage_file
+
+        with patch.object(bs, "find_parents", return_value=[]):
+            result = bs.send_backup_tofile(snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg)
+
+        self.assertEqual(result, stream_file)
+        # Should have been called twice: once for send, once for receive
+        self.assertEqual(mock_popen.call_count, 2)
+
 if __name__ == "__main__":
     unittest.main()

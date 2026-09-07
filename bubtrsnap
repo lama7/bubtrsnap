@@ -1313,12 +1313,15 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
                        stream_file: Path, cfg: dict, archive: str, archive_cfg: dict | None = None) -> Path:
     """
     btrfs send -f <stream_file>.  Errors if stream_file already exists.
-    If archive_cfg has remote/remote_dir, also sends to SSH destination.
+    If archive_cfg has remote_host/remote_path, also sends to SSH destination.
     """
     # Check if SSH remote is configured
-    remote = archive_cfg.get("remote") if archive_cfg else cfg.get("remote")
-    remote_dir = archive_cfg.get("remote_dir") if archive_cfg else cfg.get("remote_dir")
+    remote = archive_cfg.get("remote_host") if archive_cfg else cfg.get("remote_host")
+    remote_dir = archive_cfg.get("remote_path") if archive_cfg else cfg.get("remote_path")
     remote_sudo = archive_cfg.get("remote_sudo") if archive_cfg else cfg.get("remote_sudo", False)
+
+    # Check if this is a staged file operation (stage_file sets send_file=recv_file)
+    is_staged = archive_cfg.get("stage_file") is not None if archive_cfg else False
 
     # Find parents for local destination
     local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
@@ -1346,7 +1349,7 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     if cfg.get("dry_run"):
         if remote and remote_dir:
             ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
-            if backup_dir:
+            if backup_dir and not is_staged:
                 if local_parents:
                     log(f"Incremental send using {len(local_parents)} local parent(s) + {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
                 else:
@@ -1358,16 +1361,35 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
                     log(f"Incremental send using {len(ssh_parents)} SSH parent(s)", 1, cfg["verbose"])
                 else:
                     log("Full send (no matching parent found)", 1, cfg["verbose"])
+                if backup_dir:
+                    log(f"[dry-run] {' '.join(local_send_cmd)} (to file)", 2, cfg["verbose"])
                 log(f"[dry-run] {' '.join(ssh_send_cmd)} | ssh {remote} {' '.join(ssh_recv[2:])}", 2, cfg["verbose"])
         elif backup_dir:
-            if local_parents:
-                log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
+            if is_staged:
+                if local_parents:
+                    log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
+                else:
+                    log("Full send (no matching parent found)", 1, cfg["verbose"])
+                log(f"[dry-run] {' '.join(local_send_cmd)} (to file)", 2, cfg["verbose"])
             else:
-                log("Full send (no matching parent found)", 1, cfg["verbose"])
-            log(f"[dry-run] {' '.join(local_send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
+                if local_parents:
+                    log(f"Incremental send using {len(local_parents)} parent(s)", 1, cfg["verbose"])
+                else:
+                    log("Full send (no matching parent found)", 1, cfg["verbose"])
+                log(f"[dry-run] {' '.join(local_send_cmd)} | btrfs receive {backup_dir}", 2, cfg["verbose"])
         else:
             log("Full send to file (no matching parent found)", 1, cfg["verbose"])
             log(f"[dry-run] {' '.join(local_send_cmd)} (file only)", 2, cfg["verbose"])
+        return stream_file
+
+    # For staged file operations, we only send to file (receive happens separately)
+    if is_staged:
+        log("Sending to staged file...", 1, cfg["verbose"])
+        log(f"{' '.join(local_send_cmd)}", 2, cfg["verbose"])
+        send_proc = subprocess.Popen(local_send_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_proc.communicate()
+        if send_proc.returncode != 0:
+            raise RuntimeError("btrfs send to file failed")
         return stream_file
 
     has_local = backup_dir is not None
