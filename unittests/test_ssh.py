@@ -272,6 +272,94 @@ class TestApplyKeepPolicySSH(unittest.TestCase):
                 self.assertTrue(kwargs.get("dry_run", False))
 
     @patch("bubtrsnap.run")
+    def test_apply_keep_policy_ssh_dry_run_with_remote_sudo(self, mock_run):
+        """Test that SSH delete commands include 'sudo -n' when remote_sudo=True."""
+        def run_mock(cmd, **kwargs):
+            if kwargs.get("dry_run", False):
+                return None
+            mock = MagicMock()
+            mock.returncode = 0
+            return mock
+
+        mock_run.side_effect = run_mock
+
+        cfg = {"local_sudo": True, "verbose": 1, "dry_run": True, "remote_sudo": True}
+
+        with patch.object(bs, "iter_archive_items_ssh") as mock_iter:
+            mock_iter.return_value = [
+                ("202608280230", "/remote/backup/lama7.202608280230"),
+                ("202608290230", "/remote/backup/lama7.202608290230"),
+                ("202608300230", "/remote/backup/lama7.202608300230"),
+                ("202608310230", "/remote/backup/lama7.202608310230"),
+            ]
+
+            # Pass remote_sudo=True as the 6th argument
+            bs.apply_keep_policy_ssh("user@host", "/remote/backup", "lama7",
+                                     {"keep_daily": 2}, cfg, True)
+
+            # Verify delete commands include 'sudo -n'
+            delete_calls = []
+            for call in mock_run.call_args_list:
+                args, kwargs = call
+                cmd_str = " ".join(args[0]) if args else ""
+                if "delete" in cmd_str:
+                    delete_calls.append(args[0])
+            self.assertEqual(len(delete_calls), 2)
+            for cmd in delete_calls:
+                self.assertIn("sudo", cmd)
+                self.assertIn("-n", cmd)
+                # Check order: ssh user@host sudo -n btrfs subvolume delete ...
+                self.assertEqual(cmd[0], "ssh")
+                self.assertEqual(cmd[1], "user@host")
+                self.assertEqual(cmd[2], "sudo")
+                self.assertEqual(cmd[3], "-n")
+                self.assertEqual(cmd[4], "btrfs")
+                self.assertEqual(cmd[5], "subvolume")
+                self.assertEqual(cmd[6], "delete")
+
+    @patch("bubtrsnap.run")
+    def test_apply_keep_policy_ssh_dry_run_without_remote_sudo(self, mock_run):
+        """Test that SSH delete commands DON'T include 'sudo -n' when remote_sudo=False."""
+        def run_mock(cmd, **kwargs):
+            if kwargs.get("dry_run", False):
+                return None
+            mock = MagicMock()
+            mock.returncode = 0
+            return mock
+
+        mock_run.side_effect = run_mock
+
+        cfg = {"local_sudo": True, "verbose": 1, "dry_run": True, "remote_sudo": False}
+
+        with patch.object(bs, "iter_archive_items_ssh") as mock_iter:
+            mock_iter.return_value = [
+                ("202608280230", "/remote/backup/lama7.202608280230"),
+                ("202608290230", "/remote/backup/lama7.202608290230"),
+                ("202608300230", "/remote/backup/lama7.202608300230"),
+                ("202608310230", "/remote/backup/lama7.202608310230"),
+            ]
+
+            bs.apply_keep_policy_ssh("user@host", "/remote/backup", "lama7",
+                                     {"keep_daily": 2}, cfg, False)
+
+            # Verify delete commands DON'T include 'sudo -n'
+            delete_calls = []
+            for call in mock_run.call_args_list:
+                args, kwargs = call
+                cmd_str = " ".join(args[0]) if args else ""
+                if "delete" in cmd_str:
+                    delete_calls.append(args[0])
+            self.assertEqual(len(delete_calls), 2)
+            for cmd in delete_calls:
+                self.assertNotIn("sudo", cmd)
+                # Check order: ssh user@host btrfs subvolume delete ...
+                self.assertEqual(cmd[0], "ssh")
+                self.assertEqual(cmd[1], "user@host")
+                self.assertEqual(cmd[2], "btrfs")
+                self.assertEqual(cmd[3], "subvolume")
+                self.assertEqual(cmd[4], "delete")
+
+    @patch("bubtrsnap.run")
     def test_apply_keep_policy_ssh_prunes_old(self, mock_run):
         cfg = {"local_sudo": True, "verbose": 1, "dry_run": False}
 

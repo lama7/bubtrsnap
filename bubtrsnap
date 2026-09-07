@@ -399,6 +399,8 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "remote_path": str,
     "remote_sudo": bool,
     "backup_dir": str,
+    "export_dir": str,
+    "import_dir": str,
 }
 
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
@@ -798,6 +800,9 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             remote_host = cli_remote_host
             remote_path = cli_remote_path
             remote_sudo = cli_remote_sudo
+            # Initialize export/import dirs for CLI mode
+            export_dir = None
+            import_dir = None
         else:
             # Rules 2 & 3: archive-specific first; global only if none
             send_file = raw.get("export_file")
@@ -810,6 +815,14 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             if stage_file:
                 stage_file = expand_path(stage_file)
 
+            # Also read export_dir and import_dir from archive config
+            export_dir = raw.get("export_dir")
+            import_dir = raw.get("import_dir")
+            if export_dir:
+                export_dir = expand_path(export_dir)
+            if import_dir:
+                import_dir = expand_path(import_dir)
+
             if stage_file and (send_file or recv_file):
                 print(
                     f"Error in archive '{name}': stage_file cannot be combined with "
@@ -818,16 +831,33 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                 )
                 sys.exit(1)
 
+            # Initialize send_dir/recv_dir to None before check
+            send_dir = None
+            recv_dir = None
+            stage_dir = None
+            
+            # Only file options (send_file, recv_file, stage_file) count as "file opts"
+            # export_dir/import_dir are directory options that should be preserved
             archive_has_file_opts = bool(send_file or recv_file or stage_file)
             if archive_has_file_opts:
                 # Rule 2: archive-specific only — no global dirs
                 send_dir = None
                 recv_dir = None
                 stage_dir = None
+                export_dir = None
+                import_dir = None
             else:
                 # Rule 3: globals apply only when archive has no file opts
                 send_dir = global_cfg.get("export_dir")
                 recv_dir = global_cfg.get("import_dir")
+                stage_dir = global_cfg.get("stage_dir")
+                # Preserve archive's export_dir/import_dir if set
+                if export_dir is None:
+                    export_dir = global_cfg.get("export_dir")
+                if import_dir is None:
+                    import_dir = global_cfg.get("import_dir")
+                send_dir = export_dir
+                recv_dir = import_dir
                 stage_dir = global_cfg.get("stage_dir")
 
         snaps_only = (
@@ -845,14 +875,20 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             )
             sys.exit(1)
 
-        # Resolve remote/remote_path/remote_sudo with precedence: CLI > archive-specific > global
-        if cli_remote_host is not None and cli_remote_path is not None:
+        # Resolve remote_host/remote_path/remote_sudo with precedence: CLI > archive-specific > global
+        if cli_remote_host is not None:
             remote_host = cli_remote_host
-            remote_path = cli_remote_path
-            remote_sudo = cli_remote_sudo or False
         else:
             remote_host = raw.get("remote_host", global_cfg.get("remote_host"))
+        
+        if cli_remote_path is not None:
+            remote_path = cli_remote_path
+        else:
             remote_path = raw.get("remote_path", global_cfg.get("remote_path"))
+        
+        if cli_remote_sudo is not None:
+            remote_sudo = cli_remote_sudo
+        else:
             remote_sudo = raw.get("remote_sudo", global_cfg.get("remote_sudo", False))
 
         # Validate: if remote_path is set, remote_host must also be set (from any level)
@@ -873,8 +909,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                     "export_file": send_file,
                     "import_file": recv_file,
                     "stage_file": stage_file,
-                    "export_dir": send_dir,
-                    "import_dir": recv_dir,
+                    "export_dir": export_dir or send_dir,
+                    "import_dir": import_dir or recv_dir,
                     "stage_dir": stage_dir,
                     "remote_host": remote_host,
                     "remote_path": remote_path,
@@ -1019,7 +1055,7 @@ def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) 
     successfully received to backup_dir (matched by UUID ↔ Received UUID).
     Returns them newest-first.
     """
-    log(f"Finding parent subvolumes for {archive}", 2, cfg["verbose"])
+    log(f"Finding parent subvolumes for {archive}", 1, cfg["verbose"])
     # Collect snapshots
     snapshots = []
     for p in snapshot_dir.glob(f"{archive}.*"):
@@ -1064,7 +1100,7 @@ def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: 
     successfully received to remote_dir via SSH (matched by UUID ↔ Received UUID).
     Returns them newest-first.
     """
-    log(f"Finding parent subvolumes for {archive} on SSH remote {remote}:{remote_dir}", 2, cfg["verbose"])
+    log(f"Finding parent subvolumes for {archive} on SSH remote {remote}:{remote_dir}", 1, cfg["verbose"])
     # Collect snapshots
     snapshots = []
     for p in snapshot_dir.glob(f"{archive}.*"):
@@ -1159,8 +1195,8 @@ def build_ssh_receive_cmd(remote: str, remote_dir: str, cfg: dict, remote_sudo: 
 
 def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: dict, archive: str, archive_cfg: dict | None = None) -> Path:
     # Check if SSH remote is configured
-    remote = archive_cfg.get("remote") if archive_cfg else cfg.get("remote")
-    remote_dir = archive_cfg.get("remote_dir") if archive_cfg else cfg.get("remote_dir")
+    remote = archive_cfg.get("remote_host") if archive_cfg else cfg.get("remote_host")
+    remote_dir = archive_cfg.get("remote_path") if archive_cfg else cfg.get("remote_path")
     remote_sudo = archive_cfg.get("remote_sudo") if archive_cfg else cfg.get("remote_sudo", False)
 
     dest = backup_dir / snap.name if backup_dir else Path(snap.name)
@@ -1898,7 +1934,7 @@ def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict
         else:
             log(f"\tPruning {remote_path}", 1, cfg["verbose"])
             # Build SSH delete command
-            delete_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "delete", remote_path, sudo=False))
+            delete_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "delete", remote_path, sudo=False), remote_sudo)
             try:
                 run(delete_cmd,
                     dry_run=cfg.get("dry_run", False),
@@ -2046,8 +2082,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
     archive_backup_dir = archive.get("backup_dir")
     backup_dir = Path(archive_backup_dir) if archive_backup_dir else (Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None)
     snap_dir = Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None
-    remote = archive.get("remote")
-    remote_dir = archive.get("remote_dir")
+    remote = archive.get("remote_host")
+    remote_dir = archive.get("remote_path")
 
     # ----- receive-only (file) -----
     if recv_file and not send_file:
@@ -2150,8 +2186,11 @@ def process_archive(archive: dict, cfg: dict) -> None:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
         stream_path = Path(send_dir) / f"{snap.name}.btrfs"
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
-    # normal piped send|receive
+    # normal piped send|receive (no export_file/export_dir) OR export with remote
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
+        # If export_file or export_dir is set with remote, use file-based SCP + remote receive
+        use_file_transfer = (send_file or send_dir) and remote and remote_dir
+        
         log("Starting backup...", 1, cfg["verbose"])
         # Check remote_dir if configured
         if remote and remote_dir:
@@ -2159,7 +2198,14 @@ def process_archive(archive: dict, cfg: dict) -> None:
             chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
         if backup_dir:
             chk_btrfs_subvolume(backup_dir, cfg)
-        dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
+        
+        if use_file_transfer:
+            # File-based: export to stream file, SCP to remote, receive on remote
+            dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+        else:
+            # Normal piped send/receive
+            dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
+            
         run_hook(archive.get("post_backup_hook"), {
             "backup": str(dest), "snapshot": str(snap), "archive": name,
             "timestamp": timestamp(), "snapshotdir": str(snap_dir),
@@ -2339,7 +2385,9 @@ Examples:
     )
     parser.add_argument(
         "--remote-sudo",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=None,
         help="Run btrfs commands on SSH remote with 'sudo -n'. "
              "Can be set globally or per-archive in config file."
     )
