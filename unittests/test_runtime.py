@@ -340,6 +340,106 @@ class TestExportFileBackup(unittest.TestCase):
             self.assertNotIn("btrfs receive", all_cmds)
 
 
+class TestGlobalRemoteSudoBackup(unittest.TestCase):
+    """Test the global_remote_sudo configuration modeled after global_remote_sudo_test.toml.
+
+    Config:
+      - local_sudo = true (global)
+      - remote_host = "gerry@thorin" (global)  
+      - remote_sudo = true (global)
+      - backup_dir (global)
+      - remote_path (per-archive, overrides nothing from global since global has no remote_path)
+    Flow: snapshot -> send_backup (piped send|ssh receive) -> keep policy both local and remote
+    """
+
+    @patch("bubtrsnap.run")
+    def test_dry_run_global_remote_sudo_uses_sudo_prefixes(self, mock_run):
+        """Dry-run with local_sudo=true and remote_sudo=true should log sudo-prefixed commands."""
+
+        from io import StringIO
+        import sys
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "root"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": None,  # Set per-archive
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 3,
+                "keep_monthly": 3,
+                "keep_yearly": 1,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "backup_dir": str(backup_dir),
+                "keep": {
+                    "keep_daily": 5,
+                    "keep_weekly": 1,
+                    "keep_monthly": 1,
+                },
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+
+                # Validation commands (always execute, dry_run=False)
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""  # no parents
+                    return result
+
+                # Dry-run for write commands
+                return None
+
+            mock_run.side_effect = run_mock
+
+            # Capture stdout
+            old_stdout = sys.stdout
+            captured = StringIO()
+            sys.stdout = captured
+
+            try:
+                result = bs.send_backup(snap_path, snap_dir, backup_dir, cfg, archive_name, archive)
+            finally:
+                sys.stdout = old_stdout
+
+            self.assertEqual(result, backup_dir / snap_name)
+
+            # Verify dry-run output contains sudo-prefixed commands
+            output = captured.getvalue()
+            # local_sudo=true: local send/receive should have 'sudo -n'
+            self.assertIn("sudo -n btrfs send", output)
+            self.assertIn("sudo -n btrfs receive", output)
+            # remote_sudo=true: SSH command should have 'ssh' + 'sudo -n'
+            self.assertIn("ssh", output)
+            self.assertIn("sudo -n", output)
+            # Should pipe to remote (ssh ... btrfs receive)
+            self.assertIn("btrfs receive", output)
+
+
 class TestLocalSudoBackup(unittest.TestCase):
     """Test that local_sudo=True produces correct command construction."""
 
