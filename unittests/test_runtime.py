@@ -247,6 +247,99 @@ class TestStageFileBackup(unittest.TestCase):
             self.assertIn("sudo", all_cmds)
 
 
+class TestExportFileBackup(unittest.TestCase):
+    """Test the export_file configuration modeled after test_export_file.toml.
+
+    Config:
+      - local_sudo = false (default)
+      - backup_dir = /backup  
+      - export_file in archive section (send to file only, no receive)
+    Flow: create_snapshot -> send_backup_tofile (export to file) -> keep policy on snap_dir
+    """
+
+    @patch("bubtrsnap.run")
+    def test_dry_run_export_file_only_sends_to_file(self, mock_run):
+        """Dry-run with export_file should log send-to-file, skip receive, apply keep policy."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "corinne"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            cfg = {
+                "local_sudo": False,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": None,
+                "remote_path": None,
+                "remote_sudo": False,
+                "keep_daily": 3,
+                "keep_weekly": 3,
+                "keep_monthly": 3,
+                "keep_yearly": 1,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "export_file": "/tmp/corinne.btrfs",
+                "keep": {
+                    "keep_daily": 3,
+                    "keep_weekly": 2,
+                    "keep_monthly": 3,
+                    "keep_yearly": 0,
+                },
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+
+                # Validation commands (always execute in dry-run)
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""  # no parents
+                    return result
+
+                # Dry-run for write commands
+                return None
+
+            mock_run.side_effect = run_mock
+
+            # process_archive should complete without error
+            # export_file only: send to file, no receive, keep policy on snap_dir
+            bs.process_archive(archive, cfg)
+
+            # Verify run() was called
+            self.assertTrue(mock_run.called)
+
+            # Check that commands were logged (send to file, not receive)
+            calls = mock_run.call_args_list
+            cmd_strs = []
+            for call_obj in calls:
+                args, kwargs = call_obj
+                cmd = args[0]
+                cmd_strs.append(" ".join(cmd) if isinstance(cmd, list) else cmd)
+
+            all_cmds = " ".join(cmd_strs)
+            # Should have send -f (export to file)
+            self.assertIn("btrfs send", all_cmds)
+            self.assertIn("-f", all_cmds)
+            self.assertIn("/tmp/corinne.btrfs", all_cmds)
+            # Should NOT have btrfs receive (export_file only, no receive)
+            self.assertNotIn("btrfs receive", all_cmds)
+
+
 class TestLocalSudoBackup(unittest.TestCase):
     """Test that local_sudo=True produces correct command construction."""
 

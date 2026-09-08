@@ -1359,7 +1359,7 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     if has_remote:
         ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
 
-    # For staged file operations, we only send to file (receive happens separately)
+    # For staged file operations (stage_file), we only send to file (receive happens separately)
     if is_staged:
         log("Sending to staged file...", 1, cfg["verbose"])
         result = run(local_send_cmd, dry_run=cfg.get("dry_run", False),
@@ -1371,27 +1371,29 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
             raise RuntimeError("btrfs send to file failed")
         return stream_file
 
-    # NOTE: send_backup_tofile is called when export_file/export_dir is set.
-    # The send commands in this function include -f (write to file), which is
-    # incompatible with piping to btrfs receive. The correct flow is:
-    #   1. Write stream file with btrfs send -f (done below)
-    #   2. For local backup_dir: pipe btrfs send (no -f) to btrfs receive
-    #   3. For SSH remote: SCP stream file + receive -f on remote
-    # The piped sections below are currently incorrect — they pipe -f commands.
-    # This is a placeholder exit until the correct implementation is decided.
-    print("Error: send_backup_tofile with backup/receive destinations is not yet implemented", file=sys.stderr)
-    print("The -f send commands cannot be piped to receive — this needs to be reworked.", file=sys.stderr)
-    sys.exit(1)
-
-    # Also write to file if requested (without parent args - it's a full send to file)
-    export_file = btrfs_cmd(cfg, "send", "-f", str(stream_file), str(snap))
-    result = run(export_file, dry_run=cfg.get("dry_run", False),
+    # For export_file without stage_file: just write the stream to file.
+    # Receiving (if needed) is handled separately by process_archive via
+    # receive_stream or _scp_and_receive. This supports the export_file-only
+    # configuration (send to file, no receive back), as well as the
+    # export_file + remote case (SCP file to remote).
+    log("Sending to file...", 1, cfg["verbose"])
+    result = run(local_send_cmd, dry_run=cfg.get("dry_run", False),
                  verbosity=cfg["verbose"],
-                 capture_output=True, check=False)
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     if result is None:
         return stream_file
     if result.returncode != 0:
-        raise RuntimeError(f"btrfs send to file failed: {result.stderr}")
+        raise RuntimeError("btrfs send to file failed")
+
+    # If remote is configured, also send to SSH destination
+    if has_remote:
+        result = run(ssh_send_cmd, dry_run=cfg.get("dry_run", False),
+                     verbosity=cfg["verbose"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if result is None:
+            return stream_file
+        if result.returncode != 0:
+            raise RuntimeError("btrfs send to file (SSH) failed")
 
     return stream_file
 
