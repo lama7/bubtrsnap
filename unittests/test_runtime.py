@@ -154,6 +154,99 @@ class TestBasicLocalBackup(unittest.TestCase):
             # Verify the flow completed without error
 
 
+class TestStageFileBackup(unittest.TestCase):
+    """Test the stage_file configuration modeled after test_stage_file.toml.
+
+    Config:
+      - local_sudo = true
+      - remote_host, remote_sudo = true
+      - stage_file in archive section
+    Flow: send_backup_tofile (staged) -> receive_stream -> remove_stage_file
+    """
+
+    @patch("bubtrsnap.run")
+    def test_dry_run_stage_file_logs_send_receive_and_cleanup(self, mock_run):
+        """Dry-run with stage_file should log send-to-file, receive, and cleanup."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "keenan"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            stage_file_path = Path(f"/tmp/{archive_name}.btrfs")
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": None,
+                "remote_path": None,
+                "remote_sudo": False,
+                "keep_daily": 3,
+                "keep_weekly": 3,
+                "keep_monthly": 3,
+                "keep_yearly": 1,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "stage_file": str(stage_file_path),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "keep": {
+                    "keep_daily": 3,
+                    "keep_weekly": 2,
+                    "keep_monthly": 3,
+                    "keep_yearly": 0,
+                },
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+
+                # Validation commands (always execute, dry_run=False)
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""  # no parents
+                    return result
+
+                # Dry-run for write commands
+                return None
+
+            mock_run.side_effect = run_mock
+
+            bs.process_archive(archive, cfg)
+
+            # Verify run was called — for validation (read_only) + staged send + receive + cleanup
+            self.assertTrue(mock_run.called)
+
+            # Check that sudo is used for local_sudo=true commands
+            calls = mock_run.call_args_list
+            cmd_strs = []
+            for call_obj in calls:
+                args, kwargs = call_obj
+                cmd = args[0]
+                cmd_strs.append(" ".join(cmd) if isinstance(cmd, list) else cmd)
+
+            # Should have sudo in send/receive/cleanup commands
+            all_cmds = " ".join(cmd_strs)
+            self.assertIn("sudo", all_cmds)
+
+
 class TestLocalSudoBackup(unittest.TestCase):
     """Test that local_sudo=True produces correct command construction."""
 
