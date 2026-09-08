@@ -505,12 +505,15 @@ class TestSCPReceive(unittest.TestCase):
         stream = Path("/tmp/test.202608280230.btrfs")
         cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False}
 
+        # During dry-run, run() returns None (logs [dry-run] command, doesn't execute)
+        mock_run.return_value = None
+
         result = bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
 
         self.assertEqual(result, "test.202608280230")
-        # In dry-run mode, the function returns early and logs via log()
-        # The actual scp/ssh commands are not executed via run()
-        # Verify the function returns the expected stem
+        # Verify run() was called 3 times (SCP, SSH receive, cleanup)
+        self.assertEqual(mock_run.call_count, 3)
+        # Verify the return value is the stream stem
         self.assertEqual(result, stream.stem)
 
     @patch("bubtrsnap.run")
@@ -529,9 +532,8 @@ class TestSCPReceive(unittest.TestCase):
         with self.assertRaises(SystemExit):
             bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
 
-    @patch("bubtrsnap.subprocess.Popen")
-    @patch("bubtrsnap.subprocess.run")
-    def test_scp_and_receive_receive_failure(self, mock_run, mock_popen):
+    @patch("bubtrsnap.run")
+    def test_scp_and_receive_receive_failure(self, mock_run):
         """_scp_and_receive should exit on SSH receive failure."""
         import subprocess
         from pathlib import Path
@@ -539,16 +541,12 @@ class TestSCPReceive(unittest.TestCase):
         stream = Path("/tmp/test.202608280230.btrfs")
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False}
         
-        # SCP succeeds
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=["scp", "..."], returncode=0, stdout="", stderr=""
-        )
-        
-        # SSH receive fails
-        mock_proc = MagicMock()
-        mock_proc.communicate.return_value = ("", "error: no space left")
-        mock_proc.returncode = 1
-        mock_popen.return_value = mock_proc
+        # SCP succeeds, SSH receive fails, cleanup succeeds
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(args=["scp"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="error: no space left"),
+            subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
+        ]
         
         with self.assertRaises(SystemExit):
             bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
@@ -557,16 +555,17 @@ class TestSCPReceive(unittest.TestCase):
 class TestSendBackupToFile(unittest.TestCase):
     """Test send_backup_tofile behavior for stage_file vs export_file."""
 
-    @patch("bubtrsnap.subprocess.Popen")
-    def test_send_backup_tofile_stage_file_only_sends_to_file(self, mock_popen):
+    @patch("bubtrsnap.run")
+    def test_send_backup_tofile_stage_file_only_sends_to_file(self, mock_run):
         """stage_file should only send to file, not pipe to receive."""
         from pathlib import Path
         import subprocess
 
-        mock_proc = MagicMock()
-        mock_proc.communicate.return_value = (b"", b"")
-        mock_proc.returncode = 0
-        mock_popen.return_value = mock_proc
+        # run() is called with check=False and capture_output=True
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["btrfs", "send", "-f", "/tmp/stage.btrfs", "..."],
+            returncode=0, stdout=b"", stderr=b""
+        )
 
         snap = Path("/snapshots/lama7.202608280230")
         snap_dir = Path("/snapshots")
@@ -580,50 +579,30 @@ class TestSendBackupToFile(unittest.TestCase):
             result = bs.send_backup_tofile(snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg)
 
         self.assertEqual(result, stream_file)
-        # Verify Popen was called with the send command (not piped to receive)
-        self.assertTrue(mock_popen.called)
-        call_args = mock_popen.call_args[0][0]
+        # Verify run() was called with the send command (not piped to receive)
+        self.assertTrue(mock_run.called)
+        call_args = mock_run.call_args[0][0]
         self.assertIn("-f", call_args)
         self.assertIn(str(stream_file), call_args)
         # Should NOT have receive command piped
         # The function should return early for staged files
 
-    @patch("bubtrsnap.subprocess.Popen")
-    @patch("bubtrsnap.subprocess.run")
-    def test_send_backup_tofile_export_file_pipes_to_receive(self, mock_run, mock_popen):
-        """export_file (not stage_file) should pipe send to receive."""
+    @patch("bubtrsnap.run")
+    def test_send_backup_tofile_export_file_pipes_to_receive(self, mock_run):
+        """export_file with both local and remote exits — piped -f send is not supported."""
         from pathlib import Path
         import subprocess
-
-        mock_send = MagicMock()
-        mock_send.communicate.return_value = (b"", b"")
-        mock_send.returncode = 0
-        mock_recv = MagicMock()
-        mock_recv.communicate.return_value = (b"", b"")
-        mock_recv.returncode = 0
-        
-        # Return send_proc first, then recv_proc
-        mock_popen.side_effect = [mock_send, mock_recv]
-        
-        # Mock subprocess.run for the final export to file
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=["btrfs", "send", "-f", "/tmp/export.btrfs", "..."], 
-            returncode=0, stdout="", stderr=""
-        )
 
         snap = Path("/snapshots/lama7.202608280230")
         snap_dir = Path("/snapshots")
         backup_dir = Path("/backup")
         stream_file = Path("/tmp/export.btrfs")
         cfg = {"local_sudo": False, "verbose": 1, "dry_run": False}
-        archive_cfg = {"export_file": str(stream_file)}  # export_file, not stage_file
+        archive_cfg = {"export_file": str(stream_file)}
 
         with patch.object(bs, "find_parents", return_value=[]):
-            result = bs.send_backup_tofile(snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg)
-
-        self.assertEqual(result, stream_file)
-        # Should have been called twice: once for send, once for receive
-        self.assertEqual(mock_popen.call_count, 2)
+            with self.assertRaises(SystemExit):
+                bs.send_backup_tofile(snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg)
 
 if __name__ == "__main__":
     unittest.main()
