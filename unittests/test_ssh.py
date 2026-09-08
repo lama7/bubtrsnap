@@ -588,10 +588,15 @@ class TestSendBackupToFile(unittest.TestCase):
         # The function should return early for staged files
 
     @patch("bubtrsnap.run")
-    def test_send_backup_tofile_export_file_pipes_to_receive(self, mock_run):
-        """export_file with both local and remote exits — piped -f send is not supported."""
+    def test_send_backup_tofile_export_file_sends_to_file(self, mock_run):
+        """export_file with backup_dir should send to file (no pipe to receive)."""
         from pathlib import Path
         import subprocess
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["btrfs", "send", "-f", "/tmp/export.btrfs", "..."],
+            returncode=0, stdout=b"", stderr=b""
+        )
 
         snap = Path("/snapshots/lama7.202608280230")
         snap_dir = Path("/snapshots")
@@ -601,8 +606,14 @@ class TestSendBackupToFile(unittest.TestCase):
         archive_cfg = {"export_file": str(stream_file)}
 
         with patch.object(bs, "find_parents", return_value=[]):
-            with self.assertRaises(SystemExit):
-                bs.send_backup_tofile(snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg)
+            result = bs.send_backup_tofile(snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg)
+
+        # Should return the stream_file path
+        self.assertEqual(result, stream_file)
+        # Verify run() was called with send -f command (not piping to receive)
+        self.assertTrue(mock_run.called)
+        call_args = mock_run.call_args[0][0]
+        self.assertIn("-f", call_args)
 
 if __name__ == "__main__":
     unittest.main()
