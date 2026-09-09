@@ -1314,6 +1314,8 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     """
     btrfs send -f <stream_file>.  Errors if stream_file already exists.
     If archive_cfg has remote_host/remote_path, also sends to SSH destination.
+    Writes the stream to a local file. Remote transfer and receive are
+    handled separately by process_archive via receive_stream/_scp_and_receive.
     """
     # Check if SSH remote is configured
     remote = archive_cfg.get("remote_host") if archive_cfg else cfg.get("remote_host")
@@ -1325,21 +1327,12 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
 
     # Find parents for local destination
     local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
-    
-    # Find parents for SSH destination
-    ssh_parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo) if (remote and remote_dir) else []
 
     # Build parent arguments for local destination
     local_send_cmd = btrfs_cmd(cfg, "send")
     for i, p in enumerate(local_parents):
         local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
     local_send_cmd += ["-f", str(stream_file), str(snap)]
-
-    # Build parent arguments for SSH destination
-    ssh_send_cmd = btrfs_cmd(cfg, "send")
-    for i, p in enumerate(ssh_parents):
-        ssh_send_cmd += ["-p" if i == 0 else "-c", str(p)]
-    ssh_send_cmd += ["-f", str(stream_file), str(snap)]
 
     if stream_file.exists():
         print(f"Error: stream file already exists: {stream_file}", file=sys.stderr)
@@ -1353,11 +1346,9 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
         return stream_file
 
-    # Build receive commands
+    # Build receive command (used by callers that need it)
     if has_local:
         recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
-    if has_remote:
-        ssh_recv = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
 
     # For staged file operations (stage_file), we only send to file (receive happens separately)
     if is_staged:
@@ -1384,16 +1375,6 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         return stream_file
     if result.returncode != 0:
         raise RuntimeError("btrfs send to file failed")
-
-    # If remote is configured, also send to SSH destination
-    if has_remote:
-        result = run(ssh_send_cmd, dry_run=cfg.get("dry_run", False),
-                     verbosity=cfg["verbose"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if result is None:
-            return stream_file
-        if result.returncode != 0:
-            raise RuntimeError("btrfs send to file (SSH) failed")
 
     return stream_file
 
