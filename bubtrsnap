@@ -1403,6 +1403,8 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     remote_tmp = f"/tmp/bubtrsnap-{stream.name}"
     
     scp_cmd = ["scp", str(stream), f"{remote}:{remote_tmp}"]
+    if cfg.get("local_sudo"):
+        scp_cmd = ["sudo", "-n"] + scp_cmd
     recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
     recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp]
 
