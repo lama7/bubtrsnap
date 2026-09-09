@@ -1500,6 +1500,8 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict, remote: str
             print(f"Error receiving '{stream}' locally:\n{stderr}", file=sys.stderr)
             sys.exit(1)
 
+        return stream.stem
+
     else:
         print("Error: receive_stream called without backup_dir or remote/remote_dir", file=sys.stderr)
         sys.exit(1)
