@@ -935,8 +935,6 @@ class TestExportImportDirBackup(unittest.TestCase):
 
 class TestRemoteExportFileBackup(unittest.TestCase):
     """Test the remote + export_file configuration modeled after test_remote_w_export_file.toml.
-
-    Config:
       - local_sudo = true (global)
       - remote_host = "gerry@thorin" (global)
       - remote_sudo = true (global)
@@ -1041,6 +1039,279 @@ class TestRemoteExportFileBackup(unittest.TestCase):
             # Should NOT have a piped send|receive to the SSH remote (that's handled by file transfer)
             ssh_pipe = [l for l in pipe_lines if "ssh" in l and "btrfs receive" in l]
             self.assertEqual(len(ssh_pipe), 0, f"Should not have piped SSH send, got: {output}")
+
+
+class TestScpLocalSudo(unittest.TestCase):
+    """Test that scp command gets local_sudo prefix when local_sudo=true.
+
+    Regression test for bug where _scp_and_receive built scp_cmd without
+    checking cfg.get("local_sudo"). When btrfs send -f runs as root (due to
+    local_sudo), the stream file is root-owned, so scp must also use sudo.
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_scp_with_local_sudo_shows_sudo_prefix(self, mock_run, mock_stream):
+        """Dry-run with local_sudo=true + remote should prefix scp with sudo -n."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            stream_file = backup_dir / f"{archive_name}.btrfs"
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "export_file": str(stream_file),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                # For all other commands (dry-run), return None without logging
+                return None
+
+            mock_run.side_effect = run_mock
+
+            bs.process_archive(archive, cfg)
+
+            # Verify that run() was called with scp command prefixed with sudo -n
+            all_calls = mock_run.call_args_list
+            scp_calls = [
+                c for c in all_calls
+                if isinstance(c.args[0], list) and c.args[0][0] == "sudo" and "scp" in c.args[0]
+            ]
+            self.assertTrue(len(scp_calls) > 0, "Expected scp command with sudo -n prefix")
+
+
+class TestScpLocalSudoFalse(unittest.TestCase):
+    """Test that scp command does NOT get local_sudo prefix when local_sudo=false.
+
+    Counterpart to TestScpLocalSudo — ensures we don't blindly prefix scp
+    with sudo when local_sudo is not set.
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_scp_without_local_sudo_no_sudo_prefix(self, mock_run, mock_stream):
+        """Dry-run with local_sudo=false should NOT prefix scp with sudo -n."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            cfg = {
+                "local_sudo": False,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            stream_file = backup_dir / f"{archive_name}.btrfs"
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "export_file": str(stream_file),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            bs.process_archive(archive, cfg)
+
+            # Verify that run() was called with an scp command but NOT prefixed with sudo
+            all_calls = mock_run.call_args_list
+            scp_calls = [
+                c for c in all_calls
+                if isinstance(c.args[0], list) and "scp" in c.args[0]
+            ]
+            self.assertTrue(len(scp_calls) > 0, "Expected scp command to be called")
+            for c in scp_calls:
+                self.assertNotEqual(c.args[0][0], "sudo",
+                                    f"scp should not be prefixed with sudo when local_sudo=false")
+
+
+class TestReceiveStreamReturnsSubvolName(unittest.TestCase):
+    """Test that receive_stream returns the received subvolume name on success.
+
+    Regression test for bug where receive_stream's local mode returned None
+    on success (fixed in commit 3937cef). When send_backup returns None,
+    process_archive skips apply_keep_policy on backup_dir.
+    """
+
+    @patch("bubtrsnap.run")
+    def test_receive_stream_local_returns_stem(self, mock_run):
+        """receive_stream in local mode should return stream.stem on success."""
+
+        with tempfile.TemporaryDirectory() as backup_td:
+            backup_dir = Path(backup_td)
+            stream_file = Path("/tmp/test_receive.btrfs")
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                # Simulate successful receive (no read_only validation needed)
+                result = MagicMock()
+                result.returncode = 0
+                return result
+
+            mock_run.side_effect = run_mock
+
+            result = bs.receive_stream(stream_file, backup_dir, cfg={"dry_run": False, "local_sudo": False, "verbose": 2})
+
+            # Should return the stream file stem, not None
+            self.assertEqual(result, "test_receive")
+            self.assertIsNotNone(result, "receive_stream must return subvol name on success")
+
+
+class TestExportImportNoLocalPipedSend(unittest.TestCase):
+    """Test that export_file + import_file does NOT do a local piped send->receive to backup_dir.
+
+    Regression test for bug where process_archive's local piped send block
+    ran even when recv_file (import_file) was set, causing unnecessary
+    send|receive to backup_dir. The condition should be:
+    'if backup_dir and not recv_file' — not just 'if backup_dir'.
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.find_newest_stream_for_archive", return_value=Path("/tmp/test.btrfs"))
+    @patch("bubtrsnap.run")
+    def test_dry_run_export_and_import_no_local_pipe(self, mock_run, mock_find, mock_stream):
+        """With both export_file and import_file set, no local piped send|receive should appear."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            export_file = snap_dir / f"{archive_name}.btrfs"
+            import_file = snap_dir / f"{archive_name}.imported.btrfs"
+
+            cfg = {
+                "local_sudo": False,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": None,
+                "remote_path": None,
+                "remote_sudo": False,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "export_file": str(export_file),
+                "import_file": str(import_file),
+                "backup_dir": str(backup_dir),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            from io import StringIO
+            import sys
+            old_stdout = sys.stdout
+            captured = StringIO()
+            sys.stdout = captured
+            try:
+                bs.process_archive(archive, cfg)
+            finally:
+                sys.stdout = old_stdout
+
+            output = captured.getvalue()
+            cmd_lines = output.split("\n")
+
+            # Should NOT have a local piped send|receive (to backup_dir without ssh)
+            local_pipe_lines = [
+                l for l in cmd_lines
+                if "|" in l and "btrfs send" in l and "btrfs receive" in l and "ssh" not in l
+            ]
+            self.assertEqual(len(local_pipe_lines), 0,
+                           f"Should not have local piped send|receive when import_file is set: {local_pipe_lines}")
 
 
 if __name__ == "__main__":
