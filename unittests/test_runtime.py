@@ -933,5 +933,115 @@ class TestExportImportDirBackup(unittest.TestCase):
             self.assertIn("btrfs receive", all_cmds)
 
 
+class TestRemoteExportFileBackup(unittest.TestCase):
+    """Test the remote + export_file configuration modeled after test_remote_w_export_file.toml.
+
+    Config:
+      - local_sudo = true (global)
+      - remote_host = "gerry@thorin" (global)
+      - remote_sudo = true (global)
+      - backup_dir = /backup (global)
+      - Archive: subvolume, remote_path = /run/media/gerry/backup, export_file = ~/lama7Maildir.btrfs
+    Flow: send_backup_tofile (export to file + SCP to remote) AND
+          normal piped send|receive to local backup_dir
+    """
+
+    @patch("bubtrsnap.run")
+    def test_dry_run_export_file_with_remote_and_local(self, mock_run):
+        """Dry-run with export_file, backup_dir, and remote should do both file export and local piped send.
+
+        The send_backup_tofile function handles the file-based export + SCP to remote
+        via run() calls. The local piped send uses piped_run() (Popen), which logs
+        directly to stdout. We capture stdout to verify both flows appear.
+        """
+        from io import StringIO
+        import sys
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "lama7Maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 3,
+                "keep_monthly": 3,
+                "keep_yearly": 1,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_path": "/run/media/gerry/backup",
+                "export_file": str(backup_dir / f"{archive_name}.btrfs"),
+                "keep": {
+                    "keep_daily": 7,
+                    "keep_monthly": 1,
+                    "keep_yearly": 1,
+                },
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            # Capture stdout to verify piped_run logging (not captured by mock_run)
+            old_stdout = sys.stdout
+            captured = StringIO()
+            sys.stdout = captured
+
+            try:
+                bs.process_archive(archive, cfg)
+            finally:
+                sys.stdout = old_stdout
+
+            output = captured.getvalue()
+            cmd_lines = output.split("\n")
+
+            # Should have send to file (export_file with -f) via run() mock
+            run_cmds = " ".join(
+                " ".join(c.args[0]) if isinstance(c.args[0], list) else c.args[0]
+                for c in mock_run.call_args_list
+            )
+            self.assertIn("btrfs send", run_cmds)
+            self.assertIn("-f", run_cmds)
+
+            # Should have piped send to local backup_dir (via piped_run, captured in stdout)
+            # Look for the pipe pattern: send ... | receive ...
+            pipe_lines = [l for l in cmd_lines if "|" in l and "btrfs send" in l and "btrfs receive" in l]
+            self.assertTrue(len(pipe_lines) >= 1, f"Expected piped send|receive in output, got:\n{output}")
+
+            # The piped send should go to the local backup_dir, not remote
+            local_pipe = [l for l in pipe_lines if str(backup_dir) in l and "ssh" not in l]
+            self.assertTrue(len(local_pipe) >= 1, f"Expected local piped send|receive to {backup_dir}, got: {output}")
+
+            # Should NOT have a piped send|receive to the SSH remote (that's handled by file transfer)
+            ssh_pipe = [l for l in pipe_lines if "ssh" in l and "btrfs receive" in l]
+            self.assertEqual(len(ssh_pipe), 0, f"Should not have piped SSH send, got: {output}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2106,6 +2106,19 @@ def process_archive(archive: dict, cfg: dict) -> None:
     if send_file:
         stream_path = Path(send_file)
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+        # If backup_dir is set locally, also do a normal piped send|receive
+        # to the local backup_dir (in addition to any file-based remote transfer)
+        if backup_dir:
+            log("Sending to local backup...", 1, cfg["verbose"])
+            local_send_cmd = btrfs_cmd(cfg, "send")
+            local_parents = find_parents(archive, snap_dir, backup_dir, cfg)
+            for i, p in enumerate(local_parents):
+                local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
+            local_send_cmd.append(str(snap))
+            recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
+            rc, stderr = piped_run(local_send_cmd, recv_cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"])
+            if rc != 0:
+                raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
     elif send_dir:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
         stream_path = Path(send_dir) / f"{snap.name}.btrfs"
