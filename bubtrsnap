@@ -2111,7 +2111,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
         if backup_dir:
             log("Sending to local backup...", 1, cfg["verbose"])
             local_send_cmd = btrfs_cmd(cfg, "send")
-            local_parents = find_parents(archive, snap_dir, backup_dir, cfg)
+            local_parents = find_parents(archive["name"], snap_dir, backup_dir, cfg)
             for i, p in enumerate(local_parents):
                 local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
             local_send_cmd.append(str(snap))
