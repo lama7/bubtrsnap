@@ -1486,6 +1486,96 @@ class TestExportFileRemoteNoDuplicateSend(unittest.TestCase):
             self.assertIn("/remote/parent", send_cmd_str,
                           "send -f command should use remote parents from find_parents_ssh")
 
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_ssh_receive_includes_remote_path_as_destination(self, mock_run, mock_stream):
+        """The SSH btrfs receive command must include remote_path as destination.
+
+        Regression test for bug where _scp_and_receive built the SSH receive
+        command as 'ssh remote sudo -n btrfs receive -f /tmp/stream.btrfs'
+        without a destination directory. The correct command is:
+        'ssh remote sudo -n btrfs receive -f /tmp/stream.btrfs <remote_path>'.
+        Without the destination, btrfs receive doesn't know where to create
+        the subvolume on the remote.
+        """
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            export_file = backup_dir / f"{archive_name}.btrfs"
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "export_file": str(export_file),
+                "backup_dir": str(backup_dir),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            from io import StringIO
+            import sys
+            old_stdout = sys.stdout
+            captured = StringIO()
+            sys.stdout = captured
+            try:
+                bs.process_archive(archive, cfg)
+            finally:
+                sys.stdout = old_stdout
+
+            # Check the mock_run call args for the SSH receive command
+            all_calls = mock_run.call_args_list
+            ssh_receive_call_found = False
+            for c in all_calls:
+                args, kwargs = c
+                cmd = args[0]
+                if isinstance(cmd, list) and "ssh" in cmd and "btrfs" in cmd and "receive" in cmd:
+                    ssh_receive_call_found = True
+                    cmd_str = " ".join(cmd)
+                    self.assertIn("-f", cmd_str)
+                    self.assertIn("/run/media/gerry/backup", cmd_str,
+                                  "SSH receive must include remote_path as destination")
+                    break
+            self.assertTrue(ssh_receive_call_found,
+                            "Expected an SSH receive command in mock_run calls")
+
 
 if __name__ == "__main__":
     unittest.main()

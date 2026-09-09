@@ -1394,7 +1394,7 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     if cfg.get("local_sudo"):
         scp_cmd = ["sudo", "-n"] + scp_cmd
     recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
-    recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp]
+    recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp, remote_dir]
 
     log(f"Copying stream to remote via SCP...", 1, cfg["verbose"])
     # Use run helper for SCP so it respects dry-run and logging
