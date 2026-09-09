@@ -341,16 +341,7 @@ class TestExportFileBackup(unittest.TestCase):
 
 
 class TestGlobalRemoteSudoBackup(unittest.TestCase):
-    """Test the global_remote_sudo configuration modeled after global_remote_sudo_test.toml.
-
-    Config:
-      - local_sudo = true (global)
-      - remote_host = "gerry@thorin" (global)  
-      - remote_sudo = true (global)
-      - backup_dir (global)
-      - remote_path (per-archive, overrides nothing from global since global has no remote_path)
-    Flow: snapshot -> send_backup (piped send|ssh receive) -> keep policy both local and remote
-    """
+    """Test the global_remote_sudo configuration modeled after global_remote_sudo_test.toml."""
 
     @patch("bubtrsnap.run")
     def test_dry_run_global_remote_sudo_uses_sudo_prefixes(self, mock_run):
@@ -514,6 +505,181 @@ class TestLocalSudoBackup(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn("sudo -n btrfs send", output)
             self.assertIn("sudo -n btrfs receive", output)
+
+
+class TestImportFileBackup(unittest.TestCase):
+    """Test the import_file configuration.
+
+    Config:
+      - local_sudo = true (global)
+      - backup_dir + snapshot_dir (global)
+      - import_file in archive section (receive only from stream file)
+    Flow: validate backup_dir -> check stream file -> receive_stream -> keep policy
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_import_file_receives_stream(self, mock_run, mock_stream):
+        """Dry-run with import_file should log btrfs receive -f command."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            # Create a fake stream file so is_file() check passes
+            stream_file = backup_dir / "migraine.btrfs"
+            stream_file.write_bytes(b"fake-btrfs-stream-data")
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": None,
+                "remote_path": None,
+                "remote_sudo": False,
+                "keep_daily": 3,
+                "keep_weekly": 3,
+                "keep_monthly": 3,
+                "keep_yearly": 1,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": "migraine",
+                "subvolume": str(snap_dir / "migraine"),
+                "import_file": str(stream_file),
+                "backup_dir": str(backup_dir),
+                "keep": {
+                    "keep_daily": 3,
+                    "keep_weekly": 2,
+                    "keep_monthly": 3,
+                    "keep_yearly": 0,
+                },
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+
+                # Validation commands (always execute in dry-run)
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""  # no parents
+                    return result
+
+                # Dry-run for write commands
+                return None
+
+            mock_run.side_effect = run_mock
+
+            bs.process_archive(archive, cfg)
+
+            # Verify run() was called with btrfs receive command
+            calls = mock_run.call_args_list
+            cmd_strs = []
+            for call_obj in calls:
+                args, kwargs = call_obj
+                cmd = args[0]
+                cmd_strs.append(" ".join(cmd) if isinstance(cmd, list) else cmd)
+
+            all_cmds = " ".join(cmd_strs)
+
+            # Verify receive command was called with -f and the stream file path
+            self.assertIn("btrfs receive", all_cmds)
+            self.assertIn("-f", all_cmds)
+            self.assertIn(str(stream_file), all_cmds)
+            # Verify receive command includes backup_dir
+            self.assertIn(str(backup_dir), all_cmds)
+            # local_sudo=true: receive command should include 'sudo -n'
+            receive_calls = [c for c in cmd_strs if "btrfs receive" in c]
+            self.assertTrue(len(receive_calls) > 0)
+            for cmd_str in receive_calls:
+                self.assertIn("sudo -n", cmd_str)
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_two_archives_export_then_import(self, mock_run, mock_stream):
+        """Dry-run with 2 archives: export_file on one, import_file on another."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive1_name = "alpha"
+            snap1 = snap_dir / f"{archive1_name}.202601011200"
+            snap1.mkdir()
+            # Don't pre-create export_file — send_backup_tofile checks it doesn't exist
+            export_file = snap_dir / f"{archive1_name}.btrfs"
+
+            archive2_name = "beta"
+            stream_file = backup_dir / f"{archive2_name}.btrfs"
+            stream_file.write_bytes(b"fake-stream")
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": None,
+                "remote_path": None,
+                "remote_sudo": False,
+                "keep_daily": 3,
+                "keep_weekly": 3,
+                "keep_monthly": 3,
+                "keep_yearly": 1,
+                "week_startday": "sunday",
+            }
+
+            archive1 = {
+                "name": archive1_name,
+                "subvolume": str(snap1),
+                "export_file": str(export_file),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+            archive2 = {
+                "name": archive2_name,
+                "subvolume": str(snap_dir / archive2_name),
+                "import_file": str(stream_file),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            # Process first archive (export_file - send to file)
+            bs.process_archive(archive1, cfg)
+            # Process second archive (import_file - receive from file)
+            bs.process_archive(archive2, cfg)
+
+            calls = mock_run.call_args_list
+            cmd_strs = []
+            for call_obj in calls:
+                args, kwargs = call_obj
+                cmd = args[0]
+                cmd_strs.append(" ".join(cmd) if isinstance(cmd, list) else cmd)
+
+            all_cmds = " ".join(cmd_strs)
+            # First archive: should have btrfs send -f
+            self.assertIn("btrfs send", all_cmds)
+            # Second archive: should have btrfs receive -f
+            self.assertIn("btrfs receive", all_cmds)
 
 
 if __name__ == "__main__":
