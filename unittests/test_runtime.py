@@ -1314,5 +1314,88 @@ class TestExportImportNoLocalPipedSend(unittest.TestCase):
                            f"Should not have local piped send|receive when import_file is set: {local_pipe_lines}")
 
 
+class TestExportFileRemoteNoDuplicateSend(unittest.TestCase):
+    """Regression test for duplicate btrfs send command in send_backup_tofile.
+
+    When export_file + backup_dir + remote_host + remote_path are all set,
+    send_backup_tofile used to run ssh_send_cmd (a second local 'btrfs send -f'
+    to the same stream file) in addition to local_send_cmd. In dry-run this was
+    masked (run() returns None → early return), but in live execution the
+    duplicate send actually ran. The SSH transfer is handled separately by
+    _scp_and_receive in the do_receive flow.
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_export_file_remote_calls_send_to_file_once(self, mock_run, mock_stream):
+        """With export_file + remote + backup_dir, send_backup_tofile should call
+        btrfs send -f exactly once (not twice for local + ssh_send)."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            export_file = backup_dir / f"{archive_name}.btrfs"
+
+            cfg = {
+                "local_sudo": False,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "export_file": str(export_file),
+                "backup_dir": str(backup_dir),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            bs.process_archive(archive, cfg)
+
+            # Count btrfs send -f calls (send to file)
+            send_to_file_calls = 0
+            for c in mock_run.call_args_list:
+                args, kwargs = c
+                cmd = args[0]
+                if isinstance(cmd, list) and "btrfs" in cmd and "send" in cmd and "-f" in cmd:
+                    send_to_file_calls += 1
+
+            self.assertEqual(send_to_file_calls, 1,
+                             f"Expected exactly 1 'btrfs send -f' call, got {send_to_file_calls}")
+
+
 if __name__ == "__main__":
     unittest.main()
