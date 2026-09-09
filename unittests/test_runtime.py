@@ -1577,5 +1577,84 @@ class TestExportFileRemoteNoDuplicateSend(unittest.TestCase):
                             "Expected an SSH receive command in mock_run calls")
 
 
+class TestExportFileOverwritesExisting(unittest.TestCase):
+    """Test that export_file overwrites an existing stream file instead of erroring.
+
+    Regression test for change where stream_file.exists() check was replaced
+    with unconditional overwrite (unlink + send).
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_overwrites_existing_export_file(self, mock_run, mock_stream):
+        """When export_file points to an existing file, dry-run should log overwrite + send."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            # Pre-create the export file to simulate it already existing
+            export_file = backup_dir / f"{archive_name}.btrfs"
+            export_file.write_bytes(b"old-stream-data")
+
+            cfg = {
+                "local_sudo": False,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": None,
+                "remote_path": None,
+                "remote_sudo": False,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "export_file": str(export_file),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            # Capture stdout to check for "Overwriting" log message
+            from io import StringIO
+            import sys
+            old_stdout = sys.stdout
+            captured = StringIO()
+            sys.stdout = captured
+            try:
+                bs.process_archive(archive, cfg)
+            finally:
+                sys.stdout = old_stdout
+
+            output = captured.getvalue()
+            # Should log that we're overwriting the existing file
+            self.assertIn("Overwriting existing stream file", output,
+                          f"Expected overwrite message in dry-run output: {output}")
+
+
 if __name__ == "__main__":
     unittest.main()

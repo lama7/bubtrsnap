@@ -1312,10 +1312,12 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
 def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
                        stream_file: Path, cfg: dict, archive: str, archive_cfg: dict | None = None) -> Path:
     """
-    btrfs send -f <stream_file>.  Errors if stream_file already exists.
-    If archive_cfg has remote_host/remote_path, also sends to SSH destination.
-    Writes the stream to a local file. Remote transfer and receive are
-    handled separately by process_archive via receive_stream/_scp_and_receive.
+    btrfs send -f <stream_file>.  If stream_file already exists, it is
+    removed first (overwritten).  Writes the stream to a local file.
+    Remote transfer and receive are handled separately by process_archive
+    via receive_stream/_scp_and_receive. This supports the export_file-only
+    configuration (send to file, no receive back), as well as the
+    export_file + remote case (SCP file to remote).
     """
     # Check if SSH remote is configured
     remote = archive_cfg.get("remote_host") if archive_cfg else cfg.get("remote_host")
@@ -1345,9 +1347,9 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     local_send_cmd += ["-f", str(stream_file), str(snap)]
 
     if stream_file.exists():
-        print(f"Error: stream file already exists: {stream_file}", file=sys.stderr)
-        print("Delete it manually or choose a different path.", file=sys.stderr)
-        sys.exit(1)
+        log(f"Overwriting existing stream file: {stream_file}", 1, cfg["verbose"])
+        if not cfg["dry_run"]:
+            stream_file.unlink()
 
     if not has_local and not has_remote:
         log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
