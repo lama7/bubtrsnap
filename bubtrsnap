@@ -614,13 +614,13 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     # Track if CLI explicitly set remote/remote_path/remote_sudo (for precedence over archive-specific config)
     cli_remote_host = getattr(cli, "remote_host", None)
     cli_remote_path = getattr(cli, "remote_path", None)
-    cli_remote_sudo = getattr(cli, "remote_sudo", None)
+    cli_remote_sudo = getattr(cli, "remote_sudo", False)
     if cli_remote_host is not None:
         global_cfg["remote_host"] = cli_remote_host
     if cli_remote_path is not None:
         global_cfg["remote_path"] = cli_remote_path
-    if cli_remote_sudo is not None:
-        global_cfg["remote_sudo"] = cli_remote_sudo
+    if cli_remote_sudo:
+        global_cfg["remote_sudo"] = True
 
     # Track if CLI explicitly set backup_dir for precedence over archive-specific config
     cli_backup_dir = getattr(cli, "backup_dir", None)
@@ -915,8 +915,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         else:
             remote_path = raw.get("remote_path", global_cfg.get("remote_path"))
         
-        if cli_remote_sudo is not None:
-            remote_sudo = cli_remote_sudo
+        if cli_remote_sudo:
+            remote_sudo = True
         else:
             remote_sudo = raw.get("remote_sudo", global_cfg.get("remote_sudo", False))
 
@@ -2316,9 +2316,7 @@ Examples:
     )
     parser.add_argument(
         "--remote-sudo",
-        nargs="?",
-        const=True,
-        default=None,
+        action="store_true",
         help="Run btrfs commands on SSH remote with 'sudo -n'. "
              "Can be set globally or per-archive in config file."
     )
