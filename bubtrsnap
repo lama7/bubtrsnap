@@ -1325,12 +1325,22 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     # Check if this is a staged file operation (stage_file sets send_file=recv_file)
     is_staged = archive_cfg.get("stage_file") is not None if archive_cfg else False
 
-    # Find parents for local destination
-    local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
+    has_local = backup_dir is not None
+    has_remote = remote and remote_dir
 
-    # Build parent arguments for local destination
+    # Find parents for the stream file.
+    # When sending to a remote destination (via SCP + receive), parents must
+    # be those already received on the remote, not on the local backup_dir.
+    if has_remote:
+        parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo)
+    elif has_local:
+        parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
+    else:
+        parents = []
+
+    # Build send command for the stream file
     local_send_cmd = btrfs_cmd(cfg, "send")
-    for i, p in enumerate(local_parents):
+    for i, p in enumerate(parents):
         local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
     local_send_cmd += ["-f", str(stream_file), str(snap)]
 
@@ -1338,9 +1348,6 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         print(f"Error: stream file already exists: {stream_file}", file=sys.stderr)
         print("Delete it manually or choose a different path.", file=sys.stderr)
         sys.exit(1)
-
-    has_local = backup_dir is not None
-    has_remote = remote and remote_dir
 
     if not has_local and not has_remote:
         log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])

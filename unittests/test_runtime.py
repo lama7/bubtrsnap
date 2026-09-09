@@ -1396,6 +1396,96 @@ class TestExportFileRemoteNoDuplicateSend(unittest.TestCase):
             self.assertEqual(send_to_file_calls, 1,
                              f"Expected exactly 1 'btrfs send -f' call, got {send_to_file_calls}")
 
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_export_file_remote_uses_ssh_parents_for_send(self, mock_run, mock_stream):
+        """When remote is configured, send_backup_tofile should use find_parents_ssh
+        (remote parents) not find_parents (local backup_dir parents) for the stream file.
+
+        This ensures the stream file's incremental send references subvolumes
+        that already exist on the remote, so btrfs receive on remote won't fail.
+        """
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            export_file = backup_dir / f"{archive_name}.btrfs"
+
+            cfg = {
+                "local_sudo": False,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "export_file": str(export_file),
+                "backup_dir": str(backup_dir),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            with patch.object(bs, "find_parents_ssh") as mock_ssh, \
+                 patch.object(bs, "find_parents") as mock_local:
+                # find_parents_ssh returns a mock parent path
+                mock_ssh.return_value = [Path("/remote/parent/.snapshots/maildir.202601010000")]
+                mock_local.return_value = [Path("/backup/.snapshots/maildir.202601010000")]
+
+                bs.process_archive(archive, cfg)
+
+                # find_parents_ssh should have been called (for the stream file sent to remote)
+                self.assertTrue(mock_ssh.called,
+                                "find_parents_ssh should be called when remote is configured")
+                # find_parents should NOT have been called in send_backup_tofile
+                # (it may be called in the local piped send in process_archive, but
+                # we verify it wasn't used to build the send -f command)
+
+            # Verify the send-to-file command used SSH parents
+            send_cmds = []
+            for c in mock_run.call_args_list:
+                args, kwargs = c
+                cmd = args[0]
+                if isinstance(cmd, list) and "btrfs" in cmd and "send" in cmd and "-f" in cmd:
+                    send_cmds.append(cmd)
+
+            self.assertEqual(len(send_cmds), 1,
+                             f"Expected 1 send -f command, got {len(send_cmds)}")
+            send_cmd_str = " ".join(send_cmds[0])
+            self.assertIn("/remote/parent", send_cmd_str,
+                          "send -f command should use remote parents from find_parents_ssh")
+
 
 if __name__ == "__main__":
     unittest.main()
