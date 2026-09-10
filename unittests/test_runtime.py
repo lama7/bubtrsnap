@@ -1040,6 +1040,10 @@ class TestRemoteExportFileBackup(unittest.TestCase):
             ssh_pipe = [l for l in pipe_lines if "ssh" in l and "btrfs receive" in l]
             self.assertEqual(len(ssh_pipe), 0, f"Should not have piped SSH send, got: {output}")
 
+            # Verify timing is logged for piped send/receive
+            self.assertIn("completed in", output,
+                          f"Expected timing log in output: {output}")
+
 
 class TestScpLocalSudo(unittest.TestCase):
     """Test that scp command gets local_sudo prefix when local_sudo=true.
@@ -1654,6 +1658,9 @@ class TestExportFileOverwritesExisting(unittest.TestCase):
             # Should log that we're overwriting the existing file
             self.assertIn("Overwriting existing stream file", output,
                           f"Expected overwrite message in dry-run output: {output}")
+            # Verify timing is logged for send-to-file
+            self.assertIn("btrfs send to file completed in", output,
+                          f"Expected timing log in output: {output}")
 
 
 if __name__ == "__main__":
