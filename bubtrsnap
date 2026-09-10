@@ -1306,8 +1306,10 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     # be those already received on the remote, not on the local backup_dir.
     if has_remote:
         parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo)
+        log(f"Found {len(parents)} SSH parent(s) for {archive}", 1, cfg["verbose"])
     elif has_local:
         parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
+        log(f"Found {len(parents)} local parent(s) for {archive}", 1, cfg["verbose"])
     else:
         parents = []
 
