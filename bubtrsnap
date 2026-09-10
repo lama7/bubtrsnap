@@ -1922,6 +1922,54 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
 #-----------------------------------------------------------------
 # Does all archive related actions
 #-----------------------------------------------------------------
+def _validate_destinations(
+    archive: dict, cfg: dict, backup_dir: Path | None, remote: str | None,
+    remote_dir: str | None, remote_sudo: bool,
+) -> None:
+    """Check that backup_dir and/or remote/remote_dir are valid btrfs subvolumes."""
+    if backup_dir:
+        chk_btrfs_subvolume(backup_dir, cfg)
+    if remote and remote_dir:
+        chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
+
+
+def _build_hook_context(
+    archive_name: str, snap: Path | None, received: str | None,
+    backup_dir: Path | None, remote: str | None, remote_dir: str | None,
+    cfg: dict,
+) -> dict:
+    """Build the variable-substitution mapping for a post_backup_hook."""
+    if received and backup_dir:
+        backup = str(backup_dir / received)
+    elif received and remote and remote_dir:
+        backup = f"{remote}:{remote_dir}/{received}"
+    elif received:
+        backup = received
+    else:
+        backup = ""
+    return {
+        "backup": backup,
+        "snapshot": str(snap) if snap else "",
+        "archive": archive_name,
+        "timestamp": timestamp(),
+        "snapshotdir": str(cfg.get("snapshot_dir", "")) if cfg.get("snapshot_dir") else "",
+        "backupdir": str(backup_dir) if backup_dir else "",
+    }
+
+
+def _apply_all_keep_policies(
+    snap_dir: Path | None, backup_dir: Path | None, remote: str | None,
+    remote_dir: str | None, remote_sudo: bool, name: str, keep: dict, cfg: dict,
+) -> None:
+    """Apply keep policy to snap_dir, backup_dir, and remote in one place."""
+    if snap_dir:
+        apply_keep_policy(snap_dir, name, keep, cfg)
+    if backup_dir:
+        apply_keep_policy(backup_dir, name, keep, cfg)
+    if remote and remote_dir:
+        apply_keep_policy_ssh(remote, remote_dir, name, keep, cfg, remote_sudo)
+
+
 def process_archive(archive: dict, cfg: dict) -> None:
     """
     Normal processing for a single archive:
@@ -1935,111 +1983,77 @@ def process_archive(archive: dict, cfg: dict) -> None:
     Processing for export_dir and recv_from_dir uses same processing flow except it will
     handle multiple archives versus a single archive for the file variant 
     """
-
-    # start with setup...
     name = archive["name"]
     subvol = archive["subvolume"]
+    keep = archive["keep"]
+    remote_sudo = archive.get("remote_sudo", False)
 
-    # now we can provide some quick logging...
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
 
-    send_file = archive.get("export_file")
-    recv_file = archive.get("import_file")
-    stage_file = archive.get("stage_file")
+    # Resolve file/dir options; stage_file is sugar for send+recv on same path,
+    # stage_dir is sugar for export_dir + import_dir on same dir.
+    send_file = archive.get("export_file") or archive.get("stage_file")
+    recv_file = archive.get("import_file") or archive.get("stage_file")
     send_dir = archive.get("export_dir")
     recv_dir = archive.get("import_dir")
     stage_dir = archive.get("stage_dir")
+    staged = bool(archive.get("stage_file") or stage_dir)
     snaps_only = archive.get("snaps_only", False)
 
-    # stage_file is sugar for send+receive on the same path, then delete
-    if stage_file:
-        send_file = stage_file
-        recv_file = stage_file
-
-    # stage_dir is sugar for export_dir + import_dir on same dir
-    staged = False
     if stage_dir and not (send_file or recv_file):
         send_dir = stage_dir
         recv_dir = stage_dir
-        staged = True
-    elif stage_file:
-        staged = True
 
-    # Use per-archive backup_dir if set, otherwise fall back to global
+    # Resolve destination paths.
     archive_backup_dir = archive.get("backup_dir")
-    backup_dir = Path(archive_backup_dir) if archive_backup_dir else (Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None)
+    backup_dir = (
+        Path(archive_backup_dir) if archive_backup_dir
+        else (Path(cfg["backup_dir"]) if cfg.get("backup_dir") else None)
+    )
     snap_dir = Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None
     remote = archive.get("remote_host")
     remote_dir = archive.get("remote_path")
 
-    # ----- receive-only (file) -----
+    # ---- receive-only (file) ----
     if recv_file and not send_file:
-        # Need either backup_dir (local) or remote_dir (SSH)
         if not backup_dir and not (remote and remote_dir):
             print(f"Error: archive '{name}' import_file requires backup_dir or remote_dir (with remote)",
                   file=sys.stderr)
             sys.exit(1)
-        if backup_dir:
-            chk_btrfs_subvolume(backup_dir, cfg)
-        if remote and remote_dir:
-            remote_sudo = archive.get("remote_sudo", False)
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
+        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
         p = Path(recv_file)
         if not p.is_file() or not is_btrfs_stream(p, cfg):
             print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
             sys.exit(1)
         received = receive_stream(p, backup_dir, cfg, remote, remote_dir)
         if received:
-            run_hook(archive.get("post_backup_hook"), {
-                "backup": str(backup_dir / received) if backup_dir else f"{remote}:{remote_dir}/{received}",
-                "snapshot": "",
-                "archive": name,
-                "timestamp": timestamp(),
-                "snapshotdir": str(snap_dir or ""),
-                "backupdir": str(backup_dir) if backup_dir else "",
-            }, cfg)
-            if backup_dir:
-                apply_keep_policy(backup_dir, name, archive["keep"], cfg)
-            if remote and remote_dir:
-                remote_sudo = archive.get("remote_sudo", False)
-                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
+            run_hook(archive.get("post_backup_hook"),
+                     _build_hook_context(name, None, received, backup_dir, remote, remote_dir, cfg), cfg)
+            _apply_all_keep_policies(None, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
+        log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
-
-    # ----- receive-only (dir) -----
+    # ---- receive-only (dir) ----
     if recv_dir and not send_dir and not send_file:
-        # Need either backup_dir (local) or remote_dir (SSH)
         if not backup_dir and not (remote and remote_dir):
-            print(f"Error: import_dir requires backup_dir or remote_dir (with remote)", file=sys.stderr)
+            print("Error: import_dir requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
-        if backup_dir:
-            chk_btrfs_subvolume(backup_dir, cfg)
-        if remote and remote_dir:
-            remote_sudo = archive.get("remote_sudo", False)
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
+        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
         stream = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
         if not stream:
             log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
+            log(f"Finished archive: {name}\n", 1, cfg["verbose"])
             return
         log(f"Using stream {stream} for archive {name}", 1, cfg["verbose"])
         received = receive_stream(stream, backup_dir, cfg, remote, remote_dir)
         if received:
-            run_hook(archive.get("post_backup_hook"), {
-                "backup": str(backup_dir / received) if backup_dir else f"{remote}:{remote_dir}/{received}",
-                "snapshot": "",
-                "archive": name,
-                "timestamp": timestamp(),
-                "snapshotdir": str(snap_dir or ""),
-                "backupdir": str(backup_dir) if backup_dir else "",
-            }, cfg)
-            if backup_dir:
-                apply_keep_policy(backup_dir, name, archive["keep"], cfg)
-            if remote and remote_dir:
-                remote_sudo = archive.get("remote_sudo", False)
-                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
+            run_hook(archive.get("post_backup_hook"),
+                     _build_hook_context(name, None, received, backup_dir, remote, remote_dir, cfg), cfg)
+            _apply_all_keep_policies(None, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
+        log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
-    # ----- paths that create a snapshot -----
+    # ---- paths that create a snapshot ----
     if not snap_dir:
         print("Error: snapshot_dir is required for snapshot/send operations",
               file=sys.stderr)
@@ -2065,70 +2079,58 @@ def process_archive(archive: dict, cfg: dict) -> None:
     }, cfg)
 
     stream_path: Path | None = None
+    dest: Path | None = None
 
     if send_file:
         stream_path = Path(send_file)
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
-        # If backup_dir is set and no import_file is configured, also do a
-        # normal piped send|receive to the local backup_dir (in addition to any
-        # file-based remote transfer). When import_file is set, the receive
-        # from file is handled by do_receive below.
+        # When export_file is set with a local backup_dir and no import_file,
+        # also do a normal piped send|receive to the local backup_dir (in
+        # addition to any file-based remote transfer).
         if backup_dir and not recv_file:
             log("Sending to local backup...", 1, cfg["verbose"])
             local_send_cmd = btrfs_cmd(cfg, "send")
-            local_parents = find_parents(archive["name"], snap_dir, backup_dir, cfg)
+            local_parents = find_parents(name, snap_dir, backup_dir, cfg)
             for i, p in enumerate(local_parents):
                 local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
             local_send_cmd.append(str(snap))
             recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
-            rc, stderr = piped_run(local_send_cmd, recv_cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"])
+            rc, stderr = piped_run(local_send_cmd, recv_cmd,
+                                   dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"])
             if rc != 0:
                 raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
+        # dest for send_file cases: local piped send or file path
+        dest = backup_dir / snap.name if backup_dir else stream_path
     elif send_dir:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
         stream_path = Path(send_dir) / f"{snap.name}.btrfs"
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
-    # normal piped send|receive (no export_file/export_dir) OR export with remote
+        dest = backup_dir / snap.name if backup_dir else stream_path
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
-        # If export_file or export_dir is set with remote, use file-based SCP + remote receive
         use_file_transfer = (send_file or send_dir) and remote and remote_dir
-        
+
         log("Starting backup...", 1, cfg["verbose"])
-        # Check remote_dir if configured
-        if remote and remote_dir:
-            remote_sudo = archive.get("remote_sudo", False)
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
-        if backup_dir:
-            chk_btrfs_subvolume(backup_dir, cfg)
-        
+        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
+
         if use_file_transfer:
-            # File-based: export to stream file, SCP to remote, receive on remote
             dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
         else:
-            # Normal piped send/receive
             dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
-            
-        run_hook(archive.get("post_backup_hook"), {
-            "backup": str(dest), "snapshot": str(snap), "archive": name,
-            "timestamp": timestamp(), "snapshotdir": str(snap_dir),
-            "backupdir": str(backup_dir) if backup_dir else "",
-        }, cfg)
-        apply_keep_policy(snap_dir, name, archive["keep"], cfg)
-        if backup_dir:
-            apply_keep_policy(backup_dir, name, archive["keep"], cfg)
-        if remote and remote_dir:
-            remote_sudo = archive.get("remote_sudo", False)
-            apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
-        log(f"Finished archive: {name}\n", 1, cfg["verbose"])
-        return
-    else:
-        # snaps_only or no backup
-        apply_keep_policy(snap_dir, name, archive["keep"], cfg)
+
+        run_hook(archive.get("post_backup_hook"),
+                 _build_hook_context(name, snap, None, backup_dir, remote, remote_dir, cfg), cfg)
+        _apply_all_keep_policies(snap_dir, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
-    # Receive after export-file / export-dir when receive_* or staging is set,
-    # OR when export_file/export_dir is used with remote/remote_dir (auto-receive to SSH)
+    # snaps_only or no backup destination
+    if snaps_only or not (backup_dir or (remote and remote_dir)):
+        _apply_all_keep_policies(snap_dir, None, None, None, False, name, keep, cfg)
+        log(f"Finished archive: {name}\n", 1, cfg["verbose"])
+        return
+
+    # ---- receive after export-file/export-dir when import_* or staging is set,
+    # OR when export_file/export_dir is used with remote/remote_dir (auto-receive to SSH) ----
     auto_ssh_receive = (
         (send_file or send_dir)
         and remote
@@ -2139,52 +2141,30 @@ def process_archive(archive: dict, cfg: dict) -> None:
     )
     do_receive = bool(
         stream_path
-        and (
-            recv_file
-            or recv_dir
-            or staged
-            or auto_ssh_receive
-        )
+        and (recv_file or recv_dir or staged or auto_ssh_receive)
     )
     if do_receive:
-        # Need either backup_dir (local) or remote_dir (SSH)
         if not backup_dir and not (remote and remote_dir):
             print("Error: receive requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
-        if backup_dir:
-            chk_btrfs_subvolume(backup_dir, cfg)
-        
-        # Check remote_dir if configured
-        if remote and remote_dir:
-            remote_sudo = archive.get("remote_sudo", False)
-            chk_btrfs_subvolume_ssh(remote, remote_dir, cfg, remote_sudo)
+        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
 
-        # Note that by this point, recv_file and recv_dir should NOT both be set. We took
-        # care with configuration rules that should prevent that combination.  In fact,
-        # from out little logic assignment above, only 1 of recv_file, recv_dir or staged
-        # should be set by the time this code is executed...
-        # if stage_dir or stage_file was set, then use the stream_path from the send
         if staged:
             recv_path = stream_path
-        # check for import_file...
         elif recv_file:
             recv_path = Path(recv_file)
-        # check for import_dir...
         elif recv_dir:
-            # use stream_path from the send if recv_dir and send_dir are the same
             if recv_dir == send_dir:
-                recv_path = stream_path 
-            else:  # different recv_dir and send_dir...
-                # search the recv_dir for the most recent stream file for this archive
+                recv_path = stream_path
+            else:
                 recv_path = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
                 if not recv_path:
                     log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
+                    log(f"Finished archive: {name}\n", 1, cfg["verbose"])
                     return
-        # auto SSH receive: use the stream file we just created
         elif auto_ssh_receive:
             recv_path = stream_path
         else:
-            # some combination we didn't anticipate go us to this point...
             print("Should never get here...", file=sys.stderr)
             sys.exit(1)
 
@@ -2194,24 +2174,14 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
         received = receive_stream(recv_path, backup_dir, cfg, remote, remote_dir)
         if received:
-            run_hook(archive.get("post_backup_hook"), {
-                "backup": str(backup_dir / received) if backup_dir else f"{remote}:{remote_dir}/{received}",
-                "snapshot": str(snap),
-                "archive": name,
-                "timestamp": timestamp(),
-                "snapshotdir": str(snap_dir),
-                "backupdir": str(backup_dir) if backup_dir else "",
-            }, cfg)
-            if backup_dir:
-                apply_keep_policy(backup_dir, name, archive["keep"], cfg)
-            if remote and remote_dir:
-                remote_sudo = archive.get("remote_sudo", False)
-                apply_keep_policy_ssh(remote, remote_dir, name, archive["keep"], cfg, remote_sudo)
+            run_hook(archive.get("post_backup_hook"),
+                     _build_hook_context(name, snap, received, backup_dir, remote, remote_dir, cfg), cfg)
+            _apply_all_keep_policies(None, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
 
         if staged and stream_path is not None:
             remove_stage_file(stream_path, cfg)
 
-    apply_keep_policy(snap_dir, name, archive["keep"], cfg)
+    apply_keep_policy(snap_dir, name, keep, cfg)
     log(f"Finished archive: {name}\n", 1, cfg["verbose"])
 
 # ---------------------------------------------------------------------------
