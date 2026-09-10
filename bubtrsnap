@@ -1297,13 +1297,17 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     has_local = backup_dir is not None
     has_remote = remote and remote_dir
 
+    if not has_local and not has_remote:
+        log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
+        return stream_file
+
     # Find parents for the stream file.
     # When sending to a remote destination (via SCP + receive), parents must
     # be those already received on the remote, not on the local backup_dir.
     if has_remote:
         parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo)
     elif has_local:
-        parents = find_parents(archive, snapshot_dir, backup_dir, cfg) if backup_dir else []
+        parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
     else:
         parents = []
 
@@ -1317,10 +1321,6 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         log(f"Overwriting existing stream file: {stream_file}", 1, cfg["verbose"])
         if not cfg["dry_run"]:
             stream_file.unlink()
-
-    if not has_local and not has_remote:
-        log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
-        return stream_file
 
     # Build receive command (used by callers that need it)
     if has_local:
