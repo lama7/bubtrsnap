@@ -1240,7 +1240,6 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
     start_time = datetime.now()
 
     if has_local:
-        log(f"Finding parent subvolumes for {archive} (local)", 1, cfg["verbose"])
         local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
         log(f"Found {len(local_parents)} local parent(s) for {archive}", 1, cfg["verbose"])
 
@@ -1258,7 +1257,6 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
             raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
 
     if has_remote:
-        log(f"Finding parent subvolumes for {archive} on SSH remote {remote}:{remote_dir}", 1, cfg["verbose"])
         ssh_parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo)
         log(f"Found {len(ssh_parents)} SSH parent(s) for {archive}", 1, cfg["verbose"])
 
