@@ -141,6 +141,20 @@ def piped_run(send_cmd: list[str],
         log(f"Pipe failed: {e}", 2, verbosity)
         return 1, str(e)
 
+def _timed_run(cmd: list[str] | str, label: str, cfg: dict, **kwargs) -> subprocess.CompletedProcess | None:
+    """Run a command with timing and return the result.
+
+    Wraps run() to log elapsed time at verbosity level 1.
+    Logs timing even in dry-run mode to show expected operation duration.
+    """
+    start = datetime.now()
+    result = run(cmd, dry_run=cfg.get("dry_run", False),
+                 verbosity=cfg["verbose"], **kwargs)
+    elapsed = (datetime.now() - start).total_seconds()
+    log(f"{label} completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+    return result
+
+
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M")
 
@@ -1237,9 +1251,8 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
         return dest
 
-    start_time = datetime.now()
-
     if has_local:
+        start_time = datetime.now()
         local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
         log(f"Found {len(local_parents)} local parent(s) for {archive}", 1, cfg["verbose"])
 
@@ -1257,6 +1270,7 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
             raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
 
     if has_remote:
+        start_time = datetime.now()
         ssh_parents = find_parents_ssh(archive, snapshot_dir, remote, remote_dir, cfg, remote_sudo)
         log(f"Found {len(ssh_parents)} SSH parent(s) for {archive}", 1, cfg["verbose"])
 
@@ -1324,41 +1338,17 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
         if not cfg["dry_run"]:
             stream_file.unlink()
 
-    # Build receive command (used by callers that need it)
-    if has_local:
-        recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
-
-    # For staged file operations (stage_file), we only send to file (receive happens separately)
-    if is_staged:
-        log("Sending to staged file...", 1, cfg["verbose"])
-        start = datetime.now()
-        result = run(local_send_cmd, dry_run=cfg.get("dry_run", False),
-                     verbosity=cfg["verbose"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        elapsed = (datetime.now() - start).total_seconds()
-        if result is None:
-            log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-            return stream_file
-        log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-        if result.returncode != 0:
-            raise RuntimeError("btrfs send to file failed")
-        return stream_file
-
-    # For export_file without stage_file: just write the stream to file.
-    # Receiving (if needed) is handled separately by process_archive via
-    # receive_stream or _scp_and_receive. This supports the export_file-only
-    # configuration (send to file, no receive back), as well as the
-    # export_file + remote case (SCP file to remote).
-    log("Sending to file...", 1, cfg["verbose"])
-    start = datetime.now()
-    result = run(local_send_cmd, dry_run=cfg.get("dry_run", False),
-                 verbosity=cfg["verbose"],
-                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    elapsed = (datetime.now() - start).total_seconds()
+    # Send to file. Receiving (if needed) is handled separately by process_archive
+    # via receive_stream or _scp_and_receive. This supports:
+    # - export_file-only (send to file, no receive back)
+    # - export_file + remote (SCP file to remote for receive)
+    # - stage_file (send to file, receive happens separately)
+    label = "Sending to staged file..." if is_staged else "Sending to file..."
+    log(label, 1, cfg["verbose"])
+    result = _timed_run(local_send_cmd, "btrfs send to file", cfg,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     if result is None:
-        log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
         return stream_file
-    log(f"btrfs send to file completed in {format_duration(elapsed)}", 1, cfg["verbose"])
     if result.returncode != 0:
         raise RuntimeError("btrfs send to file failed")
 
@@ -1455,17 +1445,8 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict, remote: str
         # Local mode (original behavior)
         recv_cmd = btrfs_cmd(cfg, "receive", "-f", str(stream), str(backup_dir))
 
-        start = datetime.now()
-
-        result = run(recv_cmd, 
-                     dry_run=cfg.get("dry_run"), 
-                     verbosity=cfg["verbose"],
-                     capture_output=True,
-                     text=True,
-                     check=False,
-                )
-        elapsed = (datetime.now() - start).total_seconds()
-        log(f"btrfs receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+        result = _timed_run(recv_cmd, "btrfs receive", cfg,
+                            capture_output=True, text=True, check=False)
 
         if result is None:
             return stream.stem
@@ -1989,18 +1970,51 @@ def _apply_all_keep_policies(
         apply_keep_policy_ssh(remote, remote_dir, name, keep, cfg, remote_sudo)
 
 
+def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict, name: str) -> None:
+    """Perform a local piped btrfs send -> btrfs receive to backup_dir with timing."""
+    log("Finding parents for local piped send...", 1, cfg["verbose"])
+    local_send_cmd = btrfs_cmd(cfg, "send")
+    local_parents = find_parents(name, snap_dir, backup_dir, cfg)
+    log(f"Found {len(local_parents)} local parent(s) for {name}", 1, cfg["verbose"])
+    for i, p in enumerate(local_parents):
+        local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
+    local_send_cmd.append(str(snap))
+    recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
+
+    log("Sending to local backup...", 1, cfg["verbose"])
+    start_time = datetime.now()
+    rc, stderr = piped_run(local_send_cmd, recv_cmd,
+                           dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"])
+    elapsed = (datetime.now() - start_time).total_seconds()
+    log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+    if rc != 0:
+        raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
+
+
+def _receive_and_post(received: str | None, archive: dict, name: str, snap: Path | None,
+                      backup_dir: Path | None, remote: str | None, remote_dir: str | None,
+                      snap_dir: Path | None, keep: dict, cfg: dict,
+                      remote_sudo: bool = False) -> None:
+    """After a receive, run post-backup hook and all keep policies."""
+    if received:
+        run_hook(archive.get("post_backup_hook"),
+                 _build_hook_context(name, snap, received, backup_dir, remote, remote_dir, cfg), cfg)
+        _apply_all_keep_policies(snap_dir or None, backup_dir, remote, remote_dir, remote_sudo,
+                                 name, keep, cfg)
+
+
 def process_archive(archive: dict, cfg: dict) -> None:
     """
     Normal processing for a single archive:
-    pre-hook → snapshot → post-snapshot-hook → backup → post-backup-hook → keep policy
+    pre-hook -> snapshot -> post-snapshot-hook -> backup -> post-backup-hook -> keep policy
     If just export_file:
     pre-hook -> snapshot -> post-snapshot-hook -> send backup to file -> keep for snapshots
-    If just recv_from_file:
+    If just import_file:
     backup receive from file -> post-backup-hook -> keep for backups
-    If both send_to and recv_from then same as Normal above except the backup uses a file
+    If both export_file and import_file then same as Normal above except the backup uses a file
     as a staging step.
-    Processing for export_dir and recv_from_dir uses same processing flow except it will
-    handle multiple archives versus a single archive for the file variant 
+    Processing for export_dir and import_dir uses same processing flow except it will
+    handle multiple archives versus a single archive for the file variant
     """
     name = archive["name"]
     subvol = archive["subvolume"]
@@ -2016,7 +2030,6 @@ def process_archive(archive: dict, cfg: dict) -> None:
     send_dir = archive.get("export_dir")
     recv_dir = archive.get("import_dir")
     stage_dir = archive.get("stage_dir")
-    staged = bool(archive.get("stage_file") or stage_dir)
     snaps_only = archive.get("snaps_only", False)
 
     if stage_dir and not (send_file or recv_file):
@@ -2032,6 +2045,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
     snap_dir = Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None
     remote = archive.get("remote_host")
     remote_dir = archive.get("remote_path")
+    staged = bool(archive.get("stage_file") or stage_dir)
 
     # ---- receive-only (file) ----
     if recv_file and not send_file:
@@ -2045,10 +2059,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
             sys.exit(1)
         received = receive_stream(p, backup_dir, cfg, remote, remote_dir)
-        if received:
-            run_hook(archive.get("post_backup_hook"),
-                     _build_hook_context(name, None, received, backup_dir, remote, remote_dir, cfg), cfg)
-            _apply_all_keep_policies(None, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
+        _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
+                          snap_dir, keep, cfg, remote_sudo)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2065,10 +2077,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
             return
         log(f"Using stream {stream} for archive {name}", 1, cfg["verbose"])
         received = receive_stream(stream, backup_dir, cfg, remote, remote_dir)
-        if received:
-            run_hook(archive.get("post_backup_hook"),
-                     _build_hook_context(name, None, received, backup_dir, remote, remote_dir, cfg), cfg)
-            _apply_all_keep_policies(None, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
+        _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
+                          snap_dir, keep, cfg, remote_sudo)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2107,21 +2117,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
         # also do a normal piped send|receive to the local backup_dir (in
         # addition to any file-based remote transfer).
         if backup_dir and not recv_file:
-            log("Sending to local backup...", 1, cfg["verbose"])
-            local_send_cmd = btrfs_cmd(cfg, "send")
-            local_parents = find_parents(name, snap_dir, backup_dir, cfg)
-            local_send_start = datetime.now()
-            for i, p in enumerate(local_parents):
-                local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
-            local_send_cmd.append(str(snap))
-            recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
-            rc, stderr = piped_run(local_send_cmd, recv_cmd,
-                                   dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"])
-            elapsed = (datetime.now() - local_send_start).total_seconds()
-            log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-            if rc != 0:
-                raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
-        # dest for send_file cases: local piped send or file path
+            _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif send_dir:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
@@ -2129,18 +2125,16 @@ def process_archive(archive: dict, cfg: dict) -> None:
         send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
-        use_file_transfer = (send_file or send_dir) and remote and remote_dir
-
         log("Starting backup...", 1, cfg["verbose"])
         _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
 
-        if use_file_transfer:
+        if (send_file or send_dir) and remote and remote_dir:
             dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
         else:
             dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
 
         run_hook(archive.get("post_backup_hook"),
-                 _build_hook_context(name, snap, None, backup_dir, remote, remote_dir, cfg), cfg)
+                 _build_hook_context(name, snap, dest, backup_dir, remote, remote_dir, cfg), cfg)
         _apply_all_keep_policies(snap_dir, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
@@ -2195,20 +2189,14 @@ def process_archive(archive: dict, cfg: dict) -> None:
             recv_path = Path(recv_file)
 
         received = receive_stream(recv_path, backup_dir, cfg, remote, remote_dir)
-        if received:
-            run_hook(archive.get("post_backup_hook"),
-                     _build_hook_context(name, snap, received, backup_dir, remote, remote_dir, cfg), cfg)
-            _apply_all_keep_policies(None, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
+        _receive_and_post(received, archive, name, snap, backup_dir, remote, remote_dir,
+                          snap_dir, keep, cfg, remote_sudo)
 
         if staged and stream_path is not None:
             remove_stage_file(stream_path, cfg)
 
     apply_keep_policy(snap_dir, name, keep, cfg)
     log(f"Finished archive: {name}\n", 1, cfg["verbose"])
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main() -> int:
 
     parser = argparse.ArgumentParser(
