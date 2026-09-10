@@ -1110,7 +1110,16 @@ class TestScpLocalSudo(unittest.TestCase):
 
             mock_run.side_effect = run_mock
 
-            bs.process_archive(archive, cfg)
+            # Capture stdout to verify timing logs
+            from io import StringIO
+            import sys as sys_mod
+            old_stdout = sys_mod.stdout
+            captured = StringIO()
+            sys_mod.stdout = captured
+            try:
+                bs.process_archive(archive, cfg)
+            finally:
+                sys_mod.stdout = old_stdout
 
             # Verify that run() was called with scp command prefixed with sudo -n
             all_calls = mock_run.call_args_list
@@ -1119,6 +1128,11 @@ class TestScpLocalSudo(unittest.TestCase):
                 if isinstance(c.args[0], list) and c.args[0][0] == "sudo" and "scp" in c.args[0]
             ]
             self.assertTrue(len(scp_calls) > 0, "Expected scp command with sudo -n prefix")
+
+            # Verify timing is logged for SCP + receive sequence
+            output = captured.getvalue()
+            self.assertIn("SCP + receive sequence completed in", output,
+                          f"Expected SCP+receive timing log in output")
 
 
 class TestScpLocalSudoFalse(unittest.TestCase):

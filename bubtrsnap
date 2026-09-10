@@ -1375,6 +1375,9 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
     recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp, remote_dir]
 
+    # Overall timing for the complete SCP + SSH receive sequence
+    seq_start = datetime.now()
+
     log(f"Copying stream to remote via SCP...", 1, cfg["verbose"])
     # Use run helper for SCP so it respects dry-run and logging
     scp_start = datetime.now()
@@ -1383,6 +1386,8 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     if result is not None:
         log(f"SCP transfer completed in {format_duration(scp_elapsed)}", 1, cfg["verbose"])
     if result is not None and result.returncode != 0:
+        seq_elapsed = (datetime.now() - seq_start).total_seconds()
+        log(f"SCP + receive sequence failed after {format_duration(seq_elapsed)}", 1, cfg["verbose"])
         print(f"Error copying stream to remote via SCP:\\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
 
@@ -1396,6 +1401,8 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     elapsed = (datetime.now() - start).total_seconds()
     if ssh_result is not None:
         log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+    seq_elapsed = (datetime.now() - seq_start).total_seconds()
+    log(f"SCP + receive sequence completed in {format_duration(seq_elapsed)}", 1, cfg["verbose"])
     stderr = (ssh_result.stderr if ssh_result else "") or ""
     stderr = stderr.strip()
 
@@ -2103,12 +2110,15 @@ def process_archive(archive: dict, cfg: dict) -> None:
             log("Sending to local backup...", 1, cfg["verbose"])
             local_send_cmd = btrfs_cmd(cfg, "send")
             local_parents = find_parents(name, snap_dir, backup_dir, cfg)
+            local_send_start = datetime.now()
             for i, p in enumerate(local_parents):
                 local_send_cmd += ["-p" if i == 0 else "-c", str(p)]
             local_send_cmd.append(str(snap))
             recv_cmd = btrfs_cmd(cfg, "receive", str(backup_dir))
             rc, stderr = piped_run(local_send_cmd, recv_cmd,
                                    dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"])
+            elapsed = (datetime.now() - local_send_start).total_seconds()
+            log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
             if rc != 0:
                 raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
         # dest for send_file cases: local piped send or file path
