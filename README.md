@@ -76,7 +76,7 @@ Alternatively, if you prefer to do things your own way:
 Configuration files use TOML formatting and look like, well a TOML formatted
 comfiguration file:
 
-```
+```toml
     # a comment... these are global options
     snapshot_dir = "/pool/snapshots"
     backup_dir = "/backup"
@@ -94,7 +94,6 @@ comfiguration file:
 
     [archive3]
     subvolume = "/path/to/subvolume3"
-
 ```
 
 If an option can be specified on the command line, it can also be specified in
@@ -230,38 +229,39 @@ automatically (via SSH) before attempting the receive.
 
 ### When `remote_path` requires `remote_host`
 
-`--remote-path` (or `remote_path` in config) always requires `--remote-host` to also
-be set — from the CLI, a per-archive config section, or globally.  If
+The options `--remote-path` (or `remote_path` in config) always requires
+`--remote-host` to also be set.  This condition can be satisfied from the CLI,
+from a per-archive config section, or from the config global section.  If
 `remote_path` is set but `remote_host` is missing, bubtrsnap will abort with an
-error.  `remote_host` can be used on its own (for example if you only want SSH
-validation or hooks to target a host), but `remote_path` cannot stand alone.
+error.  On the other hand, the `remote_host` can be set on its own (for example
+if you only want SSH validation or hooks to target a host), but `remote_path`
+cannot stand alone.
 
 ### Local and remote destinations together
 
 If you configure both `backup_dir` (local) and `remote_host`/`remote_path` (SSH),
-bubtrsnap will send the backup to **both** destinations in a single run.  The
-send is performed twice — once targeting the local receive and once targeting
-the SSH receive — using the same snapshot as the source.  This lets you keep a
-local copy and a remote copy without running bubtrsnap twice.
+bubtrsnap will send the backup to **both** destinations in a single run.  Two
+sends are performed — once targeting `backup_dir` (a local path) and once targeting
+the `remote_path` via SSH — using the same snapshot as the source.  This
+functionality lets you keep a local copy and a remote copy without running
+bubtrsnap twice.
 
 Example:
 
-    bubtrsnap --snapshot-dir=/pool/snapshots \
-        --backup-dir=/local/backups \
-        --remote-host user@backuphost \
-        --remote-path /btrfs/backups \
-        archive1=/path/to/subvolume
+    bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/local/backups \
+              --remote-host user@backuphost --remote-path /btrfs/backups \
+              archive1=/path/to/subvolume
 
 Precedence still applies: CLI settings win over per-archive settings, which win
 over global settings.  If you set `--remote-host` and `--remote-path` on the CLI,
-they override any remote_host/remote_path values from the config for the archives
+they override any `remote_host`/`remote_path` values from the config for the archives
 being processed.
 
 ### Per-archive remote settings
 
 Remote settings can be attached to an individual archive in the config file:
 
-```
+```toml
     snapshot_dir = "/pool/snapshots"
 
     [archive1]
@@ -296,7 +296,7 @@ matches them against local snapshot UUIDs — the same logic it uses for local
 backups, just executed over SSH.  This allows incremental sends to the remote
 host once a common snapshot/backup pair exists.
 
-## Stream Files: export_file/import_file
+## Stream Files: export-file/import-file
 
 It is possible to take advantage of btrfs' ability to send to or to receive from
 a file using the appropriately named `export_file` and/or `import_file`
@@ -315,12 +315,19 @@ when post-snapshot hooks are complete. When `export_file` is combined with
 remote, the stream file is SCP'd and received on the remote (see
 [Remote receive with stream files](#remote-receive-with-stream-files)
 below).
+
 In the case of `import_file`, the snapshotting steps are skipped and
 processing **STARTS** at the backup step.  Any post-backup hooks will be
 processed as well.  In both cases, the keep policy will be applied to the
 appropriate area.  If both are used on the CLI, then processing is normal with
 the exception that the stream file is used essentially as a staging step.  When
 specifying both, the same file **MUST** be named for both options.
+
+`import_file` (or `import_dir`) can receive to both `backup_dir` and a remote
+host simultaneously when both destinations are configured.  The stream file
+is received locally into `backup_dir` first, then SCP'd to the remote and
+received into `remote_path`.  Keep policy is applied independently to each
+destination.
 
 An example CLI command (assuming a configuration file is set up):
 
@@ -333,7 +340,7 @@ or using both:
 Alternatively, the options can be placed in a configuration file and assigned to
 an archive like so:
 
-```
+```toml
     [archive1]
     subvolume = "/home/user/"
     export_file = "/home/user/btrfsstreams/archive1stream.btrfs"
@@ -341,7 +348,7 @@ an archive like so:
 
 or together:
 
-```
+```toml
     backup_dir = "/pool/backups"
     snapshot_dir = "/snapshots"
     local_sudo = true
@@ -350,22 +357,20 @@ or together:
     subvolume = "~/another/silly/path"
     export_file = "/home/user/btrfsstreams/archive1stream.btrfs"
     import_file = "/home/user/btrfsstreams/archive1stream.btrfs"
-    .
-    .
-    .
 ```
 
 The options are mutually exclusive with the `--snaps-only` option and when used
 on the command line, only 1 `archive=subvolume`, or alternatively the name of
 an archive section in the configuration file, may be specified.  
 
-## Stream Directories: export_dir/import_dir
+## Stream Directories: export-dir/import-dir
 
 If you wish for stream files to be used with multiple archives, then
 `export_dir` and `import_dir` are available.  These are similar to their
 file counterparts.  They are available from the CLI or a configuration file.
-They are a global only setting in a configuration file.  Also, no mixing and
-matching of the `dir` and `file` options are allowed.
+They are a global only setting in a configuration file meaning that they
+will apply to **ALL** archives in the file unless overridden by an archive
+specific `*_file` option.
 
 From a usage standpoint, they result in generally the same processing except
 that all send and receive operations will be through stream files in the
@@ -387,7 +392,7 @@ pre-exist.
 
 In a configuration file:
 
-```
+```toml
     backup_dir = "/pool/backups"
     snapshot_dir = "/snapshots"
     local_sudo = true
@@ -397,9 +402,6 @@ In a configuration file:
     [archive1]
     subvolume = "~/another/silly/path"
     keep_daily = 7
-    .
-    .
-    .
 ```
 
 In this instance, any archives in the configuration file will skip snapshot
@@ -425,7 +427,7 @@ This enables a fully automated single-command workflow: snapshot locally,
 stream to file, transfer via SCP, and receive on remote — all in one
 bubtrsnap run.
 
-Example CLI (export_dir):
+Example CLI (`export_dir`):
 ```
 bubtrsnap --snapshot-dir /snapshots \
     --export-dir /local/streams \
@@ -434,7 +436,7 @@ bubtrsnap --snapshot-dir /snapshots \
     archive1=/path/to/subvol
 ```
 
-Example CLI (export_file):
+Example CLI (`export_file`):
 ```
 bubtrsnap --snapshot-dir /snapshots \
     --export-file /local/stream.btrfs \
@@ -454,10 +456,7 @@ remote_path = "/btrfs/backups"
 subvolume = "/path/to/subvol"
 ```
 
-Note: The local stream file is retained after transfer (not deleted). Use
-`--stage-file` or `--stage-dir` if you want automatic cleanup of the stream file.
-
-### Combining local backup_dir with remote stream receive
+### Combining local backup-dir with remote stream receive
 
 When an archive is configured with `backup_dir` in addition to `export_file`
 (or `export_dir`) and `remote_host`/`remote_path`, bubtrsnap sends to **both**
@@ -493,17 +492,23 @@ Run it:
 bubtrsnap --dry-run archive1
 ```
 
-## Staging: stage_file / stage_dir
+## Staging: stage-file / stage-dir
 
-`--stage-file` and `--stage-dir` are convenience options that combine a send-to
-and receive-from using the same path or directory, and then remove the stream
-file when done.
+The `--stage-file` and `--stage-dir` options are convenience options that
+combine a send-to and receive-from using the same path or directory, and then
+remove the stream file when done.
 
-- `--stage-file FILE`: send to FILE, receive from FILE, then delete FILE.
-- `--stage-dir DIR`: send to DIR/{archive}.{timestamp}.btrfs, receive it, then delete it.
+- `stage_file FILE`: send to FILE, receive from FILE, then delete FILE.
+- `stage_dir DIR`: send to DIR/{archive}.{timestamp}.btrfs, receive it, then delete it.
 
 These are mutually exclusive with the other send/receive/stage options and with
 `--snaps-only`.
+
+**`stage_*` options are local-only**: they do not trigger remote (SSH) transfer.
+When `remote_host`/`remote_path` is configured, staging writes the stream file
+locally and receives it into `backup_dir` only. The remote destination is only
+used for backup operations without staging (regular piped send or
+`export_file`/`export_dir` + remote combinations).
 
 ## Keep Policy
 
@@ -544,7 +549,7 @@ new keep policy.
     
 An example of a configuration file with a keep policy:
 
-```
+```toml
     snapshot_dir = "/pool/snapshots"
     backup_dir = "/backup"
     
@@ -669,7 +674,7 @@ strings are:
 
 An example of a configuration file with some hooks in it:
 
-```
+```toml
     snapshot_dir = "/pool/snapshots"
     backup_dir = "/backups"
 
