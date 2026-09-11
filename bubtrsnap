@@ -2109,6 +2109,7 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
     stream_path: Path | None = None
     dest: Path | None = None
+    received: str | None = None
 
     if send_file:
         stream_path = Path(send_file)
@@ -2189,14 +2190,17 @@ def process_archive(archive: dict, cfg: dict) -> None:
             recv_path = Path(recv_file)
 
         received = receive_stream(recv_path, backup_dir, cfg, remote, remote_dir)
+        # snap_dir keep policy is handled by the final apply_keep_policy call
         _receive_and_post(received, archive, name, snap, backup_dir, remote, remote_dir,
-                          snap_dir, keep, cfg, remote_sudo)
+                          None, keep, cfg, remote_sudo)
 
         if staged and stream_path is not None:
             remove_stage_file(stream_path, cfg)
 
     apply_keep_policy(snap_dir, name, keep, cfg)
     log(f"Finished archive: {name}\n", 1, cfg["verbose"])
+
+
 def main() -> int:
 
     parser = argparse.ArgumentParser(

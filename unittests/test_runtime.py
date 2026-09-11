@@ -1677,5 +1677,89 @@ class TestExportFileOverwritesExisting(unittest.TestCase):
                           f"Expected timing log in output: {output}")
 
 
+class TestNoDuplicateKeepPolicy(unittest.TestCase):
+    """Regression test for keep policy being applied twice to snap_dir.
+
+    When export_file + remote + backup_dir are all configured,
+    _receive_and_post applies keep policy to snap_dir, backup_dir, and
+    remote via _apply_all_keep_policies. The final apply_keep_policy(snap_dir)
+    should NOT run again — otherwise snap_dir keep policy is applied twice.
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_dry_run_no_duplicate_keep_policy_on_snap_dir(self, mock_run, mock_stream):
+        """With export_file + remote + backup_dir, snap_dir keep policy should run once."""
+
+        from io import StringIO
+        import sys as sys_mod
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "lama7Maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            export_file = backup_dir / f"{archive_name}.btrfs"
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 1,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "keep_weekly": 0,
+                "keep_monthly": 0,
+                "keep_yearly": 0,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "export_file": str(export_file),
+                "backup_dir": str(backup_dir),
+                "keep": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            old_stdout = sys_mod.stdout
+            captured = StringIO()
+            sys_mod.stdout = captured
+            try:
+                bs.process_archive(archive, cfg)
+            finally:
+                sys_mod.stdout = old_stdout
+
+            output = captured.getvalue()
+            # Count how many times keep policy is applied to the snapshot directory
+            snap_dir_applies = output.count(f"Applying to {archive_name} in {snap_dir}")
+            self.assertEqual(snap_dir_applies, 1,
+                             f"Expected keep policy applied once to snap_dir, got {snap_dir_applies}:\\n{output}")
+
+
 if __name__ == "__main__":
     unittest.main()
