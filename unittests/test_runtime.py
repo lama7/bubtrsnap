@@ -1244,6 +1244,53 @@ class TestReceiveStreamReturnsSubvolName(unittest.TestCase):
             self.assertIsNotNone(result, "receive_stream must return subvol name on success")
 
 
+class TestReceiveStreamDualDestination(unittest.TestCase):
+    """Test that receive_stream dispatches to both _receive_local and
+    _receive_remote when both backup_dir and remote/remote_dir are set."""
+
+    @patch("bubtrsnap._receive_remote", return_value="archive.remote.202501010000")
+    @patch("bubtrsnap._receive_local", return_value="archive.202501010000")
+    def test_both_local_and_remote_receivers_invoked(self, mock_local, mock_remote):
+        """When both backup_dir and remote are set, both receivers fire."""
+        stream_file = Path("/tmp/test_receive.btrfs")
+        backup_dir = Path("/tmp/backup")
+        cfg = {"dry_run": False, "local_sudo": False, "verbose": 2,
+               "remote_sudo": False}
+
+        result = bs.receive_stream(
+            stream_file, backup_dir, cfg,
+            remote="user@host", remote_dir="/btrfs/backups",
+            remote_sudo=False,
+        )
+
+        mock_local.assert_called_once_with(stream_file, backup_dir, cfg)
+        mock_remote.assert_called_once_with(
+            stream_file, "user@host", "/btrfs/backups", cfg, False
+        )
+        # Local result takes precedence
+        self.assertEqual(result, "archive.202501010000")
+
+    @patch("bubtrsnap._receive_remote", return_value="archive.remote.202501010000")
+    @patch("bubtrsnap._receive_local", return_value="archive.202501010000")
+    def test_only_remote_when_no_backup_dir(self, mock_local, mock_remote):
+        """When only remote is set (no backup_dir), only remote receiver fires."""
+        stream_file = Path("/tmp/test_receive.btrfs")
+        cfg = {"dry_run": False, "local_sudo": False, "verbose": 2,
+               "remote_sudo": True}
+
+        result = bs.receive_stream(
+            stream_file, None, cfg,
+            remote="user@host", remote_dir="/btrfs/backups",
+            remote_sudo=True,
+        )
+
+        mock_local.assert_not_called()
+        mock_remote.assert_called_once_with(
+            stream_file, "user@host", "/btrfs/backups", cfg, True
+        )
+        self.assertEqual(result, "archive.remote.202501010000")
+
+
 class TestExportImportNoLocalPipedSend(unittest.TestCase):
     """Test that export_file + import_file does NOT do a local piped send->receive to backup_dir.
 
