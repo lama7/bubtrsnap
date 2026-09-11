@@ -242,6 +242,35 @@ class TestPrecedence(unittest.TestCase):
             self.assertEqual(by_name["b"]["export_dir"], str(streams))
             self.assertIsNone(by_name["b"]["export_file"])
 
+    def test_mixed_archives_global_export_dir(self):
+        """Archive A has import_file; archive B has none.
+        Global export_dir applies only to B, A suppresses it."""
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a", "b")
+            streams = td_path / "streams"
+            streams.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f'''\n                snapshot_dir = "{td_path}"
+                export_dir = "{streams}"
+                [a]
+                subvolume = "{subs['a']}"
+                import_file = "{td_path}/a.btrfs"
+                [b]
+                subvolume = "{subs['b']}"
+                ''',
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(archives=["a","b"]), cfg)
+            by_name = {x["name"]: x for x in archives}
+            self.assertEqual(by_name["a"]["import_file"], str(td_path / "a.btrfs"))
+            self.assertIsNone(by_name["a"]["export_dir"])
+            self.assertIsNone(by_name["a"]["export_file"])
+            self.assertEqual(by_name["b"]["export_dir"], str(streams))
+            self.assertIsNone(by_name["b"]["import_file"])
+
     def test_cli_stage_file_ignores_config_import_file(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
