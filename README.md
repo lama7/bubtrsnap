@@ -323,11 +323,11 @@ appropriate area.  If both are used on the CLI, then processing is normal with
 the exception that the stream file is used essentially as a staging step.  When
 specifying both, the same file **MUST** be named for both options.
 
-`import_file` (or `import_dir`) can receive to both `backup_dir` and a remote
-host simultaneously when both destinations are configured.  The stream file
-is received locally into `backup_dir` first, then SCP'd to the remote and
-received into `remote_path`.  Keep policy is applied independently to each
-destination.
+The `import_file` (or `import_dir`) options can receive to both `backup_dir`
+and a remote host simultaneously when both destinations are configured.  The
+stream file is received locally into `backup_dir` first, then SCP'd to the
+remote and received into `remote_path`.  Keep policy is applied independently
+to each destination.
 
 An example CLI command (assuming a configuration file is set up):
 
@@ -504,11 +504,11 @@ remove the stream file when done.
 These are mutually exclusive with the other send/receive/stage options and with
 `--snaps-only`.
 
-**`stage_*` options are local-only**: they do not trigger remote (SSH) transfer.
-When `remote_host`/`remote_path` is configured, staging writes the stream file
-locally and receives it into `backup_dir` only. The remote destination is only
-used for backup operations without staging (regular piped send or
-`export_file`/`export_dir` + remote combinations).
+Note that **`stage_*` options are local-only**: they do not trigger remote
+(SSH) transfer.  When `remote_host`/`remote_path` is configured, staging writes
+the stream file locally and receives it into `backup_dir` only. The remote
+destination is only used for backup operations without staging (regular piped
+send or `export_file`/`export_dir` + remote combinations).
 
 ## Keep Policy
 
