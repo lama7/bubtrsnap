@@ -151,34 +151,40 @@ See [keep policy][] below for more info on keeps.
 
 ### Configuration Options
 
-Several options are global only:
+Global-only options:
 
 + `snapshot_dir`
-+ `backup_dir`
 + `local_sudo`
-+ `verbose`
++ `snaps_only`
 + `export_dir`
 + `import_dir`
 + `stage_dir`
++ `verbose`
++ `dry_run`
+
+Options that can be set globally or per-archive (archive-level overrides global):
+
++ `backup_dir`
 + `remote_host`
 + `remote_path`
 + `remote_sudo`
 + `week_startday`
++ `keep_hourly`
++ `keep_daily`
++ `keep_weekly`
++ `keep_monthly`
++ `keep_yearly`
 
-The following options can only be used with an archive:
+Per-archive options (set within an `[archive_name]` section only):
 
 + `subvolume`  # required for an archive
 + `export_file`
 + `import_file`
++ `stage_file`
 + `pre_snapshot_hook`
 + `post_snapshot_hook`
 + `post_backup_hook`
-+ `remote_host`
-+ `remote_path`
-+ `remote_sudo`
-+ `backup_dir`
-+ `week_startday`
-+ `keep`
++ `forced_keep`
 
 The `verbose` option has several levels for increased messaging on the CLI or
 for logging purposes if running bubtrsnap from a cron job.  By default,
@@ -284,10 +290,12 @@ host once a common snapshot/backup pair exists.
 
 ### SSH with stream files
 
-SSH destinations work with the existing stream file options.  For example, you
-can stage a stream locally and then receive it on the remote, or use
-`export_dir`/`import_dir` alongside a remote destination.  The same
-precedence and mutual-exclusion rules apply.
+SSH destinations can be combined with the stream file options (`export_file`,
+`export_dir`, `import_file`, `import_dir`, `stage_file`, `stage_dir`).  See
+the "Stream Files" and "Stream Directories" sections below for details.  The
+same precedence and mutual-exclusion rules apply, plus the automated SCP+receive
+workflow is available when `export_file`/`export_dir` is combined with
+`remote_host`/`remote_path` (no explicit import/stage options).
 
 ## Stream Files: export_file/import_file
 
@@ -297,12 +305,17 @@ options.  This is to facilitate backups of very large archives where a raw
 send-receive could get interrupted due to the time it takes for the transfer.
 
 Both of these options take a file name for an argument.  In the case of
-`export_file` the file names the destination file for the stream data.  This
-file cannot be a pre-existing file.  For `import_file` the file names the
+`export_file` the file names the destination file for the stream data.  If the
+file already exists, it will be overwritten.  For `import_file` the file names the
 source for a `btrfs receive` operation and the destination will be
 `backup_dir`.  The options can be used individually or together on the CLI.
-When `export_file` is specified no backup processing will be performed (no
-`btrfs receive`).  Processing will stop when post-snapshot hooks are complete.
+When `export_file` is used on its own (without `backup_dir` or `remote`), no
+backup processing will be performed (no `btrfs receive`).  Processing will stop
+when post-snapshot hooks are complete. When `export_file` is combined with
+`backup_dir`, a local piped send|receive also occurs. When combined with a
+remote, the stream file is SCP'd and received on the remote (see
+[Remote receive with stream files](#remote-receive-with-stream-files)
+above).
 In the case of `import_file`, the snapshotting steps are skipped and
 processing **STARTS** at the backup step.  Any post-backup hooks will be
 processed as well.  In both cases, the keep policy will be applied to the
@@ -395,19 +408,23 @@ processing and a btrfs stream file will be searched for in the specified directo
 If a stream file is not found, processing for that archive completes and the
 next archive is dealt with.
 
-### SSH Remote Receive with export_file / export_dir
+### Remote receive with stream files
 
-When `export_file` or `export_dir` is combined with `remote_host` and `remote_path` (and no explicit
-`import_file`, `import_dir`, or staging options), bubtrsnap will:
+When `export_file` or `export_dir` is combined with `remote_host` and `remote_path`
+(and no explicit `import_file`, `import_dir`, or staging options), bubtrsnap
+will:
 
-1. Create the snapshot
-2. Write the btrfs stream to a file (`export_file` path or `export_dir`/`archive.timestamp.btrfs`)
-3. Automatically copy that stream file to the SSH remote via `scp`
-4. Receive the stream on the remote via `btrfs receive -f <temp_file> remote_dir`
-5. Clean up the temporary file on the remote
-6. Apply keep policy on the remote
+1. Create the snapshot.
+2. Write the btrfs stream to a file (`export_file` path or
+   `export_dir/archive.timestamp.btrfs`).
+3. Copy that stream file to the SSH remote via `scp`.
+4. On the remote, run `btrfs receive -f <temp_file> <remote_path>`.
+5. Clean up the temporary file on the remote.
+6. Apply keep policy on the remote.
 
-This enables a fully automated single-command workflow: snapshot locally, stream to file, transfer via SCP, and receive on remote — all in one bubtrsnap run.
+This enables a fully automated single-command workflow: snapshot locally,
+stream to file, transfer via SCP, and receive on remote — all in one
+bubtrsnap run.
 
 Example CLI (export_dir):
 ```
@@ -438,17 +455,21 @@ remote_path = "/btrfs/backups"
 subvolume = "/path/to/subvol"
 ```
 
-Note: The local stream file is retained after transfer (not deleted). Use `--stage-file` or `--stage-dir` if you want automatic cleanup.
+Note: The local stream file is retained after transfer (not deleted). Use
+`--stage-file` or `--stage-dir` if you want automatic cleanup of the stream file.
 
-### Dual destination: local backup + remote via SCP
+### Combining local backup_dir with remote stream receive
 
-When an archive is configured with `export_file` (or `export_dir`), `remote_host`/`remote_path`,
-**and** `backup_dir`, bubtrsnap performs both a local piped send-receive to `backup_dir` and
-the SCP-based remote receive. The sequence for each archive is:
+When an archive is configured with `backup_dir` in addition to `export_file`
+(or `export_dir`) and `remote_host`/`remote_path`, bubtrsnap sends to **both**
+destinations: a local piped `btrfs send | btrfs receive` to `backup_dir`, and
+the SCP-based remote receive described above. The sequence:
 
 1. Create the read-only snapshot.
-2. Send to local `backup_dir` via piped `btrfs send | btrfs receive` (incrementals use local parents).
-3. Write the btrfs stream to a file (`export_file` or `export_dir/archive.timestamp.btrfs`).
+2. Send to local `backup_dir` via piped `btrfs send | btrfs receive`
+   (incrementals use local parents).
+3. Write the btrfs stream to a file (`export_file` or
+   `export_dir/archive.timestamp.btrfs`).
 4. SCP the stream file to the remote host.
 5. On the remote, run `btrfs receive -f <remote_temp_file> <remote_path>`.
 6. Clean up the temporary file on the remote.
