@@ -2,7 +2,7 @@ bubtrsnap
 =========
 
 Based on my previous [btrbu][] project, bubtrsnap is a rewrite of it using
-Grok.  It is a python3 based project and is a superior implementation, imho.
+AI to help extend it significantly from where I left the previous project.
 
 More formally, bubtrsnap is a(nother) btrfs snapshot and backup management
 script.  Like btrbu before it, bubtrsnap will bootstrap itself if no backups
@@ -22,13 +22,14 @@ invoke a [borgbackup][] command using the just created snapshot as a source.
 
 As with btrbu, bubtrsnap remains largely dependency free.  It uses no data
 files or databases in order to perform its duties.  It's main dependency is a
-python3 installation.
+python3 installation.  For more advanced needs, a working SSH installation is
+also required, at least on the client side.
 
 [btrbu]: https://github.com/lama7/btrbu
 
 ## Usage
 
-For simple snapshot and backup needs, a command can be as simple as:
+For basic snapshot and backup needs, a command can be as simple as:
 
     bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup archive1=/path/to/subvolume
 
@@ -63,13 +64,17 @@ useful.
 ## Configuration Files
 
 At some point, if backing up several different subvolumes for instance, a
-configuration file will make the command line more manageable.  bubtrsnap will
-look for a configuration file in `~/.config/bubtrsnap.toml` if no file is
-specified on the command line.  Alternatively:
+configuration file will make the command line more manageable.  The default
+location for a configuration file to live in is `~/.config/bubtrsnap.toml`.
+Assuming that file is in place, a simple `bubtrsnap` invocaton on the CLI will
+pull everything it needs to run from that file.
+
+Alternatively, if you prefer to do things your own way:
 
     bubtrsnap --config=/path/to/myconfig
 
-Configuration files use TOML formatting and look like:
+Configuration files use TOML formatting and look like, well a TOML formatted
+comfiguration file:
 
 ```
     # a comment... these are global options
@@ -193,8 +198,11 @@ flow messages.  Increasing the number will cause `btrfs` commands to be
 reported.  To be able to get the maximum information on flow and commands, use
 `debug` on the CLI.
 
-Finally, the `dry-run` option is not honored in the configuration file.  Simply
-add it the CLI to see how bubtrsnap will proceed with a configuration.
+Note: while `dry_run` is a valid configuration file option, it is overridden
+on every run by the CLI value.  This means setting `dry_run = true` in a
+config file will have no effect unless `--dry-run` is also passed on the
+CLI.  To see how bubtrsnap will proceed with a configuration, always add
+`--dry-run` to the command line.
 
 [keep policy]: #keep-policy
 
@@ -288,15 +296,6 @@ matches them against local snapshot UUIDs — the same logic it uses for local
 backups, just executed over SSH.  This allows incremental sends to the remote
 host once a common snapshot/backup pair exists.
 
-### SSH with stream files
-
-SSH destinations can be combined with the stream file options (`export_file`,
-`export_dir`, `import_file`, `import_dir`, `stage_file`, `stage_dir`).  See
-the "Stream Files" and "Stream Directories" sections below for details.  The
-same precedence and mutual-exclusion rules apply, plus the automated SCP+receive
-workflow is available when `export_file`/`export_dir` is combined with
-`remote_host`/`remote_path` (no explicit import/stage options).
-
 ## Stream Files: export_file/import_file
 
 It is possible to take advantage of btrfs' ability to send to or to receive from
@@ -315,7 +314,7 @@ when post-snapshot hooks are complete. When `export_file` is combined with
 `backup_dir`, a local piped send|receive also occurs. When combined with a
 remote, the stream file is SCP'd and received on the remote (see
 [Remote receive with stream files](#remote-receive-with-stream-files)
-above).
+below).
 In the case of `import_file`, the snapshotting steps are skipped and
 processing **STARTS** at the backup step.  Any post-backup hooks will be
 processed as well.  In both cases, the keep policy will be applied to the
