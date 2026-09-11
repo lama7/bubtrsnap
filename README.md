@@ -271,7 +271,7 @@ If the remote host requires elevated privileges to run btrfs commands,
 `--remote-sudo` (or `remote_sudo` in config) will prepend `sudo -n` to the
 remote btrfs commands.  This works the same way as local `local_sudo` but
 applies to the SSH side only.  Note the user needs to have their sudo profiles
-setup for NOPASSWD fornthis to work properly.
+setup for NOPASSWD in order for this to work properly.
 
 ### SSH validation and parent matching
 
@@ -397,7 +397,7 @@ next archive is dealt with.
 
 ### SSH Remote Receive with export_file / export_dir
 
-When `export_file` or `export_dir` is combined with `remote` and `remote_dir` (and no explicit
+When `export_file` or `export_dir` is combined with `remote_host` and `remote_path` (and no explicit
 `import_file`, `import_dir`, or staging options), bubtrsnap will:
 
 1. Create the snapshot
@@ -413,8 +413,8 @@ Example CLI (export_dir):
 ```
 bubtrsnap --snapshot-dir /snapshots \
     --export-dir /local/streams \
-    --remote user@backuphost \
-    --remote-dir /btrfs/backups \
+    --remote-host user@backuphost \
+    --remote-path /btrfs/backups \
     archive1=/path/to/subvol
 ```
 
@@ -422,8 +422,8 @@ Example CLI (export_file):
 ```
 bubtrsnap --snapshot-dir /snapshots \
     --export-file /local/stream.btrfs \
-    --remote user@backuphost \
-    --remote-dir /btrfs/backups \
+    --remote-host user@backuphost \
+    --remote-path /btrfs/backups \
     archive1=/path/to/subvol
 ```
 
@@ -431,14 +431,47 @@ Example config:
 ```toml
 snapshot_dir = "/snapshots"
 export_dir = "/local/streams"
-remote = "user@backuphost"
-remote_dir = "/btrfs/backups"
+remote_host = "user@backuphost"
+remote_path = "/btrfs/backups"
 
 [archive1]
 subvolume = "/path/to/subvol"
 ```
 
 Note: The local stream file is retained after transfer (not deleted). Use `--stage-file` or `--stage-dir` if you want automatic cleanup.
+
+### Dual destination: local backup + remote via SCP
+
+When an archive is configured with `export_file` (or `export_dir`), `remote_host`/`remote_path`,
+**and** `backup_dir`, bubtrsnap performs both a local piped send-receive to `backup_dir` and
+the SCP-based remote receive. The sequence for each archive is:
+
+1. Create the read-only snapshot.
+2. Send to local `backup_dir` via piped `btrfs send | btrfs receive` (incrementals use local parents).
+3. Write the btrfs stream to a file (`export_file` or `export_dir/archive.timestamp.btrfs`).
+4. SCP the stream file to the remote host.
+5. On the remote, run `btrfs receive -f <remote_temp_file> <remote_path>`.
+6. Clean up the temporary file on the remote.
+7. Apply keep policy to snap_dir, backup_dir, and the remote.
+
+Example config (triple destination):
+```toml
+snapshot_dir = "/snapshots"
+backup_dir = "/pool/backups"
+export_dir = "/local/streams"
+remote_host = "user@backuphost"
+remote_path = "/btrfs/backups"
+
+[archive1]
+subvolume = "/home/user/data"
+keep_daily = 7
+keep_weekly = 4
+```
+
+Run it:
+```
+bubtrsnap --dry-run archive1
+```
 
 ## Staging: stage_file / stage_dir
 
@@ -682,7 +715,7 @@ a real backup.
 
 The SSH branch includes unit tests covering:
 
-- CLI / per-archive / global precedence for `remote`, `remote_dir`, and
+- CLI / per-archive / global precedence for `remote_host`, `remote_path`, and
   `remote_sudo`.
 - SSH subvolume validation failure and success.
 - `iter_archive_items_ssh` output format, archive filtering, invalid timestamps,
