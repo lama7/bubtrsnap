@@ -14,16 +14,18 @@ formatted configuration file with a default location in a users `~/.config/`.
 The information bubtrsnap needs is minimal- a snapshot directory, an archive
 name and a subvolume that the archive name is associated with.  If a backup is
 desired, then a backup path must also be specified.  It is a btrfs specific
-utility and takes advantage of the `send` and `receive` commands to aid with
-making backups.  From a configuration file, hooks are available at different
-stages to enhance its capabilities via scripts or other command line
-utilities.  For instance, a snapshot can be taken and then a hook used to
-invoke a [borgbackup][] command using the just created snapshot as a source.
+utility and takes advantage of the `send` and `receive` commands native to
+btrfs.  From a configuration file, hooks are available at different stages to
+enhance its capabilities via scripts or other command line utilities.  For
+instance, a snapshot can be taken and then a hook used to invoke a
+[borgbackup][] command using the just created snapshot as a source.
 
-As with btrbu, bubtrsnap remains largely dependency free.  It uses no data
-files or databases in order to perform its duties.  It's main dependency is a
-python3 installation.  For more advanced needs, a working SSH installation is
-also required, at least on the client side.
+As with btrbu, bubtrsnap remains largely dependency free.  If you have a
+working btrfs installation yuou likely have the main dependency needed,
+btrfs-progs.  It uses no data files or databases in order to perform its
+duties.  It's main dependency is a python3 installation.  For more advanced
+needs, a working SSH installation is also required, at least on the client
+side.
 
 [btrbu]: https://github.com/lama7/btrbu
 
@@ -207,9 +209,9 @@ CLI.  To see how bubtrsnap will proceed with a configuration, always add
 
 ## SSH Backups
 
-bubtrsnap can send backups over SSH to a remote btrfs-capable host.  This is
-useful when you want a copy of your backups on another machine without needing
-to set up a local backup directory.
+If desired, bubtrsnap can send backups over SSH to a remote btrfs-capable host.
+This is useful when you want a copy of your backups on another machine without
+needing to set up a local backup directory.
 
 ### Basic remote backup
 
