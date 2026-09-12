@@ -1808,5 +1808,123 @@ class TestNoDuplicateKeepPolicy(unittest.TestCase):
                              f"Expected keep policy applied once to snap_dir, got {snap_dir_applies}:\\n{output}")
 
 
+class TestNoDuplicateReceiveWithAutoSSHDestination(unittest.TestCase):
+    """Regression test for stray 'btrfs receive -f file.btrfs /backup_dir' when
+    export_file + remote + backup_dir are all configured.
+
+    The lama7Maildir archive has export_file set with remote_host/remote_path
+    and a global backup_dir. The send_file branch in process_archive already
+    does a piped send|receive to backup_dir via _piped_send_to_local. The
+    auto_ssh_receive path should only SCP + SSH receive to the remote, NOT
+    also do a local btrfs receive -f of the same stream file into backup_dir.
+    """
+
+    @patch("bubtrsnap.is_btrfs_stream", return_value=True)
+    @patch("bubtrsnap.run")
+    def test_no_stray_local_receive_when_auto_ssh_receive(self, mock_run, mock_stream):
+        """With export_file + remote + backup_dir, no 'btrfs receive -f <stream> <backup_dir>'."""
+
+        from io import StringIO
+        import sys as sys_mod
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "lama7Maildir"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            export_file = backup_dir / f"{archive_name}.btrfs"
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "keep_daily": 7,
+                "keep_monthly": 1,
+                "keep_yearly": 1,
+                "keep_hourly": 0,
+                "keep_weekly": 0,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "export_file": str(export_file),
+                "backup_dir": str(backup_dir),
+                "keep": {"keep_daily": 7, "keep_monthly": 1, "keep_yearly": 1,
+                        "keep_hourly": 0, "keep_weekly": 0},
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            old_stdout = sys_mod.stdout
+            captured = StringIO()
+            sys_mod.stdout = captured
+            try:
+                bs.process_archive(archive, cfg)
+            finally:
+                sys_mod.stdout = old_stdout
+
+            output = captured.getvalue()
+
+            # Collect all run() command calls
+            all_cmds = " ".join(
+                " ".join(c.args[0]) if isinstance(c.args[0], list) else c.args[0]
+                for c in mock_run.call_args_list
+            )
+
+            # The stream file path should NOT appear in a 'btrfs receive' command
+            # (the piped send|receive to local is fine — that goes through piped_run,
+            #  not run(), and doesn't use -f on the stream file)
+            receive_calls = [
+                " ".join(c.args[0]) if isinstance(c.args[0], list) else c.args[0]
+                for c in mock_run.call_args_list
+                if isinstance(c.args[0], list) and "btrfs" in c.args[0] and "receive" in c.args[0]
+            ]
+
+            for cmd in receive_calls:
+                self.assertNotIn(
+                    str(export_file), cmd,
+                    f"Stray 'btrfs receive -f {export_file}' found — the local piped send "
+                    f"already wrote to backup_dir: {cmd}"
+                )
+
+            # Verify the piped send|receive to local backup_dir still happens
+            pipe_lines = [l for l in output.split("\n") if "|" in l and "btrfs send" in l and "btrfs receive" in l]
+            local_pipe = [l for l in pipe_lines if str(backup_dir) in l and "ssh" not in l]
+            self.assertTrue(len(local_pipe) >= 1,
+                            f"Expected local piped send|receive to {backup_dir}: {output}")
+
+            # Verify keep policy IS applied to local backup_dir (not skipped)
+            # _piped_send_to_local deposited into backup_dir, so it needs pruning
+            keep_backup = [l for l in output.split("\n") if "Applying to" in l and str(backup_dir) + ":" in l]
+            self.assertTrue(len(keep_backup) >= 1,
+                            f"Expected keep policy applied to backup_dir {backup_dir}: {output}")
+
+
 if __name__ == "__main__":
     unittest.main()

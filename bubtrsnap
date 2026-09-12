@@ -2210,7 +2210,14 @@ def process_archive(archive: dict, cfg: dict) -> None:
         if recv_file and send_file and not staged:
             recv_path = Path(recv_file)
 
-        received = receive_stream(recv_path, backup_dir, cfg, remote, remote_dir, remote_sudo)
+        # When auto_ssh_receive is the trigger, the local piped send in the
+        # send_file branch already deposited the subvolume into backup_dir.
+        # Pass None for the receive destination so receive_stream only does
+        # the SSH receive, not a redundant local btrfs receive -f of the same
+        # stream file into backup_dir (which the piped send already covered).
+        # Keep policy still needs to target backup_dir, so pass it separately.
+        recv_dest_dir = None if auto_ssh_receive else backup_dir
+        received = receive_stream(recv_path, recv_dest_dir, cfg, remote, remote_dir, remote_sudo)
         # snap_dir keep policy is handled by the final apply_keep_policy call
         _receive_and_post(received, archive, name, snap, backup_dir, remote, remote_dir,
                           None, keep, cfg, remote_sudo)
