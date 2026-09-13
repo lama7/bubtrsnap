@@ -174,6 +174,8 @@ Options that can be set globally or per-archive (archive-level overrides global)
 + `remote_host`
 + `remote_path`
 + `remote_sudo`
++ `rsync`
++ `rsync_opts`
 + `week_startday`
 + `keep_hourly`
 + `keep_daily`
@@ -288,6 +290,31 @@ If the remote host requires elevated privileges to run btrfs commands,
 remote btrfs commands.  This works the same way as local `local_sudo` but
 applies to the SSH side only.  Note the user needs to have their sudo profiles
 setup for NOPASSWD in order for this to work properly.
+
+### rsync transport (optional)
+
+By default, bubtrsnap uses `scp` to copy stream files to a remote host.  You can
+opt into `rsync` instead by enabling `--rsync` (or `rsync = true` in config).
+rsync provides partial-transfer recovery via `--partial-dir`, so if a transfer
+is interrupted it can be resumed on the next run without starting over.
+
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots --export-file /tmp/stream.btrfs \
+          --remote-host user@backuphost --remote-path /btrfs/backups --rsync \
+          archive1=/path/to/subvolume
+```
+
+When `--rsync` is enabled, bubtrsnap always uses `-a` (archive mode) and
+`--partial-dir .bubtrsnap-partial` for transfer resilience.  You can supply
+additional rsync options with `--rsync-opts` (or `rsync_opts` in config).  Some
+options are blocked for safety or to avoid interfering with bubtrsnap's workflow
+(e.g. `--delete`, `--partial-dir`, `-v`, `--progress`, `--dry-run`, `--daemon`,
+`--rsh`, `--exclude`, etc.).  Blocked options are reported via stderr.
+
+rsync can be set globally or per-archive with the usual precedence rules
+(CLI > archive > global).  When set globally, it applies to all archives that
+have a remote destination.  rsync only affects file-based transfers (scp
+replacement); it does not affect piped `btrfs send | btrfs receive`.
 
 ### SSH validation and parent matching
 

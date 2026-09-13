@@ -51,6 +51,8 @@ def _ns(**kwargs):
         remote_host=None,
         remote_path=None,
         remote_sudo=False,
+        rsync=False,
+        rsync_opts=None,
     )
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -614,6 +616,364 @@ class TestSendBackupToFile(unittest.TestCase):
         self.assertTrue(mock_run.called)
         call_args = mock_run.call_args[0][0]
         self.assertIn("-f", call_args)
+
+
+class TestRsyncConfigPrecedence(unittest.TestCase):
+    """Test CLI > archive > global precedence for rsync options."""
+
+    def test_cli_rsync_overrides_archive_and_global(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = td_path / "subvol_a"
+            sub.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f"""
+                snapshot_dir = "{td_path}"
+                rsync = true
+                rsync_opts = "--compress"
+                [a]
+                subvolume = "{sub}"
+                rsync = false
+                rsync_opts = "--times"
+                """,
+            )
+            cli = _ns(rsync=True, rsync_opts="--bwlimit=1000", archives=["a"])
+            _global, archives = bs.load_and_resolve_archives(cli, cfg)
+            a = archives[0]
+            self.assertTrue(a["rsync"])
+            self.assertEqual(a["rsync_opts"], "--bwlimit=1000")
+
+    def test_archive_rsync_overrides_global(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = td_path / "subvol_a"
+            sub.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f"""
+                snapshot_dir = "{td_path}"
+                rsync = false
+                rsync_opts = "--compress"
+                [a]
+                subvolume = "{sub}"
+                rsync = true
+                rsync_opts = "--times"
+                """,
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            a = archives[0]
+            self.assertTrue(a["rsync"])
+            self.assertEqual(a["rsync_opts"], "--times")
+
+    def test_global_rsync_inherited_when_no_archive_setting(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = td_path / "subvol_a"
+            sub.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f"""
+                snapshot_dir = "{td_path}"
+                rsync = true
+                rsync_opts = "--compress"
+                [a]
+                subvolume = "{sub}"
+                """,
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            a = archives[0]
+            self.assertTrue(a["rsync"])
+            self.assertEqual(a["rsync_opts"], "--compress")
+
+    def test_rsync_defaults_when_not_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = td_path / "subvol_a"
+            sub.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f"""
+                snapshot_dir = "{td_path}"
+                [a]
+                subvolume = "{sub}"
+                """,
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            a = archives[0]
+            self.assertFalse(a["rsync"])
+            self.assertIsNone(a["rsync_opts"])
+
+
+class TestRsyncOptionsFilter(unittest.TestCase):
+    """Test that _filter_rsync_opts blocks dangerous options."""
+
+    def test_no_opts_returns_empty(self):
+        self.assertEqual(bs._filter_rsync_opts(None), [])
+        self.assertEqual(bs._filter_rsync_opts(""), [])
+
+    def test_safe_opts_preserved(self):
+        opts = "--compress --whole-file"
+        result = bs._filter_rsync_opts(opts)
+        self.assertIn("--compress", result)
+        self.assertIn("--whole-file", result)
+
+    def test_blocked_opts_filtered(self):
+        opts = "--delete --verbose --progress"
+        result = bs._filter_rsync_opts(opts)
+        self.assertNotIn("--delete", result)
+        self.assertNotIn("--verbose", result)
+        self.assertNotIn("--progress", result)
+        self.assertEqual(len(result), 0)
+
+    def test_blocked_opts_reported_via_stderr(self):
+        opts = "--delete"
+        from io import StringIO
+        import sys as _sys
+        old_stderr = _sys.stderr
+        _sys.stderr = StringIO()
+        try:
+            bs._filter_rsync_opts(opts)
+            output = _sys.stderr.getvalue()
+        finally:
+            _sys.stderr = old_stderr
+        self.assertIn("blocking", output.lower())
+        self.assertIn("--delete", output)
+
+    def test_partial_dir_always_blocked(self):
+        opts = "--partial-dir=/tmp/foo --archive"
+        result = bs._filter_rsync_opts(opts)
+        self.assertNotIn("--partial-dir=/tmp/foo", result)
+        self.assertIn("--archive", result)
+
+    def test_combined_short_opts_split(self):
+        """-av should keep -a but block -v."""
+        opts = "-av"
+        result = bs._filter_rsync_opts(opts)
+        self.assertIn("-a", result)
+        self.assertNotIn("-v", result)
+
+    def test_option_with_value_stripped(self):
+        """--delete=something still blocked."""
+        opts = "--delete=foo"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(len(result), 0)
+
+    def test_dry_run_blocked(self):
+        opts = "--dry-run --compress"
+        result = bs._filter_rsync_opts(opts)
+        self.assertNotIn("--dry-run", result)
+        self.assertIn("--compress", result)
+
+    def test_daemon_blocked(self):
+        opts = "--daemon"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(len(result), 0)
+
+
+class TestRsyncAndReceive(unittest.TestCase):
+    """Test _rsync_and_receive function."""
+
+    @patch("bubtrsnap.run")
+    def test_rsync_and_receive_dry_run(self, mock_run):
+        """_rsync_and_receive should log rsync and SSH commands in dry-run."""
+        from pathlib import Path
+        import subprocess
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False,
+               "local_sudo": False, "rsync": True, "rsync_opts": "--compress"}
+
+        mock_run.return_value = None
+
+        result = bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
+
+        self.assertEqual(result, "test.202608280230")
+        # Should have at least 3 run() calls: check-partial, rsync, receive, cleanup
+        self.assertGreaterEqual(mock_run.call_count, 3)
+
+        # Verify rsync command was logged
+        calls_str = [str(c) for c in mock_run.call_args_list]
+        rsync_found = any("rsync" in s for s in calls_str)
+        self.assertTrue(rsync_found, "rsync command not found in run() calls")
+
+    @patch("bubtrsnap.run")
+    def test_rsync_command_structure(self, mock_run):
+        """Verify rsync command includes -a, --partial-dir, and remote path."""
+        from pathlib import Path
+        import subprocess
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False,
+               "local_sudo": False, "rsync": True, "rsync_opts": "--compress"}
+
+        mock_run.return_value = None
+
+        bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg,
+                              rsync_opts=cfg.get("rsync_opts"))
+
+        # Find the rsync command call
+        rsync_cmd = None
+        for call_obj in mock_run.call_args_list:
+            args, kwargs = call_obj
+            cmd = args[0]
+            if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "rsync":
+                rsync_cmd = cmd
+                break
+
+        self.assertIsNotNone(rsync_cmd, "rsync command not found in calls")
+        self.assertIn("-a", rsync_cmd)
+        self.assertIn("--partial-dir", rsync_cmd)
+        self.assertIn("--compress", rsync_cmd)
+        self.assertIn("user@host:/tmp/bubtrsnap-test.202608280230.btrfs", rsync_cmd)
+
+    @patch("bubtrsnap.run")
+    def test_rsync_partial_dir_detection(self, mock_run):
+        """When partial-dir exists on remote, rsync should be notified."""
+        from pathlib import Path
+        import subprocess
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False,
+               "local_sudo": False, "rsync": True, "rsync_opts": None}
+
+        # First call (check partial) succeeds → interrupted transfer detected
+        # Remaining calls return None for dry-run
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="", stderr=""),
+            None,  # rsync command (dry-run)
+            None,  # receive command (dry-run)
+            None,  # cleanup command (dry-run)
+        ]
+
+        result = bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
+        self.assertEqual(result, "test.202608280230")
+
+    @patch("bubtrsnap.run")
+    def test_rsync_transfer_failure(self, mock_run):
+        """rsync transfer failure should exit."""
+        from pathlib import Path
+        import subprocess
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False,
+               "local_sudo": False, "rsync": True, "rsync_opts": None}
+
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(args=["ssh"], returncode=1, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["rsync"], returncode=1, stdout="", stderr="connection refused"),
+        ]
+
+        with self.assertRaises(SystemExit):
+            bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
+
+    @patch("bubtrsnap.run")
+    def test_rsync_receive_failure(self, mock_run):
+        """SSH receive failure after rsync should exit."""
+        from pathlib import Path
+        import subprocess
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False,
+               "local_sudo": False, "rsync": True, "rsync_opts": None}
+
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(args=["ssh"], returncode=1, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="no space left"),
+            subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
+        ]
+
+        with self.assertRaises(SystemExit):
+            bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
+
+    @patch("bubtrsnap.run")
+    def test_rsync_receive_already_exists(self, mock_run):
+        """rsync receive returning 'already exists' should return None."""
+        from pathlib import Path
+        import subprocess
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False,
+               "local_sudo": False, "rsync": True, "rsync_opts": None}
+
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(args=["ssh"], returncode=1, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="subvolume already exists"),
+            subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
+        ]
+
+        result = bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
+        self.assertIsNone(result)
+
+    @patch("bubtrsnap.run")
+    def test_rsync_command_with_local_sudo(self, mock_run):
+        """rsync with local_sudo should prepend sudo -n."""
+        from pathlib import Path
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False,
+               "local_sudo": True, "rsync": True, "rsync_opts": None}
+
+        mock_run.return_value = None
+
+        bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg,
+                              rsync_opts=cfg.get("rsync_opts"))
+
+        # Find the rsync command call — when local_sudo is set, the command
+        # is ["sudo", "-n", "rsync", ...] instead of ["rsync", ...]
+        rsync_cmd = None
+        for call_obj in mock_run.call_args_list:
+            args, kwargs = call_obj
+            cmd = args[0]
+            if isinstance(cmd, list) and "rsync" in cmd:
+                rsync_cmd = cmd
+                break
+
+        self.assertIsNotNone(rsync_cmd, "rsync command with sudo not found")
+        self.assertEqual(rsync_cmd[0], "sudo")
+        self.assertEqual(rsync_cmd[1], "-n")
+        self.assertEqual(rsync_cmd[2], "rsync")
+
+
+class TestReceiveRemoteRsyncRouting(unittest.TestCase):
+    """Test that _receive_remote routes to rsync when use_rsync=True."""
+
+    @patch("bubtrsnap._rsync_and_receive")
+    @patch("bubtrsnap._scp_and_receive")
+    def test_receive_remote_uses_rsync(self, mock_scp, mock_rsync):
+        from pathlib import Path
+        mock_rsync.return_value = "test_subvol"
+        stream = Path("/tmp/test.btrfs")
+        cfg = {"verbose": 0, "dry_run": True}
+
+        result = bs._receive_remote(stream, "user@host", "/remote/backup", cfg,
+                                     remote_sudo=False, use_rsync=True, rsync_opts="--compress")
+
+        mock_rsync.assert_called_once_with(stream, "user@host", "/remote/backup", cfg,
+                                           False, "--compress")
+        mock_scp.assert_not_called()
+        self.assertEqual(result, "test_subvol")
+
+    @patch("bubtrsnap._rsync_and_receive")
+    @patch("bubtrsnap._scp_and_receive")
+    def test_receive_remote_uses_scp_when_no_rsync(self, mock_scp, mock_rsync):
+        from pathlib import Path
+        mock_scp.return_value = "test_subvol"
+        stream = Path("/tmp/test.btrfs")
+        cfg = {"verbose": 0, "dry_run": True}
+
+        result = bs._receive_remote(stream, "user@host", "/remote/backup", cfg)
+
+        mock_scp.assert_called_once_with(stream, "user@host", "/remote/backup", cfg, False)
+        mock_rsync.assert_not_called()
+        self.assertEqual(result, "test_subvol")
+
 
 if __name__ == "__main__":
     unittest.main()
