@@ -793,7 +793,7 @@ class TestRsyncAndReceive(unittest.TestCase):
         result = bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
 
         self.assertEqual(result, "test.202608280230")
-        # Should have at least 3 run() calls: check-partial, rsync, receive, cleanup
+        # Should have at least 3 run() calls: rsync, receive, cleanup
         self.assertGreaterEqual(mock_run.call_count, 3)
 
         # Verify rsync command was logged
@@ -833,25 +833,30 @@ class TestRsyncAndReceive(unittest.TestCase):
 
     @patch("bubtrsnap.run")
     def test_rsync_partial_dir_detection(self, mock_run):
-        """When partial-dir exists on remote, rsync should be notified."""
+        """rsync uses --partial-dir flag for interrupted transfer recovery."""
         from pathlib import Path
-        import subprocess
 
         stream = Path("/tmp/test.202608280230.btrfs")
         cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False,
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
-        # First call (check partial) succeeds → interrupted transfer detected
-        # Remaining calls return None for dry-run
-        mock_run.side_effect = [
-            subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="", stderr=""),
-            None,  # rsync command (dry-run)
-            None,  # receive command (dry-run)
-            None,  # cleanup command (dry-run)
-        ]
+        # All calls return None for dry-run (rsync, receive, cleanup)
+        mock_run.side_effect = [None, None, None]
 
         result = bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
         self.assertEqual(result, "test.202608280230")
+
+        # Verify --partial-dir flag is present in the rsync command
+        rsync_cmd = None
+        for call_obj in mock_run.call_args_list:
+            args, kwargs = call_obj
+            cmd = args[0]
+            if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "rsync":
+                rsync_cmd = cmd
+                break
+        self.assertIsNotNone(rsync_cmd, "rsync command not found in calls")
+        self.assertIn("--partial-dir", rsync_cmd)
+        self.assertIn(".bubtrsnap-partial", rsync_cmd)
 
     @patch("bubtrsnap.run")
     def test_rsync_transfer_failure(self, mock_run):
@@ -863,8 +868,8 @@ class TestRsyncAndReceive(unittest.TestCase):
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False,
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
+        # First call (rsync) fails, second call (receive) not reached
         mock_run.side_effect = [
-            subprocess.CompletedProcess(args=["ssh"], returncode=1, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["rsync"], returncode=1, stdout="", stderr="connection refused"),
         ]
 
@@ -881,8 +886,8 @@ class TestRsyncAndReceive(unittest.TestCase):
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False,
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
+        # First call (rsync) succeeds, second call (receive) fails
         mock_run.side_effect = [
-            subprocess.CompletedProcess(args=["ssh"], returncode=1, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="no space left"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
@@ -902,7 +907,6 @@ class TestRsyncAndReceive(unittest.TestCase):
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
         mock_run.side_effect = [
-            subprocess.CompletedProcess(args=["ssh"], returncode=1, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="subvolume already exists"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),

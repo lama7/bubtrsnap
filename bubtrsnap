@@ -1595,26 +1595,10 @@ def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
     # Overall timing for the complete rsync + SSH receive sequence
     seq_start = datetime.now()
 
-    # --- Check for interrupted transfer ---
-    # If a partial-dir exists on the remote, a previous rsync was interrupted.
-    # We log this and proceed — rsync with --partial-dir will resume automatically.
-    check_partial_cmd = ["ssh", remote, "test", "-d", remote_partial_dir]
-    if cfg.get("local_sudo"):
-        check_partial_cmd = ["sudo", "-n"] + check_partial_cmd
-
-    partial_result = run(check_partial_cmd,
-                         dry_run=cfg.get("dry_run", False),
-                         verbosity=cfg["verbose"],
-                         capture_output=True, text=True, check=False)
-
-    interrupted = False
-    if partial_result is not None and partial_result.returncode == 0:
-        interrupted = True
-        log(f"Detected interrupted rsync transfer (partial-dir exists on remote)", 1, cfg["verbose"])
-    elif partial_result is not None:
-        log(f"No interrupted rsync transfer detected", 3, cfg["verbose"])
-
-    log(f"Copying stream to remote via rsync{' (resuming interrupted transfer)' if interrupted else ''}...", 1, cfg["verbose"])
+    # rsync with --partial-dir will resume any interrupted transfer automatically
+    # (the partial-dir check is done earlier in process_archive via
+    # _check_interrupted_rsync, before the stream file is created/reused)
+    log("Copying stream to remote via rsync...", 1, cfg["verbose"])
 
     # Execute rsync
     rsync_start = datetime.now()
