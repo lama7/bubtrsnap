@@ -1018,7 +1018,7 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
 
         with patch("bubtrsnap._validate_destinations"), \
              patch("bubtrsnap._piped_send_to_local"):
-            bs.process_archive(archive, cfg)
+            result = bs.process_archive(archive, cfg)
 
         # Snapshot should NOT be created (interrupted transfer path)
         mock_snap.assert_not_called()
@@ -1026,6 +1026,8 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_send.assert_not_called()
         # receive_stream should be called
         mock_recv.assert_called()
+        # Should return "RECOVERED" to signal reprocessing
+        self.assertEqual(result, "RECOVERED")
         # Cleanup
         stream_file.unlink(missing_ok=True)
 
@@ -1056,12 +1058,14 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
 
         with patch("bubtrsnap._validate_destinations"), \
              patch("bubtrsnap._piped_send_to_local"):
-            bs.process_archive(archive, cfg)
+            result = bs.process_archive(archive, cfg)
 
         # Snapshot SHOULD be created
         mock_snap.assert_called_once()
         # send_backup_tofile SHOULD be called (new stream created)
         mock_send.assert_called_once()
+        # Should return None (not "RECOVERED")
+        self.assertIsNone(result)
 
     @patch("builtins.print")
     @patch("bubtrsnap.run")

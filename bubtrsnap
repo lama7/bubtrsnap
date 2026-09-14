@@ -2279,7 +2279,7 @@ def _receive_and_post(received: str | None, archive: dict, name: str, snap: Path
                                  name, keep, cfg)
 
 
-def process_archive(archive: dict, cfg: dict) -> None:
+def process_archive(archive: dict, cfg: dict) -> str | None:
     """
     Normal processing for a single archive:
     pre-hook -> snapshot -> post-snapshot-hook -> backup -> post-backup-hook -> keep policy
@@ -2517,6 +2517,9 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
     apply_keep_policy(snap_dir, name, keep, cfg)
     log(f"Finished archive: {name}\n", 1, cfg["verbose"])
+    if interrupted_rsync:
+        log(f"Archive {name} recovered from interrupted rsync; will re-process for complete backup", 1, cfg["verbose"])
+        return "RECOVERED"
 
 
 def main() -> int:
@@ -2755,12 +2758,27 @@ Examples:
         return 1
 
     # Process each archive fully
+    recovered_archives = []
     for archive in archives:
         try:
-            process_archive(archive, global_cfg)
+            result = process_archive(archive, global_cfg)
+            if result == "RECOVERED":
+                recovered_archives.append(archive)
         except Exception as e:
             log(f"Error processing {archive['name']}: {e}", 1, global_cfg["verbose"])
             return 1
+
+    # Re-process archives that were recovered from interrupted rsync transfers.
+    # The first pass completed the interrupted transfer; this second pass runs
+    # the full normal flow (new snapshot, hooks, backup, keep policy).
+    if recovered_archives:
+        log(f"Re-processing {len(recovered_archives)} recovered archive(s)...", 1, global_cfg["verbose"])
+        for archive in recovered_archives:
+            try:
+                process_archive(archive, global_cfg)
+            except Exception as e:
+                log(f"Error re-processing {archive['name']}: {e}", 1, global_cfg["verbose"])
+                return 1
 
     log("All archives processed.", 1, global_cfg["verbose"])
     return 0    
