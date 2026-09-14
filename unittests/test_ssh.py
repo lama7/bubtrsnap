@@ -975,5 +975,122 @@ class TestReceiveRemoteRsyncRouting(unittest.TestCase):
         self.assertEqual(result, "test_subvol")
 
 
+class TestInterruptedRsyncResumption(unittest.TestCase):
+    """Test that process_archive handles interrupted rsync transfers correctly."""
+
+    def _make_archive(self, **overrides):
+        """Build a minimal archive dict for process_archive."""
+        return {
+            "name": "testarchive",
+            "subvolume": "/test/subvol",
+            "keep": [],
+            "export_file": "/tmp/test_stream.btrfs",
+            "remote_host": "user@host",
+            "remote_path": "/remote/backup",
+            "rsync": True,
+            **overrides,
+        }
+
+    @patch("bubtrsnap.apply_keep_policy")
+    @patch("bubtrsnap._receive_and_post")
+    @patch("bubtrsnap.receive_stream")
+    @patch("bubtrsnap._check_interrupted_rsync")
+    @patch("bubtrsnap.run_hook")
+    @patch("bubtrsnap.create_snapshot")
+    @patch("bubtrsnap.chk_btrfs_subvolume")
+    @patch("bubtrsnap.send_backup_tofile")
+    def test_resumes_interrupted_rsync_no_new_snapshot(
+        self, mock_send, mock_chk, mock_snap, mock_hook, mock_check, mock_recv, mock_post, mock_keep
+    ):
+        """When interrupted rsync is detected with existing stream file,
+        process_archive should skip snapshot creation and reuse the stream."""
+        mock_check.return_value = True
+        mock_recv.return_value = "testarchive"
+        stream_file = Path("/tmp/test_stream.btrfs")
+        stream_file.touch()
+
+        cfg = {
+            "verbose": 0, "dry_run": True,
+            "snapshot_dir": "/tmp/snapshots",
+            "local_sudo": False, "remote_sudo": False,
+        }
+        archive = self._make_archive()
+
+        with patch("bubtrsnap._validate_destinations"), \
+             patch("bubtrsnap._piped_send_to_local"):
+            bs.process_archive(archive, cfg)
+
+        # Snapshot should NOT be created (interrupted transfer path)
+        mock_snap.assert_not_called()
+        # send_backup_tofile should NOT be called (stream file already exists)
+        mock_send.assert_not_called()
+        # receive_stream should be called
+        mock_recv.assert_called()
+        # Cleanup
+        stream_file.unlink(missing_ok=True)
+
+    @patch("bubtrsnap.apply_keep_policy")
+    @patch("bubtrsnap._receive_and_post")
+    @patch("bubtrsnap.receive_stream")
+    @patch("bubtrsnap._check_interrupted_rsync")
+    @patch("bubtrsnap.run_hook")
+    @patch("bubtrsnap.create_snapshot")
+    @patch("bubtrsnap.chk_btrfs_subvolume")
+    @patch("bubtrsnap.send_backup_tofile")
+    def test_no_interrupted_rsync_creates_new_snapshot(
+        self, mock_send, mock_chk, mock_snap, mock_hook, mock_check, mock_recv, mock_post, mock_keep
+    ):
+        """When no interrupted rsync is detected, normal snapshot creation proceeds."""
+        mock_check.return_value = False
+        mock_snap.return_value = MagicMock(name="testarchive.202601011200")
+        mock_snap.return_value.name = "testarchive.202601011200"
+        mock_snap.return_value.is_file.return_value = False
+        mock_recv.return_value = "testarchive"
+
+        cfg = {
+            "verbose": 0, "dry_run": True,
+            "snapshot_dir": "/tmp/snapshots",
+            "local_sudo": False, "remote_sudo": False,
+        }
+        archive = self._make_archive()
+
+        with patch("bubtrsnap._validate_destinations"), \
+             patch("bubtrsnap._piped_send_to_local"):
+            bs.process_archive(archive, cfg)
+
+        # Snapshot SHOULD be created
+        mock_snap.assert_called_once()
+        # send_backup_tofile SHOULD be called (new stream created)
+        mock_send.assert_called_once()
+
+    @patch("builtins.print")
+    @patch("bubtrsnap.run")
+    def test_check_interrupted_rsync_detects_partial_dir(self, mock_run, mock_print):
+        """_check_interrupted_rsync returns True when partial-dir exists on remote."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        cfg = {"verbose": 0, "dry_run": False, "local_sudo": False}
+        result = bs._check_interrupted_rsync("user@host", cfg)
+        self.assertTrue(result)
+
+    @patch("bubtrsnap.run")
+    def test_check_interrupted_rsync_no_partial_dir(self, mock_run):
+        """_check_interrupted_rsync returns False when partial-dir does not exist."""
+        mock_run.return_value = MagicMock(returncode=1)
+
+        cfg = {"verbose": 0, "dry_run": False, "local_sudo": False}
+        result = bs._check_interrupted_rsync("user@host", cfg)
+        self.assertFalse(result)
+
+    @patch("bubtrsnap.run")
+    def test_check_interrupted_rsync_dry_run(self, mock_run):
+        """_check_interrupted_rsync returns False in dry-run (no returncode to check)."""
+        mock_run.return_value = None
+
+        cfg = {"verbose": 2, "dry_run": True, "local_sudo": False}
+        result = bs._check_interrupted_rsync("user@host", cfg)
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()

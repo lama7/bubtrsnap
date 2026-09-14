@@ -1538,6 +1538,25 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
     return subvol_name
 
+def _check_interrupted_rsync(remote: str, cfg: dict) -> bool:
+    """
+    Check if a previous rsync transfer was interrupted by looking for
+    the --partial-dir on the remote.
+    """
+    remote_partial_dir = "/tmp/.bubtrsnap-partial"
+    check_cmd = ["ssh", remote, "test", "-d", remote_partial_dir]
+    if cfg.get("local_sudo"):
+        check_cmd = ["sudo", "-n"] + check_cmd
+
+    result = run(check_cmd,
+                  dry_run=cfg.get("dry_run", False),
+                  verbosity=cfg["verbose"],
+                  capture_output=True, text=True, check=False)
+
+    if result is not None and result.returncode == 0:
+        return True
+    return False
+
 
 def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
                        remote_sudo: bool = False, rsync_opts: str | None = None) -> str | None:
@@ -2348,6 +2367,25 @@ def process_archive(archive: dict, cfg: dict) -> None:
         print("Error: snapshot_dir is required for snapshot/send operations",
               file=sys.stderr)
         sys.exit(1)
+
+    # Check for interrupted rsync transfer before taking a snapshot
+    # so we can reuse the existing stream file instead of creating a new one
+    interrupted_rsync = False
+    interrupted_stream: Path | None = None
+    if use_rsync and remote and remote_dir:
+        interrupted_rsync = _check_interrupted_rsync(remote, cfg)
+        if interrupted_rsync:
+            # Determine which stream file was being transferred
+            if send_file:
+                interrupted_stream = Path(send_file)
+            elif send_dir:
+                interrupted_stream = find_newest_stream_for_archive(Path(send_dir), name, cfg)
+            if interrupted_stream and interrupted_stream.is_file():
+                log(f"Found interrupted rsync transfer with stream file: {interrupted_stream}", 1, cfg["verbose"])
+            else:
+                log(f"Partial-dir found but no matching stream file; proceeding with new transfer", 1, cfg["verbose"])
+                interrupted_rsync = False
+
     chk_btrfs_subvolume(Path(subvol), cfg)
     chk_btrfs_subvolume(snap_dir, cfg)
 
@@ -2359,7 +2397,13 @@ def process_archive(archive: dict, cfg: dict) -> None:
     }, cfg)
 
     log("Creating snapshot...", 1, cfg["verbose"])
-    snap = create_snapshot(name, subvol, snap_dir, cfg)
+    if interrupted_rsync and interrupted_stream and interrupted_stream.is_file():
+        log(f"Resuming interrupted rsync transfer (stream file already exists)", 1, cfg["verbose"])
+        snap = interrupted_stream  # use the existing stream file as 'snap' placeholder
+        post_hook_snap_name = interrupted_stream.stem
+    else:
+        snap = create_snapshot(name, subvol, snap_dir, cfg)
+        post_hook_snap_name = snap.name
 
     log("Running post-snapshot hook...", 1, cfg["verbose"])
     run_hook(archive.get("post_snapshot_hook"), {
@@ -2374,7 +2418,8 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
     if send_file:
         stream_path = Path(send_file)
-        send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+        if not interrupted_rsync:
+            send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
         # When export_file is set with a local backup_dir and no import_file,
         # also do a normal piped send|receive to the local backup_dir (in
         # addition to any file-based remote transfer).
@@ -2383,15 +2428,19 @@ def process_archive(archive: dict, cfg: dict) -> None:
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif send_dir:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
-        stream_path = Path(send_dir) / f"{snap.name}.btrfs"
-        send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+        stream_path = Path(send_dir) / f"{post_hook_snap_name}.btrfs"
+        if not interrupted_rsync:
+            send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
         log("Starting backup...", 1, cfg["verbose"])
         _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
 
         if (send_file or send_dir) and remote and remote_dir:
-            dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+            if not interrupted_rsync:
+                dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+            else:
+                dest = stream_path
         else:
             dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
 
