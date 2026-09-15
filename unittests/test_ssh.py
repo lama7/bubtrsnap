@@ -1091,13 +1091,27 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         self.assertFalse(result)
 
     @patch("bubtrsnap.run")
-    def test_check_interrupted_rsync_dry_run(self, mock_run):
-        """_check_interrupted_rsync returns False in dry-run (no returncode to check)."""
-        mock_run.return_value = None
+    def test_check_interrupted_rsync_dry_run_executes(self, mock_run):
+        """_check_interrupted_rsync always executes the SSH check (dry_run=False),
+        even when cfg dry_run is True, so dry-run previews detect interruptions."""
+        mock_run.return_value = MagicMock(returncode=1)
 
         cfg = {"verbose": 2, "dry_run": True, "local_sudo": False}
         result = bs._check_interrupted_rsync("user@host", cfg)
         self.assertFalse(result)
+        # Verify run() was called with dry_run=False (always execute, not cfg dry_run)
+        call_kwargs = mock_run.call_args.kwargs
+        self.assertFalse(call_kwargs.get("dry_run", False))
+
+    @patch("bubtrsnap.run")
+    def test_check_interrupted_rsync_dry_run_detects_partial(self, mock_run):
+        """In dry-run, _check_interrupted_rsync should still detect a
+        partial-dir on the remote (dry_run=False forces execution)."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        cfg = {"verbose": 2, "dry_run": True, "local_sudo": False}
+        result = bs._check_interrupted_rsync("user@host", cfg)
+        self.assertTrue(result)
 
 
 if __name__ == "__main__":

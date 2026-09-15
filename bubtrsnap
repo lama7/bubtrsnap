@@ -1549,7 +1549,7 @@ def _check_interrupted_rsync(remote: str, cfg: dict) -> bool:
         check_cmd = ["sudo", "-n"] + check_cmd
 
     result = run(check_cmd,
-                  dry_run=cfg.get("dry_run", False),
+                  dry_run=False,  # always execute — read-only check, should run even during dry-run
                   verbosity=cfg["verbose"],
                   capture_output=True, text=True, check=False)
 
