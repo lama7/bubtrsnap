@@ -1043,6 +1043,51 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
     @patch("bubtrsnap.create_snapshot")
     @patch("bubtrsnap.chk_btrfs_subvolume")
     @patch("bubtrsnap.send_backup_tofile")
+    def test_interrupted_rsync_with_backup_dir_skips_piped_send(
+        self, mock_send, mock_chk, mock_snap, mock_hook, mock_check, mock_recv, mock_post, mock_keep
+    ):
+        """When interrupted rsync is detected with backup_dir set,
+        _piped_send_to_local should NOT be called — snap is a stream file
+        (not a subvolume), and the local backup was already completed in
+        the previous run. Only the SSH rsync resume + receive should occur."""
+        mock_check.return_value = True
+        mock_recv.return_value = "testarchive"
+        stream_file = Path("/tmp/test_stream.btrfs")
+        stream_file.touch()
+
+        cfg = {
+            "verbose": 0, "dry_run": True,
+            "snapshot_dir": "/tmp/snapshots",
+            "local_sudo": False, "remote_sudo": False,
+        }
+        archive = self._make_archive(backup_dir="/tmp/backup")
+
+        with patch("bubtrsnap._validate_destinations"), \
+             patch("bubtrsnap._piped_send_to_local") as mock_piped:
+            result = bs.process_archive(archive, cfg)
+
+        # Snapshot should NOT be created (interrupted transfer path)
+        mock_snap.assert_not_called()
+        # send_backup_tofile should NOT be called (stream file already exists)
+        mock_send.assert_not_called()
+        # _piped_send_to_local should NOT be called (snap is a stream file,
+        # not a subvolume — local backup was already done in the previous run)
+        mock_piped.assert_not_called()
+        # receive_stream should be called (for SSH rsync resume + receive)
+        mock_recv.assert_called()
+        # Should return "RECOVERED" to signal reprocessing
+        self.assertEqual(result, "RECOVERED")
+        # Cleanup
+        stream_file.unlink(missing_ok=True)
+
+    @patch("bubtrsnap.apply_keep_policy")
+    @patch("bubtrsnap._receive_and_post")
+    @patch("bubtrsnap.receive_stream")
+    @patch("bubtrsnap._check_interrupted_rsync")
+    @patch("bubtrsnap.run_hook")
+    @patch("bubtrsnap.create_snapshot")
+    @patch("bubtrsnap.chk_btrfs_subvolume")
+    @patch("bubtrsnap.send_backup_tofile")
     def test_no_interrupted_rsync_creates_new_snapshot(
         self, mock_send, mock_chk, mock_snap, mock_hook, mock_check, mock_recv, mock_post, mock_keep
     ):

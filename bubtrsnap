@@ -2427,7 +2427,8 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         # also do a normal piped send|receive to the local backup_dir (in
         # addition to any file-based remote transfer).
         if backup_dir and not recv_file:
-            _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
+            if not interrupted_rsync:
+                _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif send_dir:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
