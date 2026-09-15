@@ -1067,6 +1067,8 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_send.assert_not_called()
         # receive_stream should be called
         mock_recv.assert_called()
+        # pre/post-snapshot hooks should NOT be called (no snapshot created)
+        mock_hook.assert_not_called()
         # Should return "RECOVERED" to signal reprocessing
         self.assertEqual(result, "RECOVERED")
         # Cleanup
@@ -1110,6 +1112,8 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         # _piped_send_to_local should NOT be called (snap is a stream file,
         # not a subvolume — local backup was already done in the previous run)
         mock_piped.assert_not_called()
+        # pre/post-snapshot hooks should NOT be called (no snapshot created)
+        mock_hook.assert_not_called()
         # receive_stream should be called (for SSH rsync resume + receive)
         mock_recv.assert_called()
         # Should return "RECOVERED" to signal reprocessing
@@ -1150,6 +1154,8 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_snap.assert_called_once()
         # send_backup_tofile SHOULD be called (new stream created)
         mock_send.assert_called_once()
+        # pre/post-snapshot hooks SHOULD be called (snapshot was created)
+        mock_hook.assert_called()
         # Should return None (not "RECOVERED")
         self.assertIsNone(result)
 

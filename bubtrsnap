@@ -2391,28 +2391,28 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     chk_btrfs_subvolume(Path(subvol), cfg)
     chk_btrfs_subvolume(snap_dir, cfg)
 
-    log("Running pre-snapshot hook...", 1, cfg["verbose"])
-    run_hook(archive.get("pre_snapshot_hook"), {
-        "archive": name, "subvol": subvol, "timestamp": timestamp(),
-        "snapshotdir": str(snap_dir),
-        "backupdir": str(backup_dir) if backup_dir else "",
-    }, cfg)
-
-    log("Creating snapshot...", 1, cfg["verbose"])
     if interrupted_rsync and interrupted_stream and interrupted_stream.is_file():
         log(f"Resuming interrupted rsync transfer (stream file already exists)", 1, cfg["verbose"])
         snap = interrupted_stream  # use the existing stream file as 'snap' placeholder
         post_hook_snap_name = interrupted_stream.stem
     else:
+        log("Running pre-snapshot hook...", 1, cfg["verbose"])
+        run_hook(archive.get("pre_snapshot_hook"), {
+            "archive": name, "subvol": subvol, "timestamp": timestamp(),
+            "snapshotdir": str(snap_dir),
+            "backupdir": str(backup_dir) if backup_dir else "",
+        }, cfg)
+
+        log("Creating snapshot...", 1, cfg["verbose"])
         snap = create_snapshot(name, subvol, snap_dir, cfg)
         post_hook_snap_name = snap.name
 
-    log("Running post-snapshot hook...", 1, cfg["verbose"])
-    run_hook(archive.get("post_snapshot_hook"), {
-        "snapshot": str(snap), "archive": name, "timestamp": timestamp(),
-        "snapshotdir": str(snap_dir),
-        "backupdir": str(backup_dir) if backup_dir else "",
-    }, cfg)
+        log("Running post-snapshot hook...", 1, cfg["verbose"])
+        run_hook(archive.get("post_snapshot_hook"), {
+            "snapshot": str(snap), "archive": name, "timestamp": timestamp(),
+            "snapshotdir": str(snap_dir),
+            "backupdir": str(backup_dir) if backup_dir else "",
+        }, cfg)
 
     stream_path: Path | None = None
     dest: Path | None = None
