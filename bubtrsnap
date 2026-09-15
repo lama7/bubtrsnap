@@ -2375,6 +2375,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     interrupted_rsync = False
     interrupted_stream: Path | None = None
     if use_rsync and remote and remote_dir:
+        log(f"Checking for interrupted rsync transfer to {remote}...", 1, cfg["verbose"])
         interrupted_rsync = _check_interrupted_rsync(remote, cfg)
         if interrupted_rsync:
             # Determine which stream file was being transferred
