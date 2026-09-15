@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+VERSION = "0.1.0"
+
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -2544,7 +2546,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
 def main() -> int:
 
     parser = argparse.ArgumentParser(
-        description="btrfs snapshot & backup tool",
+        description=f"bubtrsnap v{VERSION} — btrfs snapshot & backup tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2553,6 +2555,12 @@ Examples:
   bubtrsnap -v --snaps-only root=/
   bubtrsnap --export-file /dirfor/streamdata/file/ maildir=/home/user/Maildir
         """
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"bubtrsnap {VERSION}",
     )
 
     # Global options
