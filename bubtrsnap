@@ -1915,11 +1915,12 @@ def _get_keeps(
     keep_cnt = 0
     oldest_keep = None
     while i >= 0:
-        keep_tbl[timestamps[i]] = interval_label
-        oldest_keep = timestamps[i]
-        keep_cnt += 1
-        if keep_cnt == max_keeps:
-            return oldest_keep
+        if timestamps[i] not in keep_tbl:
+            keep_tbl[timestamps[i]] = interval_label
+            oldest_keep = timestamps[i]
+            keep_cnt += 1
+            if keep_cnt == max_keeps:
+                return oldest_keep
         tsref = interval_f(timestamps[i], 1)
         i -= 1
         while i >= 0 and timestamps[i] > tsref:
@@ -2028,6 +2029,7 @@ def build_keep_set(ts_list: list[str], keep: dict, week_start_day: int = 6) -> d
                 continue
             n = count - 1
 
+        _prev_oldest = oldest_keep
         oldest_keep = _get_keeps(
             ts_list,
             keeps,
@@ -2036,6 +2038,22 @@ def build_keep_set(ts_list: list[str], keep: dict, week_start_day: int = 6) -> d
             label,
             step_fn,
         )
+        # Boundary fallback for w/m/y: when old (oldest keep of prior
+        # interval) is on the interval boundary day (week-end / month-end
+        # / year-end), the start_fn _prev_X(_prev_day(old,1),0,...) overshoots
+        # to the PREVIOUS boundary, skipping archives in the same period.
+        # Retry with _prev_day(old, 1) — the day before the oldest keep —
+        # which lets _get_keeps find the archive that crosses into the
+        # prior boundary period.
+        if oldest_keep is None and label in ("w", "m", "y") and _prev_oldest is not None:
+            oldest_keep = _get_keeps(
+                ts_list,
+                keeps,
+                n,
+                _prev_day(_prev_oldest, 1),
+                label,
+                step_fn,
+            )
         prior_total += count
 
     return keeps
