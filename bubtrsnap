@@ -1420,9 +1420,8 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     has_local = backup_dir is not None
     has_remote = remote and remote_dir
 
-    if not has_local and not has_remote:
-        log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
-        return stream_file
+    # When only stream_file is configured (export_file-only, no backup_dir
+    # or remote), create a full send stream with no parents.
 
     # Find parents for the stream file.
     # When sending to a remote destination (via SCP + receive), parents must

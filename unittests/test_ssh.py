@@ -618,6 +618,43 @@ class TestSendBackupToFile(unittest.TestCase):
         self.assertIn("-f", call_args)
 
 
+    @patch("bubtrsnap.run")
+    def test_send_backup_tofile_export_file_only_no_destinations(self, mock_run):
+        """export_file without backup_dir or remote should still create
+        the stream file (full send, no parents). Previously broken by an
+        early return that prevented stream file creation."""
+        from pathlib import Path
+        import subprocess
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["btrfs", "send", "-f", "/tmp/export.btrfs", "..."],
+            returncode=0, stdout=b"", stderr=b""
+        )
+
+        snap = Path("/snapshots/lama7.202608280230")
+        snap_dir = Path("/snapshots")
+        backup_dir = None  # no backup_dir, no remote
+        stream_file = Path("/tmp/export.btrfs")
+        cfg = {"local_sudo": False, "verbose": 1, "dry_run": False}
+        archive_cfg = {}  # no remote, no stage_file, no export_dir
+
+        with patch.object(bs, "find_parents", return_value=[]):
+            result = bs.send_backup_tofile(
+                snap, snap_dir, backup_dir, stream_file, cfg, "lama7", archive_cfg
+            )
+
+        # Should return the stream_file path
+        self.assertEqual(result, stream_file)
+        # Verify run() was called with the send command (not skipped)
+        self.assertTrue(mock_run.called)
+        call_args = mock_run.call_args[0][0]
+        self.assertIn("-f", call_args)
+        self.assertIn(str(stream_file), call_args)
+        # Should be a full send (no parent refs)
+        self.assertNotIn("-p", call_args)
+        self.assertNotIn("-c", call_args)
+
+
 class TestRsyncConfigPrecedence(unittest.TestCase):
     """Test CLI > archive > global precedence for rsync options."""
 
