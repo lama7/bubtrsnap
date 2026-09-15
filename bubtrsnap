@@ -1091,6 +1091,12 @@ def btrfs_cmd(cfg: dict, *args: str, sudo: bool | None = None) -> list[str]:
 
 # makes sure the dir is a subvolume, errors out if not
 def chk_btrfs_subvolume(dir: Path, cfg: dict):
+    # Cache: avoid redundant btrfs subvolume show for the same path across
+    # multiple archives in a single run (e.g. shared snapshot_dir/backup_dir).
+    cache_key = f"local:{dir}"
+    validated = cfg.setdefault("_validated_paths", set())
+    if cache_key in validated:
+        return
     try:
         run(btrfs_cmd(cfg, "subvolume", "show", str(dir)),
             dry_run=False,
@@ -1099,7 +1105,8 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
             stderr=subprocess.DEVNULL,
             check=True)
         log(f"\t{dir} is a valid btrfs subvolume", 2, cfg["verbose"])
-                                   
+        validated.add(cache_key)
+
     except subprocess.CalledProcessError:
         print(f"Error: '{dir}' is not a btrfs subvolume "
         f"(required for snapshot/backup/receive operations)", file=sys.stderr)
@@ -1107,6 +1114,12 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
 
 def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False):
     """Check if a remote directory is a btrfs subvolume via SSH."""
+    # Cache: avoid redundant SSH round-trips for the same remote path across
+    # multiple archives in a single run.
+    cache_key = f"ssh:{remote}:{remote_dir}"
+    validated = cfg.setdefault("_validated_paths", set())
+    if cache_key in validated:
+        return
     # Build SSH command: ssh remote sudo -n btrfs subvolume show remote_dir
     sudo_prefix = ["sudo", "-n"] if remote_sudo else []
     ssh_cmd = ["ssh", remote] + sudo_prefix + ["btrfs", "subvolume", "show", remote_dir]
@@ -1118,6 +1131,7 @@ def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict, remote_sudo
                      verbosity=cfg["verbose"],
                      check=True, capture_output=True, text=True, timeout=30)
         log(f"\t{remote}:{remote_dir} is a valid btrfs subvolume", 2, cfg["verbose"])
+        validated.add(cache_key)
     except subprocess.CalledProcessError as e:
         print(f"Error: '{remote}:{remote_dir}' is not a btrfs subvolume "
               f"(required for snapshot/backup/receive operations)", file=sys.stderr)
@@ -2326,13 +2340,21 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     remote_dir = archive.get("remote_path")
     staged = bool(archive.get("stage_file") or stage_dir)
 
+    # Validate all archive paths early — fail fast before any mutation.
+    # Caching inside chk_btrfs_subvolume/chk_btrfs_subvolume_ssh avoids
+    # redundant validation when the same path is checked across archives
+    # (e.g. a shared snapshot_dir or backup_dir).
+    chk_btrfs_subvolume(Path(subvol), cfg)
+    if snap_dir:
+        chk_btrfs_subvolume(snap_dir, cfg)
+    _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
+
     # ---- receive-only (file) ----
     if recv_file and not send_file:
         if not backup_dir and not (remote and remote_dir):
             print(f"Error: archive '{name}' import_file requires backup_dir or remote_dir (with remote)",
                   file=sys.stderr)
             sys.exit(1)
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
         p = Path(recv_file)
         if not p.is_file() or not is_btrfs_stream(p, cfg):
             print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
@@ -2349,7 +2371,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         if not backup_dir and not (remote and remote_dir):
             print("Error: import_dir requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
         stream = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
         if not stream:
             log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
@@ -2387,9 +2408,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
             else:
                 log(f"Partial-dir found but no matching stream file; proceeding with new transfer", 1, cfg["verbose"])
                 interrupted_rsync = False
-
-    chk_btrfs_subvolume(Path(subvol), cfg)
-    chk_btrfs_subvolume(snap_dir, cfg)
 
     if interrupted_rsync and interrupted_stream and interrupted_stream.is_file():
         log(f"Resuming interrupted rsync transfer (stream file already exists)", 1, cfg["verbose"])
@@ -2437,7 +2455,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
         log("Starting backup...", 1, cfg["verbose"])
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
 
         if (send_file or send_dir) and remote and remote_dir:
             if not interrupted_rsync:
@@ -2477,7 +2494,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         if not backup_dir and not (remote and remote_dir):
             print("Error: receive requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
 
         if staged:
             recv_path = stream_path

@@ -1202,5 +1202,165 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         self.assertTrue(result)
 
 
+class TestValidationCache(unittest.TestCase):
+    """Test that btrfs subvolume validation results are cached across
+    archives sharing the same paths within a single bubtrsnap run."""
+
+    @patch("bubtrsnap.run")
+    def test_chk_btrfs_subvolume_caches_result(self, mock_run):
+        """Second call with same path skips run() (cache hit)."""
+        mock_run.return_value = MagicMock(returncode=0)
+        cfg = {"verbose": 0}
+
+        bs.chk_btrfs_subvolume(Path("/pool/snapshots"), cfg)
+        bs.chk_btrfs_subvolume(Path("/pool/snapshots"), cfg)
+
+        self.assertEqual(mock_run.call_count, 1)
+
+    @patch("bubtrsnap.run")
+    def test_chk_btrfs_subvolume_different_paths_not_cached(self, mock_run):
+        """Different paths are each validated independently."""
+        mock_run.return_value = MagicMock(returncode=0)
+        cfg = {"verbose": 0}
+
+        bs.chk_btrfs_subvolume(Path("/pool/snapshots"), cfg)
+        bs.chk_btrfs_subvolume(Path("/pool/backup"), cfg)
+
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("bubtrsnap.run")
+    def test_chk_btrfs_subvolume_cache_populated_in_cfg(self, mock_run):
+        """Cache key is stored in cfg after successful validation."""
+        mock_run.return_value = MagicMock(returncode=0)
+        cfg = {"verbose": 0}
+
+        bs.chk_btrfs_subvolume(Path("/pool/snapshots"), cfg)
+
+        self.assertIn("local:/pool/snapshots", cfg["_validated_paths"])
+
+    @patch("bubtrsnap.run")
+    def test_chk_btrfs_subvolume_ssh_caches_result(self, mock_run):
+        """Second call with same remote+path skips run() (cache hit)."""
+        mock_result = MagicMock(returncode=0)
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+        cfg = {"verbose": 0}
+
+        bs.chk_btrfs_subvolume_ssh("user@host", "/remote/backup", cfg)
+        bs.chk_btrfs_subvolume_ssh("user@host", "/remote/backup", cfg)
+
+        self.assertEqual(mock_run.call_count, 1)
+
+    @patch("bubtrsnap.run")
+    def test_chk_btrfs_subvolume_ssh_different_targets_not_cached(self, mock_run):
+        """Different remotes are each validated independently."""
+        mock_result = MagicMock(returncode=0)
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+        cfg = {"verbose": 0}
+
+        bs.chk_btrfs_subvolume_ssh("user@host", "/remote/backup", cfg)
+        bs.chk_btrfs_subvolume_ssh("user@other", "/remote/backup", cfg)
+
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("bubtrsnap.apply_keep_policy")
+    @patch("bubtrsnap.run")
+    @patch("bubtrsnap.create_snapshot")
+    @patch("bubtrsnap.send_backup_tofile")
+    @patch("bubtrsnap._piped_send_to_local")
+    @patch("bubtrsnap.receive_stream")
+    @patch("bubtrsnap._receive_and_post")
+    @patch("bubtrsnap.find_parents")
+    @patch("bubtrsnap.run_hook")
+    def test_validation_cached_across_process_archive_calls(
+        self, mock_hook, mock_find_parents, mock_post, mock_recv,
+        mock_piped, mock_send, mock_snap, mock_run, mock_keep
+    ):
+        """Two archives sharing the same snapshot_dir/backup_dir only
+        validate each path once — second process_archive call hits cache."""
+        mock_find_parents.return_value = []
+        mock_send.return_value = Path("/tmp/stream.btrfs")
+        mock_snap.return_value = MagicMock(name="testarchive.202601011200")
+        mock_snap.return_value.name = "testarchive.202601011200"
+        mock_snap.return_value.is_file.return_value = False
+        mock_recv.return_value = "received"
+        mock_keep.return_value = None
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        cfg = {
+            "verbose": 0, "dry_run": True,
+            "snapshot_dir": "/tmp/snapshots",
+            "backup_dir": "/tmp/backup",
+            "local_sudo": False, "remote_sudo": False,
+        }
+
+        archive = {
+            "name": "testarchive",
+            "subvolume": "/test/subvol",
+            "keep": [],
+        }
+
+        # First call — validation executes for subvol, snap_dir, backup_dir
+        mock_run.reset_mock()
+        bs.process_archive(archive, cfg)
+        first_run_calls = mock_run.call_count
+
+        # Second call — same paths, validation skipped via cache
+        mock_run.reset_mock()
+        bs.process_archive(archive, cfg)
+        second_run_calls = mock_run.call_count
+
+        # First call should have validation run() calls
+        self.assertGreater(first_run_calls, 0)
+        # Second call should have zero run() calls (all validation cached)
+        self.assertEqual(second_run_calls, 0)
+
+    @patch("bubtrsnap.apply_keep_policy")
+    @patch("bubtrsnap.run")
+    @patch("bubtrsnap.create_snapshot")
+    @patch("bubtrsnap.send_backup_tofile")
+    @patch("bubtrsnap._piped_send_to_local")
+    @patch("bubtrsnap.receive_stream")
+    @patch("bubtrsnap._receive_and_post")
+    @patch("bubtrsnap.find_parents")
+    @patch("bubtrsnap.run_hook")
+    def test_validation_cache_skips_invalid_path_logging(
+        self, mock_hook, mock_find_parents, mock_post, mock_recv,
+        mock_piped, mock_send, mock_snap, mock_run, mock_keep
+    ):
+        """Cache hits do not produce the 'is a valid btrfs subvolume' log."""
+        mock_find_parents.return_value = []
+        mock_send.return_value = Path("/tmp/stream.btrfs")
+        mock_snap.return_value = MagicMock(name="testarchive.202601011200")
+        mock_snap.return_value.name = "testarchive.202601011200"
+        mock_snap.return_value.is_file.return_value = False
+        mock_recv.return_value = "received"
+        mock_keep.return_value = None
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        cfg = {
+            "verbose": 2, "dry_run": True,
+            "snapshot_dir": "/tmp/snapshots",
+            "backup_dir": "/tmp/backup",
+            "local_sudo": False, "remote_sudo": False,
+        }
+
+        archive = {
+            "name": "testarchive",
+            "subvolume": "/test/subvol",
+            "keep": [],
+        }
+
+        # First call
+        bs.process_archive(archive, cfg)
+        self.assertEqual(mock_run.call_count, 3)  # subvol, snap_dir, backup_dir
+
+        # Second call — cached, no run() calls
+        mock_run.reset_mock()
+        bs.process_archive(archive, cfg)
+        self.assertEqual(mock_run.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
