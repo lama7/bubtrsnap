@@ -18,9 +18,9 @@ echo "Mounting btrfs..."
 mount -o loop /btrfs_pool/btrfs.img /btrfs_mount
 
 # Create subvolumes
-mkdir -p /btrfs_mount/snapshots
-mkdir -p /btrfs_mount/backups
-mkdir -p /btrfs_mount/streams
+sudo btrfs subvolume create /btrfs_mount/snapshots
+sudo btrfs subvolume create /btrfs_mount/backups
+sudo btrfs subvolume create /btrfs_mount/streams
 
 # Keep container running
 echo "SSH daemon started on port 22"
