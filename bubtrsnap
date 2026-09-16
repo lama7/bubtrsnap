@@ -144,6 +144,23 @@ def _filter_rsync_opts(user_opts: str | None) -> list[str]:
     return filtered
 
 
+def _quote_for_display(s: str) -> str:
+    """Quote a string for shell display, using double quotes for args with spaces.
+
+    Unlike shlex.quote (which defaults to single quotes), this preserves the
+    double-quote style that users typically write in config files (e.g.
+    ``-e "ssh -p 2222"``).  Falls back to shlex.quote for strings that contain
+    double quotes or other shell metacharacters.
+    """
+    s = str(s)
+    if " " not in s:
+        return s
+    if '"' in s or any(c in s for c in "\\$`"):
+        import shlex
+        return shlex.quote(s)
+    return f'"{s}"'
+
+
 def log(msg: str, level: int, verbosity: int) -> None:
     """
     level 1 = flow / progress
@@ -178,7 +195,7 @@ def run(cmd: list[str] | str,
                    Returns None so callers that check for None don't proceed
                    with write operations.
     """
-    pretty = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+    pretty = cmd if isinstance(cmd, str) else " ".join(_quote_for_display(c) for c in cmd)
 
     if dry_run:
         if read_only:
