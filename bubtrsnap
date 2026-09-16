@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -1061,6 +1062,14 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         # Validate: if remote_path is set, remote_host must also be set (from any level)
         if remote_path and not remote_host:
             print(f"Error in archive '{name}': 'remote_path' requires 'remote_host' to be set (global, per-archive, or CLI)", file=sys.stderr)
+            sys.exit(1)
+
+        # Validate external tool availability when they'll be needed.
+        if archive_rsync and remote_path and shutil.which("rsync") is None:
+            print(f"Error in archive '{name}': rsync is enabled but rsync was not found on the system PATH", file=sys.stderr)
+            sys.exit(1)
+        if remote_host and shutil.which("ssh") is None:
+            print(f"Error in archive '{name}': remote_host is set but ssh was not found on the system PATH", file=sys.stderr)
             sys.exit(1)
         
         # Resolve backup_dir with precedence: CLI > archive-specific > global
