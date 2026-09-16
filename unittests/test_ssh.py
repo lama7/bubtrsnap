@@ -61,6 +61,11 @@ def _ns(**kwargs):
 class TestSSHConfigPrecedence(unittest.TestCase):
     """Test CLI > archive > global precedence for SSH options."""
 
+    def setUp(self):
+        patcher = patch("bubtrsnap.chk_btrfs_subvolume")
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
     def test_cli_remote_overrides_archive_and_global(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -657,6 +662,11 @@ class TestSendBackupToFile(unittest.TestCase):
 
 class TestRsyncConfigPrecedence(unittest.TestCase):
     """Test CLI > archive > global precedence for rsync options."""
+
+    def setUp(self):
+        patcher = patch("bubtrsnap.chk_btrfs_subvolume")
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
     def test_cli_rsync_overrides_archive_and_global(self):
         with tempfile.TemporaryDirectory() as td:

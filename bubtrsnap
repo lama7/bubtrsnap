@@ -941,9 +941,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             sys.exit(1)
 
         subvol_path = Path(subvol)
-        if not subvol_path.exists():
-            print(f"Error: subvolume path does not exist: {subvol}", file=sys.stderr)
-            sys.exit(1)
+        chk_btrfs_subvolume(subvol_path, global_cfg)
 
         if cli_has_file_related:
             # Rule 1: CLI only — ignore all config file-related options

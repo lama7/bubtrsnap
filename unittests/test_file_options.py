@@ -8,6 +8,7 @@ import tempfile
 import textwrap
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest.mock import patch
 from pathlib import Path
 
 def _load():
@@ -184,6 +185,11 @@ class TestConfigCombinations(unittest.TestCase):
 
 class TestPrecedence(unittest.TestCase):
     """Rules: CLI wins all six; archive opts block globals; globals only if bare."""
+
+    def setUp(self):
+        patcher = patch("bubtrsnap.chk_btrfs_subvolume")
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
     def test_cli_export_dir_ignores_config_stage_dir_and_archive_file(self):
         with tempfile.TemporaryDirectory() as td:
