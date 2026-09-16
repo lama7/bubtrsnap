@@ -1099,6 +1099,7 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
     validated = cfg.setdefault("_validated_paths", set())
     if cache_key in validated:
         return
+    log(f"Checking {dir} is a valid btrfs subvolume...", 1, cfg["verbose"])
     try:
         run(btrfs_cmd(cfg, "subvolume", "show", str(dir)),
             dry_run=False,
@@ -1122,6 +1123,7 @@ def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict, remote_sudo
     validated = cfg.setdefault("_validated_paths", set())
     if cache_key in validated:
         return
+    log(f"Checking {remote}:{remote_dir} is a valid btrfs subvolume...", 1, cfg["verbose"])
     # Build SSH command: ssh remote sudo -n btrfs subvolume show remote_dir
     sudo_prefix = ["sudo", "-n"] if remote_sudo else []
     ssh_cmd = ["ssh", remote] + sudo_prefix + ["btrfs", "subvolume", "show", remote_dir]
