@@ -854,8 +854,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         if val is not None:
             cli_keeps[key] = val
 
-    # CLI keep options (--keep) - requires exactly one archive total
-    cli_keep = getattr(cli, "keep", None)
+    # CLI forced-keep options (--forced-keep) - requires exactly one archive total
+    cli_keep = getattr(cli, "forced_keep", None)
     if cli_keep:
         # Count total archives that would be processed
         cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
@@ -1097,7 +1097,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                     "post_backup_hook": raw.get("post_backup_hook"),
                     "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
                     "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
-                    "forced_keep": _merge_keep(raw.get("forced_keep"), getattr(cli, "keep", None)),
+                    "forced_keep": _merge_keep(raw.get("forced_keep"), getattr(cli, "forced_keep", None)),
                     "rsync": archive_rsync,
                     "rsync_opts": archive_rsync_opts,
                 }
@@ -2684,7 +2684,7 @@ Examples:
         help="Day that starts the week: monday..sunday (default: sunday). Affects keep policy weekly boundary.")
 
     # Per-archive forced keep
-    parser.add_argument("--keep", type=str, metavar="TIMESTAMP", action="append",
+    parser.add_argument("--forced-keep", type=str, metavar="TIMESTAMP", action="append",
         help="Force keep of a specific timestamp for the archive (format: YYYYMMDDhhmm). "
              "Can be specified multiple times. Comma-separated list also accepted. "
              "Must match an existing snapshot/backup for the archive. Archive-specific only.")

@@ -161,9 +161,6 @@ Global-only options:
 
 + `snapshot_dir`
 + `local_sudo`
-+ `snaps_only`
-+ `export_dir`
-+ `import_dir`
 + `stage_dir`
 + `verbose`
 + `dry_run`
@@ -171,6 +168,9 @@ Global-only options:
 Options that can be set globally or per-archive (archive-level overrides global):
 
 + `backup_dir`
++ `snaps_only`
++ `export_dir`
++ `import_dir`
 + `remote_host`
 + `remote_path`
 + `remote_sudo`
@@ -601,13 +601,13 @@ If no `keep_*` values are set on the CLI or in the config file (all remain
 `0`), **pruning is skipped**. Existing snapshots and backups are left as they
 are.
 
-### Forced keeps (--keep / keep)
+### Forced keeps (--forced-keep / forced_keep)
 
-The `--keep` CLI option (config: `keep`) allows forcing retention of
+The `--forced-keep` CLI option (config: `forced_keep`) allows forcing retention of
 specific timestamps that would otherwise be pruned by the keep policy.
 
-- **CLI**: `--keep TIMESTAMP` — can be specified multiple times
-- **Config**: `keep = "202601011200,202601021200"` (comma-separated list, archive section only)
+- **CLI**: `--forced-keep TIMESTAMP` — can be specified multiple times
+- **Config**: `forced_keep = "202601011200,202601021200"` (comma-separated list, archive section only)
 - **Format**: `YYYYMMDDhhmm` (12 digits)
 - **Behavior**: Forced keeps are applied **first**, then the keep policy runs on the remaining timestamps
 - **Validation**: The timestamp must exist for the archive being processed; missing timestamps log a warning and are ignored
@@ -615,17 +615,17 @@ specific timestamps that would otherwise be pruned by the keep policy.
 
 Example CLI:
 ```
-bubtrsnap --keep 202601011200 --keep 202601021200 archive1=/path/to/subvol
+bubtrsnap --forced-keep 202601011200 --forced-keep 202601021200 archive1=/path/to/subvol
 ```
 
 Example config:
 ```toml
 [archive1]
 subvolume = "/path/to/subvol"
-keep = "202601011200,202601021200"
+forced_keep = "202601011200,202601021200"
 ```
 
-**Note**: `--keep` requires exactly one archive to be processed (whether specified on CLI or from config).
+**Note**: `--forced-keep` requires exactly one archive to be processed (whether specified on CLI or from config).
 
 ### Weekly boundary
 
