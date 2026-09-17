@@ -1,1 +1,1 @@
-pandoc README.md --standalone --metadata title="bubtrsnap" -o bubtrsnap.html
+pandoc $1 --standalone --metadata title="bubtrsnap" -o bubtrsnap.html
