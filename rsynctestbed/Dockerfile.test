@@ -1,0 +1,28 @@
+FROM alpine:3.20
+
+# Packages: SSH, btrfs, rsync, sudo, python3, openssh-client (for testing)
+RUN apk add --no-cache \
+    openssh-server \
+    btrfs-progs \
+    rsync \
+    sudo \
+    python3 \
+    openssh-client \
+    && ssh-keygen -A
+
+# Create test user with passwordless sudo
+RUN adduser -D testuser && \
+    echo 'testuser:testpass' | chpasswd && \
+    echo 'testuser ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+
+# Create btrfs loopback image and mount point
+RUN mkdir -p /btrfs_pool /btrfs_mount /btrfs_pool/snapshots \
+    /btrfs_pool/backups /btrfs_pool/streams
+
+# Copy entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 22
+
+ENTRYPOINT ["/entrypoint.sh"]

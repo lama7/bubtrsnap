@@ -1,0 +1,35 @@
+# minimal test config to chk an interrupted rsync transfer
+snapshot_dir = "/pool/snapshots"
+local_sudo = true
+
+rsync = true
+
+# if your ssh isn't setup for the remote host, you can add rsync
+# specific options here to change the port, or id_file
+#rsync_opts = '-e "ssh -p 2222 -i /home/user/.ssh/private_key"'
+
+# the below works with the docker container, alternatively you can supply
+# an actual remote and path.  Keep in mind permissions when you're doing
+# all this.
+# IF you use the docker container, keep in mind the btrfs mount in there is 2Gb
+# in size which can make it the test challenging.  If you use local_sudo,
+# you'll need to setup the container with public keys for the root user from
+# the connecting machine.
+# Something like:
+#     ssh testuser@localhost "mkdir .ssh" && scp pub_key testuser@localhost:.ssh/ && cat .ssh/pub_key >> authorized_keys
+#
+# should do the trick.  Or something close anyway.
+# It doesn't hurt to setup with a local user's key as well just
+# to be able to ssh into the container and check on things.
+remote_host = "testuser@localhost"
+remote_path = "/btrfs_mount/backups"
+remote_sudo = true
+
+[ testarchive ]
+# in my own testing, the sweetspot was a subvolume that's about 1G
+# in size is large enough to let it start the rsync command, then
+# interrupt it uinsg Ctrl-C.  Then rerun bubtrsnap to complete
+# the transfer.  Use `--dry-run` to check on things beforehand.
+subvolume = "/some/subvolume"
+export_file = "/var/local/teststream.btrfs"
+

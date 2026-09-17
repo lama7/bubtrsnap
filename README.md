@@ -1,485 +1,263 @@
-bubtrsnap
-=========
+# bubtrsnap
 
-Based on my previous [btrbu][] project, bubtrsnap is a rewrite of it using
-AI to help extend it significantly from where I left the previous project.
+A btrfs snapshot and backup management tool built on btrfs-native incremental
+`send`/`receive`.  It bootstraps from nothing, uses a borg-style keep policy
+for retention, and can send backups to local paths, remote SSH hosts, or both
+in a single run.  When you need resilience across unreliable transfers, use
+`rsync` as a transport to handle partial-transfer recovery.
 
-More formally, bubtrsnap is a(nother) btrfs snapshot and backup management
-script.  Like btrbu before it, bubtrsnap will bootstrap itself if no backups
-exist and uses a keep policy similar to that of borg (ie- specifying a number
-of keeps at different time intervals).  For the simplest cases, it can be used
-straight from the command line but for more sophisticated needs it uses a TOML
-formatted configuration file with a default location in a users `~/.config/`.
+Key features:
 
-The information bubtrsnap needs is minimal- a snapshot directory, an archive
-name and a subvolume that the archive name is associated with.  If a backup is
-desired, then a backup path must also be specified.  It is a btrfs specific
-utility and takes advantage of the `send` and `receive` commands native to
-btrfs.  From a configuration file, hooks are available at different stages to
-enhance its capabilities via scripts or other command line utilities.  For
-instance, a snapshot can be taken and then a hook used to invoke a
-[borgbackup][] command using the just created snapshot as a source.
+- Incremental snapshots and backups using `btrfs send`/`receive`
+- Borg-style keep policy: hourly, daily, weekly, monthly, yearly
+- Local backups (`backup_dir`), SSH remote backups (`remote_host`/`remote_path`),
+  or both destinations in one run
+- Optional `rsync` transport with `--rsync-opts` for partial-transfer recovery
+  on interrupted sends
+- Stream files (`export_file`/`export_dir`, `import_file`/`import_dir`) for
+  large subvolumes or staged workflows
+- Pre-snapshot, post-snapshot, and post-backup hooks with substitution strings
+- Has a `--dry-run` mode that validates remote hosts and subvolumes without writing
+- Minimal dependencies: `btrfs-progs` and `python3`; no databases or state files
 
-As with btrbu, bubtrsnap remains largely dependency free.  If you have a
-working btrfs installation yuou likely have the main dependency needed,
-btrfs-progs.  It uses no data files or databases in order to perform its
-duties.  It's main dependency is a python3 installation.  For more advanced
-needs, a working SSH installation is also required, at least on the client
-side.
+Like the original [btrbu][] project it rewrites, bubtrsnap remains functionally
+simple — give it a subvolume to snapshot and a destination to back it up to, and
+it does the rest.
 
 [btrbu]: https://github.com/lama7/btrbu
 
-## Usage
+## Quick start
 
-For basic snapshot and backup needs, a command can be as simple as:
-
-    bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup archive1=/path/to/subvolume
-
-Assuming a start from nothing, this will take a snapshot of
-`/path/to/subvolume` and place it in `/pool/snapshots` with a timestamp suffix.
-So the snapshot name will be of the form `archive.YYYYMMddhhmm`.  This snapshot
-will then be used to send a full backup to `/backup`. All of these locations **must**
-be valid btrfs subvolumes.
-
-Subsequent use of this same command will result in incremental backups which
-will just advance the timestamp associated with the archive.  By default,
-previous snapshots and backups are retained so that bubtrsnap can take
-advantage of btrfs' incremental send and receive capabilities.  Each prior
-snapshot and backup becomes either a parent or source.  See [keep policy][]
-below for how to change the keep behavior.
-
-More than 1 archive can be specified on the command line:
-
-    bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup archive1=/path/to/subvolume archive2=/path/to/subvolume2
-
-These archives will share the same snapshot and backup destination, but
-obviously have different names qualified with a timestamp.  
-
-All archive related processing is completed before the next one is processed.
-Normal archive processing starts with pre-snapshot hooks followed by the
-snapshot, post-snapshot hooks, backup, post-backup hooks and then any keep
-policy is applied.
-
-For a full list of options and their explanations, `bubtrsnap --help` is
-useful.
-
-## Configuration Files
-
-At some point, if backing up several different subvolumes for instance, a
-configuration file will make the command line more manageable.  The default
-location for a configuration file to live in is `~/.config/bubtrsnap.toml`.
-Assuming that file is in place, a simple `bubtrsnap` invocaton on the CLI will
-pull everything it needs to run from that file.
-
-Alternatively, if you prefer to do things your own way:
-
-    bubtrsnap --config=/path/to/myconfig
-
-Configuration files use TOML formatting and look like, well a TOML formatted
-comfiguration file:
-
-```toml
-    # a comment... these are global options
-    snapshot_dir = "/pool/snapshots"
-    backup_dir = "/backup"
-
-    keep_daily = 5
-
-    # archives are under a header
-    [archive1]
-    subvolume = "/path/to/subvolume1"
-
-    [archive2]
-    subvolume = "/path/to/subvolume2"
-    keep_daily = 7
-    keep_monthly = 1
-
-    [archive3]
-    subvolume = "/path/to/subvolume3"
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup \
+    archive1=/path/to/subvolume
 ```
 
-If an option can be specified on the command line, it can also be specified in
-the configuration file.  CLI options map to configuration settings by
-substituting a `'_'` for any `'-'` characters in the command line option.  So
-the `--snapshot-dir` option would be specified as `snapshot_dir` in a
-configuration file.
+Assuming a clean start, this creates a read-only snapshot in `/pool/snapshots`
+and sends it to the backup location.  On subsequent runs, bubtrsnap handles
+finding parents for all additional archives so only the incremental
+information is sent. All paths **must** be valid btrfs subvolumes.
 
-Configuration files for bubtrsnap have a global section and then archive
-sections.  Global settings in a configuration file apply to all archives
-declared in the file and any archive declared on the command line.  So setting
-default `snapshot_dir` and `backup_dir` settings is a good way to go to keep
-CLI entry to a minimum.
+More than one archive can be specified:
 
-### CLI Examples with Configuration File
-
-Using the above configuration snippet as a reference, the following command is
-now possible:
-
-    bubtrsnap archive1
-
-The above command would cause only archive1 to be processed.  Normal
-configuration settings still apply, except because the CLI has highest
-precedence, bubtrsnap will only process the named archive in the command.  To
-process all archives in the configuration file:
-
-    bubtrsnap
-
-or to process 2:
-
-    bubtrsnap archive2 archive3
-
-Want to change the keep policy for all archives?
-
-    bubtrsnap keep-daily 5 keep-weekly 2
-
-Note that this policy is only used for that 1 command.  No alterations are made
-to the configuration file.  Also, any keep intervals not specified are set to 0
-so no archives will be kept at hourly, monthly or yearly intervals in the above
-example.
-
-### Archive Sections and Option Precedence
-
-Archive sections are defined by a header which names the archive and then a
-`subvolume = "/path/to/subvolume"` entry.  Within an archive section, all key
-value pairs are specific to that archive.  Options set in the archive take
-precedence over global settings.
-
-An important concept to keep in mind when using bubtrsnap is this idea of
-option precedence.  Since any option can be specified on the CLI and some can
-be set globally and per archive, there is opportunity for conflicts.  These
-conflicts are resolved by applying a precedence order.  The CLI has top
-priority as it is assumed the user knows what they want to do.  After that, any
-archive specific settings are applied, then global settings and finally,
-program default settings as appropriate.  So, referring to the configuration
-example earlier, a keep policy of 5 days is specified globally.  The policy is
-over-ridden for archive2 which uses a keep policy of 7 dailies and 1 monthly.
-See [keep policy][] below for more info on keeps.
-
-### Configuration Options
-
-Global-only options:
-
-+ `snapshot_dir`
-+ `local_sudo`
-+ `snaps_only`
-+ `export_dir`
-+ `import_dir`
-+ `stage_dir`
-+ `verbose`
-+ `dry_run`
-
-Options that can be set globally or per-archive (archive-level overrides global):
-
-+ `backup_dir`
-+ `remote_host`
-+ `remote_path`
-+ `remote_sudo`
-+ `week_startday`
-+ `keep_hourly`
-+ `keep_daily`
-+ `keep_weekly`
-+ `keep_monthly`
-+ `keep_yearly`
-
-Per-archive options (set within an `[archive_name]` section only):
-
-+ `subvolume`  # required for an archive
-+ `export_file`
-+ `import_file`
-+ `stage_file`
-+ `pre_snapshot_hook`
-+ `post_snapshot_hook`
-+ `post_backup_hook`
-+ `forced_keep`
-
-The `verbose` option has several levels for increased messaging on the CLI or
-for logging purposes if running bubtrsnap from a cron job.  By default,
-bubtrsnap is quiet and will only report errors.  Verbose 1 will report general
-flow messages.  Increasing the number will cause `btrfs` commands to be
-reported.  To be able to get the maximum information on flow and commands, use
-`debug` on the CLI.
-
-Note: while `dry_run` is a valid configuration file option, it is overridden
-on every run by the CLI value.  This means setting `dry_run = true` in a
-config file will have no effect unless `--dry-run` is also passed on the
-CLI.  To see how bubtrsnap will proceed with a configuration, always add
-`--dry-run` to the command line.
-
-[keep policy]: #keep-policy
-
-## SSH Backups
-
-If desired, bubtrsnap can send backups over SSH to a remote btrfs-capable host.
-This is useful when you want a copy of your backups on another machine without
-needing to set up a local backup directory.
-
-### Basic remote backup
-
-Specify both `--remote-host` (user@host) and `--remote-path` (target btrfs
-subvolume directory on the remote).  For example:
-
-    bubtrsnap --snapshot-dir=/pool/snapshots --remote-host user@backuphost --remote-path /btrfs/backups archive1=/path/to/subvolume
-
-This will:
-
-1. Create a read-only snapshot in `/pool/snapshots`.
-2. Send the snapshot stream to the remote host via SSH.
-3. On the remote, run `btrfs receive` into `/btrfs/backups`.
-
-The remote directory must be a btrfs subvolume.  bubtrsnap validates this
-automatically (via SSH) before attempting the receive.
-
-### When `remote_path` requires `remote_host`
-
-The options `--remote-path` (or `remote_path` in config) always requires
-`--remote-host` to also be set.  This condition can be satisfied from the CLI,
-from a per-archive config section, or from the config global section.  If
-`remote_path` is set but `remote_host` is missing, bubtrsnap will abort with an
-error.  On the other hand, the `remote_host` can be set on its own (for example
-if you only want SSH validation or hooks to target a host), but `remote_path`
-cannot stand alone.
-
-### Local and remote destinations together
-
-If you configure both `backup_dir` (local) and `remote_host`/`remote_path` (SSH),
-bubtrsnap will send the backup to **both** destinations in a single run.  Two
-sends are performed — once targeting `backup_dir` (a local path) and once targeting
-the `remote_path` via SSH — using the same snapshot as the source.  This
-functionality lets you keep a local copy and a remote copy without running
-bubtrsnap twice.
-
-Example:
-
-    bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/local/backups \
-              --remote-host user@backuphost --remote-path /btrfs/backups \
-              archive1=/path/to/subvolume
-
-Precedence still applies: CLI settings win over per-archive settings, which win
-over global settings.  If you set `--remote-host` and `--remote-path` on the CLI,
-they override any `remote_host`/`remote_path` values from the config for the archives
-being processed.
-
-### Per-archive remote settings
-
-Remote settings can be attached to an individual archive in the config file:
-
-```toml
-    snapshot_dir = "/pool/snapshots"
-
-    [archive1]
-    subvolume = "/home"
-    remote_host = "user@backuphost"
-    remote_path = "/btrfs/backups"
-    remote_sudo = true
-
-    [archive2]
-    subvolume = "/var/lib"
-    # uses global remote_host/remote_path if set, otherwise no SSH backup
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup \
+    archive1=/var/lib data2=/home/user
 ```
 
-Each archive can have its own remote host, target directory, and sudo
-preference.  Global `remote_host`/`remote_path`/`remote_sudo` values are used for any
-archive that does not override them.
+Each archive is processed fully (pre-hook -> snapshot -> post-snapshot-hook ->
+backup/send -> post-backup-hook -> keep policy) before the next begins.
 
-### Remote sudo
+## Configuration files
 
-If the remote host requires elevated privileges to run btrfs commands,
-`--remote-sudo` (or `remote_sudo` in config) will prepend `sudo -n` to the
-remote btrfs commands.  This works the same way as local `local_sudo` but
-applies to the SSH side only.  Note the user needs to have their sudo profiles
-setup for NOPASSWD in order for this to work properly.
+For anything beyond the simplest cases, a TOML configuration file keeps the
+command line manageable.  The default location is
+`~/.config/bubtrsnap.toml`:
 
-### SSH validation and parent matching
-
-Before sending, bubtrsnap validates that the remote `remote_path` is a btrfs
-subvolume (via SSH).  When determining incremental parents for an SSH backup,
-bubtrsnap lists the remote subvolumes, inspects each one's Received UUID, and
-matches them against local snapshot UUIDs — the same logic it uses for local
-backups, just executed over SSH.  This allows incremental sends to the remote
-host once a common snapshot/backup pair exists.
-
-## Stream Files: export-file/import-file
-
-It is possible to take advantage of btrfs' ability to send to or to receive from
-a file using the appropriately named `export_file` and/or `import_file`
-options.  This is to facilitate backups of very large archives where a raw
-send-receive could get interrupted due to the time it takes for the transfer.
-
-Both of these options take a file name for an argument.  In the case of
-`export_file` the file names the destination file for the stream data.  If the
-file already exists, it will be overwritten.  For `import_file` the file names the
-source for a `btrfs receive` operation and the destination will be
-`backup_dir`.  The options can be used individually or together on the CLI.
-When `export_file` is used on its own (without `backup_dir` or `remote`), no
-backup processing will be performed (no `btrfs receive`).  Processing will stop
-when post-snapshot hooks are complete. When `export_file` is combined with
-`backup_dir`, a local piped send|receive also occurs. When combined with a
-remote, the stream file is SCP'd and received on the remote (see
-[Remote receive with stream files](#remote-receive-with-stream-files)
-below).
-
-In the case of `import_file`, the snapshotting steps are skipped and
-processing **STARTS** at the backup step.  Any post-backup hooks will be
-processed as well.  In both cases, the keep policy will be applied to the
-appropriate area.  If both are used on the CLI, then processing is normal with
-the exception that the stream file is used essentially as a staging step.  When
-specifying both, the same file **MUST** be named for both options.
-
-The `import_file` (or `import_dir`) options can receive to both `backup_dir`
-and a remote host simultaneously when both destinations are configured.  The
-stream file is received locally into `backup_dir` first, then SCP'd to the
-remote and received into `remote_path`.  Keep policy is applied independently
-to each destination.
-
-An example CLI command (assuming a configuration file is set up):
-
-    bubtrsnap --import-file ~/btrfsstreams/archive.btrfs
-
-or using both:
-
-    bubtrsnap --export-file ~/btrfsstreams/archive.btrfs --import-file ~/btrfsstreams/archive.btrfs archive1
-
-Alternatively, the options can be placed in a configuration file and assigned to
-an archive like so:
-
-```toml
-    [archive1]
-    subvolume = "/home/user/"
-    export_file = "/home/user/btrfsstreams/archive1stream.btrfs"
+```bash
+bubtrsnap                     # loads ~/.config/bubtrsnap.toml
+bubtrsnap --config=/path/to/configfile.toml # or use a custom file
 ```
 
-or together:
+The configuration file format is TOML:
 
 ```toml
-    backup_dir = "/pool/backups"
-    snapshot_dir = "/snapshots"
-    local_sudo = true
+# global options
+snapshot_dir = "/pool/snapshots"
+backup_dir = "/backup"
+keep_daily = 5
 
-    [archive1]
-    subvolume = "~/another/silly/path"
-    export_file = "/home/user/btrfsstreams/archive1stream.btrfs"
-    import_file = "/home/user/btrfsstreams/archive1stream.btrfs"
+[archive1]
+subvolume = "/var/lib"
+
+[archive2]
+subvolume = "/home/user"
 ```
 
-The options are mutually exclusive with the `--snaps-only` option and when used
-on the command line, only 1 `archive=subvolume`, or alternatively the name of
-an archive section in the configuration file, may be specified.  
+CLI options map to configuration keys by replacing `-` with `_` (so
+`--snapshot-dir` becomes `snapshot_dir`).  Precedence is **CLI > archive >
+global** — the CLI always wins, then archive-specific settings, then global.
 
-## Stream Directories: export-dir/import-dir
+```bash
+bubtrsnap --keep-daily 3            # override keep policy for one run only
+bubtrsnap archive1                # process only archive1
+bubtrsnap archive2 archive3       # process multiple archives setup in a
+                                  # configuration file
+```
 
-If you wish for stream files to be used with multiple archives, then
-`export_dir` and `import_dir` are available.  These are similar to their
-file counterparts.  They are available from the CLI or a configuration file.
-They are a global only setting in a configuration file meaning that they
-will apply to **ALL** archives in the file unless overridden by an archive
-specific `*_file` option.
+## Local and remote backups
 
-From a usage standpoint, they result in generally the same processing except
-that all send and receive operations will be through stream files in the
-specified directories.  The `export_dir` will write a file with a name like
-`archivename.YYYYMMDDHHMMSS.btrfs`.  The `import_dir` will scan the
-directory for the most recent stream file that matches the current archive
-being worked on.  The received file will go into `backup_dir`.  Again, they can
-be specified individually or together.  If both are specified, the file
-resulting from the send will be used for the ensuing receive operation.  These
-options are also mutually exclusive with the `snaps-only` option.
+Backups to the local system, a DAS for example, or a remote backup host
+on the network can be coordinated as one, the other or both in a single
+run with bubtrsnap.
 
-An examples for the CLI:
+### Local backup only
 
-    bubtrsnap --export-dir ~/btrfsstreams/ archive1 archive2 archive3=/some/subvolume
+For a local only backup, specify `--backup-dir`:
 
-So archive1, archive2 and archive3 (which isn't set up in the configuration
-file) will all have stream files put into `~/btrfsstreams/` which must
-pre-exist.  
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup \
+    archive1=/path/to/subvolume
+```
 
-In a configuration file:
+This takes a snapshot of the archive's subvolume and uses it as a source for
+sending it to the backup location.
+
+### Snapshots only (`--snaps-only`)
+
+If you only want snapshots and no backups, use `--snaps-only` (config:
+`snaps_only`, also per-archive):
+
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots --snaps-only \
+    archive1=/path/to/subvolume
+```
+
+This creates the read-only snapshot and exits — no `btrfs send`/`receive` or
+keep pruning is performed.  The `--snaps-only` option is mutually exclusive
+with `--export-file`, `--import-file`, `--stage-file`, `--export-dir`,
+`--import-dir`, and `--stage-dir`, and bubtrsnap will error out if
+`--snaps-only` is set with any of them.
+
+### Local sudo (`--local-sudo`)
+
+When bubtrsnap needs to run `btrfs` commands on directories it doesn't own,
+use `--local-sudo` (config: `local_sudo`).  This prepends `sudo -n` to local
+`btrfs` commands (snapshot creation, `btrfs send`/`receive`, `btrfs subvolume
+show` for validation) as well as `scp`/`rsync` used for file-based stream
+transfers.  The user running bubtrsnap must have their sudo profile configured
+for NOPASSWD access to these commands.  The `remote_sudo` option is separate —
+it only affects commands run on the remote via SSH.
+
+### Remote backup via SSH
+
+Use the `--remote-host` and `--remote-path` options to backup to another host
+over a network:
+
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots \
+    --remote-host user@backuphost --remote-path /btrfs/backups \
+    archive1=/path/to/subvolume
+```
+
+This creates a snapshot, then sends the appropriate incremental or full send
+data via SSH to the remote host into a `btrfs receive` which writes the
+resulting subvolume to `/btrfs/backups`.  The remote directory is validated as
+a btrfs subvolume automatically before receiving.
+
+The `remote_path` option always requires `remote_host`.  If `remote_sudo` is
+set, `sudo -n` is prepended to the remote btrfs commands.
+
+### Both local and remote in one run
+
+Specify `backup_dir`, `remote_host`, and `remote_path` together and bubtrsnap
+sends to both destinations using the same snapshot as source:
+
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/local/backups \
+    --remote-host user@backuphost --remote-path /btrfs/backups \
+    archive1=/path/to/subvolume
+```
+
+### rsync transport (optional)
+
+By default bubtrsnap uses `scp` for file-based stream transfers to a remote.
+Enable `rsync` for partial-transfer recovery:
+
+```bash
+bubtrsnap --snapshot-dir=/pool/snapshots \
+    --export-file /tmp/stream.btrfs \
+    --remote-host user@backuphost --remote-path /btrfs/backups \
+    --rsync --rsync-opts '-e "ssh -p 2222"' \
+    archive1=/path/to/subvolume
+```
+
+When `--rsync` is enabled:
+
+- The rsync options `-a` (archive mode) and `--partial-dir .bubtrsnap-partial`
+    are always added
+- Additional options come from `--rsync-opts` (config: `rsync_opts`)
+- Dangerous options (`--delete`, `--partial-dir`, `-v`, `--progress`,
+  `--dry-run`, `--daemon`, `--rsh`, `--exclude`, etc.) are blocked and reported
+- The rsync option can be set globally, per-archive, or on the CLI
+
+To use a non-standard SSH port or identity file, put `ssh -p PORT` (or
+`-i /path/to/key`) with the `-e` rsync option in `rsync_opts`:
 
 ```toml
-    backup_dir = "/pool/backups"
-    snapshot_dir = "/snapshots"
-    local_sudo = true
-
-    import_dir = "~/btrfsstreams/"
-
-    [archive1]
-    subvolume = "~/another/silly/path"
-    keep_daily = 7
+rsync = true
+rsync_opts = '-e "ssh -p 2222 -i /home/user/.ssh/id_rsa"'
 ```
 
-In this instance, any archives in the configuration file will skip snapshot
-processing and a btrfs stream file will be searched for in the specified directory. 
-If a stream file is not found, processing for that archive completes and the
-next archive is dealt with.
+Using rsync affects only file-based transfers (replacing scp) and does not
+affect piping `btrfs send | btrfs receive` or local backup operations.
+
+## Stream files
+
+For very large subvolumes or when you want to break the send and receive steps
+apart, use stream files:
+
+| Option         | Description                                  |
+|----------------|----------------------------------------------|
+| `export_file`  | Write the btrfs stream to a file, then stop  |
+| `import_file`  | Receive from a stream file into `backup_dir` |
+| `export_dir`   | Write stream to `dir/archive.timestamp.btrfs`|
+| `import_dir`   | Search `dir/` for the most recent matching stream file |
+
+Local staging can be accomplished by using `export_file` and `import_file`
+together: send to a file, then receive from that same file.  If the export file
+already exists, it is overwritten. When combined with
+`remote_host`/`remote_path`, the stream file is sent to the remote and received
+there — a fully automated single-command workflow.
+
+When `import_file` is used on its own (no snapshotting needed), the snapshot
+step is skipped entirely — processing starts at the receive step.
 
 ### Remote receive with stream files
 
-When `export_file` or `export_dir` is combined with `remote_host` and `remote_path`
-(and no explicit `import_file`, `import_dir`, or staging options), bubtrsnap
-will:
+When `export_file` or `export_dir` is combined with remote settings (and no
+explicit `import_file`/`import_dir`/`stage_file`), bubtrsnap:
 
-1. Create the snapshot.
-2. Write the btrfs stream to a file (`export_file` path or
-   `export_dir/archive.timestamp.btrfs`).
-3. Copy that stream file to the SSH remote via `scp`.
-4. On the remote, run `btrfs receive -f <temp_file> <remote_path>`.
-5. Clean up the temporary file on the remote.
-6. Apply keep policy on the remote.
+1. Creates the snapshot
+2. Writes the btrfs stream to a local file
+3. Copies the stream file to the remote via `scp`
+4. Runs `btrfs receive -f <temp_file> <remote_path>` on the remote
+5. Cleans up the temporary file on the remote
+6. Applies keep policy on the remote
 
-This enables a fully automated single-command workflow: snapshot locally,
-stream to file, transfer via SCP, and receive on remote — all in one
-bubtrsnap run.
+For `rsync` transport, the stream file is transferred via `rsync` instead of
+`scp`, and interrupted transfers can be resumed.
 
-Example CLI (`export_dir`):
-```
+### Combining local and remote stream receive
+
+An archive configured with `backup_dir` + `export_file`/`export_dir` +
+`remote_host`/`remote_path` sends to **both** destinations:
+
+1. Local piped `btrfs send | btrfs receive` to `backup_dir`
+2. Stream file written, transferred, and received on remote
+
+Keep policy is applied independently to each destination.
+
+A CLI usage example:
+
+```bash
 bubtrsnap --snapshot-dir /snapshots \
-    --export-dir /local/streams \
-    --remote-host user@backuphost \
-    --remote-path /btrfs/backups \
+    --export-file /tmp/stream.btrfs \
+    --remote-host user@backuphost --remote-path /btrfs/backups \
     archive1=/path/to/subvol
 ```
 
-Example CLI (`export_file`):
-```
-bubtrsnap --snapshot-dir /snapshots \
-    --export-file /local/stream.btrfs \
-    --remote-host user@backuphost \
-    --remote-path /btrfs/backups \
-    archive1=/path/to/subvol
-```
+This command would create a readonly snapshot of archive1, create stream file
+/tmp/stream.btrfs with appropriate incremental (or not) information, use scp
+to transfer the file to the remote host where it will then execute a btrfs
+receive command to create the subvolume on the remote host.
 
-Example config:
+In a config file:
+
 ```toml
 snapshot_dir = "/snapshots"
 export_dir = "/local/streams"
-remote_host = "user@backuphost"
-remote_path = "/btrfs/backups"
-
-[archive1]
-subvolume = "/path/to/subvol"
-```
-
-### Combining local backup-dir with remote stream receive
-
-When an archive is configured with `backup_dir` in addition to `export_file`
-(or `export_dir`) and `remote_host`/`remote_path`, bubtrsnap sends to **both**
-destinations: a local piped `btrfs send | btrfs receive` to `backup_dir`, and
-the SCP-based remote receive described above. The sequence:
-
-1. Create the read-only snapshot.
-2. Send to local `backup_dir` via piped `btrfs send | btrfs receive`
-   (incrementals use local parents).
-3. Write the btrfs stream to a file (`export_file` or
-   `export_dir/archive.timestamp.btrfs`).
-4. SCP the stream file to the remote host.
-5. On the remote, run `btrfs receive -f <remote_temp_file> <remote_path>`.
-6. Clean up the temporary file on the remote.
-7. Apply keep policy to snap_dir, backup_dir, and the remote.
-
-Example config (triple destination):
-```toml
-snapshot_dir = "/snapshots"
 backup_dir = "/pool/backups"
-export_dir = "/local/streams"
 remote_host = "user@backuphost"
 remote_path = "/btrfs/backups"
 
@@ -489,269 +267,166 @@ keep_daily = 7
 keep_weekly = 4
 ```
 
-Run it:
-```
-bubtrsnap --dry-run archive1
-```
+Given the above in a configuration file, a simple `bubtrsnap` CLI command
+would perform the equivalent operations to the above CLI example, plus perform
+a local piped send -> receive to /pool/backups and apply the specified keeps to
+the archive snapshots, local backup and remote backup locations.
 
 ## Staging: stage-file / stage-dir
 
-The `--stage-file` and `--stage-dir` options are convenience options that
-combine a send-to and receive-from using the same path or directory, and then
-remove the stream file when done.
+The `--stage-file FILE` and `--stage-dir DIR` options are a convenience that
+combine send-to and receive-from using the same path, then delete the stream
+file:
 
-- `stage_file FILE`: send to FILE, receive from FILE, then delete FILE.
-- `stage_dir DIR`: send to DIR/{archive}.{timestamp}.btrfs, receive it, then delete it.
+```bash
+bubtrsnap --stage-file /tmp/archive.btrfs archive1=/path/to/subvolume
+```
 
-These are mutually exclusive with the other send/receive/stage options and with
-`--snaps-only`.
+When combined with `--remote-host`/`--remote-path`, staging also transfers the
+stream to the remote (via `scp` or `rsync`) and receives it there, just like
+`export_file`/`import_file`.
 
-Note that **`stage_*` options are local-only**: they do not trigger remote
-(SSH) transfer.  When `remote_host`/`remote_path` is configured, staging writes
-the stream file locally and receives it into `backup_dir` only. The remote
-destination is only used for backup operations without staging (regular piped
-send or `export_file`/`export_dir` + remote combinations).
+## Keep policy
 
-## Keep Policy
+The keep policy is inspired by [borgbackup][].  It specifies how many
+snapshots/backups to retain at each time interval:
 
-The keep policy for bubtrsnap is a direct port from [btrbu][] which was
-inspired by the [borgbackup][] policy.  It uses hourly, daily, weekly, monthly
-and yearly timeframes to determine what to keep.  The relevant options are
-`keep-hourly`, `keep-daily`, `keep-weekly`, `keep-monthly` and `keep-yearly`
-and the value assigned is the number of snapshots and backups to keep at that
-particular timeframe. The timeframes are applied from shortest to longest and
-there is no overlap, meaning a snapshot/backup kept because of a daily keep
-doesn't count towards a weekly or monthly keep.  The keep is ALWAYS the most
-recent available for a given timeframe.
+| Option        | CLI flag         | Config key      |
+|---------------|------------------|-----------------|
+| `keep_hourly` | `--keep-hourly`  | `keep_hourly`   |
+| `keep_daily`  | `--keep-daily`   | `keep_daily`    |
+| `keep_weekly` | `--keep-weekly`  | `keep_weekly`   |
+| `keep_monthly`| `--keep-monthly` | `keep_monthly`  |
+| `keep_yearly` | `--keep-yearly`  | `keep_yearly`   |
 
-When first starting up, a given keep timeframe will not apply until that
-timeframe becomes relevant as keeps accumulate.  So monthly keeps will not
-apply until snapshots and backups have filled all hourly, daily or weekly keep
-requirements.
+Intervals are applied shortest to longest with no overlap — a snapshot kept
+because of a daily keep does not count towards a weekly or monthly keep.  The
+keep policy applies to **both** snapshots and backups.
 
-If there is an existing set of backups, then the keep policy will be applied to
-all those and only those snapshot and backups that meet the keep policy
-criteria will be kept.  Note that the keep policy applies to BOTH snapshots AND
-backups.
-
-Keeps can be specified on the CLI or via a configuration file.  Keeps are dealt
-with as all or nothing.  Keeps specified on the CLI, in the global section or
-for a specific archive are independent of each other.  Keeps from the CLI take
-precedence over global and archive settings while archive specific keeps take
-precedence over global settings.  Any unspecified keep is set to 0 at that
-interval. As an example, consider the following CLI command:
-
-    bubtrsnap --keep-daily 5 myarchive=/some/subvolume
-
-Assuming that a snapshot directory and backup directory are properly configured
-in a configuration file, this command will only keep 5 daily snapshots for
-`myarchive`.  Any previous weekly, hourly, monthly and yearly snapshots and
-backups will be pruned.  Always perform a `--dry-run` to test the results of a
-new keep policy.
-    
-An example of a configuration file with a keep policy:
+When no keep values are set (all `0`), pruning is skipped — existing snapshots
+and backups are left untouched.  By default, all keep values are set to 0.
 
 ```toml
-    snapshot_dir = "/pool/snapshots"
-    backup_dir = "/backup"
-    
-    keep_daily = 4
-    keep_weekly = 2
-    keep_monthly = 1
+snapshot_dir = "/pool/snapshots"
+backup_dir = "/backup"
+keep_daily = 4
+keep_weekly = 2
+keep_monthly = 1
 
-    [archive1]
-    subvolume = "/path/to/subvolume1"
-
+[archive1]
+subvolume = "/path/to/subvolume1"
 ```
 
-The shortest keep policy time interval is 1 hour for bubtrsnap.  So multiple
-backups within the same hour will be subject to pruning by any keep policy.
-The most recent snapshot/backups from that hour will be kept in those cases.
+### Forced keeps
 
-### Default (no keep options set)
+If there is a particular archive you don't want bubtrsnap to remove, the
+`--forced-keep TIMESTAMP` (config: `forced_keep`) option forces retention of
+specific timestamps that would otherwise be pruned.  Format: `YYYYMMDDhhmm` (12
+digits).
 
-If no `keep_*` values are set on the CLI or in the config file (all remain
-`0`), **pruning is skipped**. Existing snapshots and backups are left as they
-are.
-
-### Forced keeps (--keep / keep)
-
-The `--keep` CLI option (config: `keep`) allows forcing retention of
-specific timestamps that would otherwise be pruned by the keep policy.
-
-- **CLI**: `--keep TIMESTAMP` — can be specified multiple times
-- **Config**: `keep = "202601011200,202601021200"` (comma-separated list, archive section only)
-- **Format**: `YYYYMMDDhhmm` (12 digits)
-- **Behavior**: Forced keeps are applied **first**, then the keep policy runs on the remaining timestamps
-- **Validation**: The timestamp must exist for the archive being processed; missing timestamps log a warning and are ignored
-- **Archive-specific only** — not a global option
-
-Example CLI:
-```
-bubtrsnap --keep 202601011200 --keep 202601021200 archive1=/path/to/subvol
+```bash
+bubtrsnap --forced-keep 202601011200 --forced-keep 202601021200 archive1=/path/to/subvolume
 ```
 
-Example config:
+In config:
 ```toml
 [archive1]
 subvolume = "/path/to/subvol"
-keep = "202601011200,202601021200"
+forced_keep = "202601011200,202601021200"
 ```
 
-**Note**: `--keep` requires exactly one archive to be processed (whether specified on CLI or from config).
+Note that on the CLI, a forced keep doesn't last beyond the command itself.  A
+subsequent CLI command without the forced keep specified again might result in
+the archive getting pruned.  To keep a specific archive over many iterations, use `forced_keep` in a configuration file so it is specified on every run.
 
 ### Weekly boundary
 
-**Weekly keeps are aligned to the day before `week_startday`** (default: Saturday, since `week_startday` defaults to `sunday`). The week boundary used when selecting weeklies is the most recent such day at or before a candidate timestamp (23:59).
-
-The `week_startday` option (CLI: `--week-startday`, config: `week_startday`) controls which day the week starts on. Accepted values: `monday` through `sunday`. The week ends on the day before the start day.
-
-| `week_startday` | Week ends on (weekly boundary) |
-|-----------------|--------------------------------|
-| `monday`        | Sunday                         |
-| `tuesday`       | Monday                         |
-| `wednesday`     | Tuesday                        |
-| `thursday`      | Wednesday                      |
-| `friday`        | Thursday                       |
-| `saturday`      | Friday                         |
-| `sunday` (default) | Saturday                    |
-
-This can be set globally or per-archive in the config file, or via `--week-startday` on the CLI.
-
-### Other boundaries
-
-| Interval | Boundary used when walking backward |
-|----------|-------------------------------------|
-| Hourly   | Previous hour at minute 59          |
-| Daily    | Previous calendar day at 23:59      |
-| Weekly   | Day before `week_startday` at 23:59 |
-| Monthly  | Last day of the target month 23:59  |
-| Yearly   | December 31 23:59                   |
-
-[borgbackup]: https://borgbackup.org
+Weekly keeps are aligned to the day before `week_startday` (default:
+`sunday`, meaning the week ends on Saturday).  This can be set globally or
+per-archive.
 
 ## Hooks
 
-Hooks allow for external programs to be coordinated with the creation of
-snapshots and backups.  There are 3 types of hooks:  pre-snapshot,
-post-snapshot and backup.  All referring to the timing when the hooks are run.
-The idea was to facilitate creating an all-in-one-place backup solution so that
-snapshot or backup creation could be paired with backing up to a remote server.
-Or some kind of pre-processing or massaging could be done prior to taking
-snapshots.
+Hooks coordinate external programs at three stages:
 
-Hooks can only be configured in a configuration file.  They are not available on
-the command line.  The configuration values for the file are as follows:
+| Hook               | Timing                           |
+|--------------------|----------------------------------|
+| `pre_snapshot_hook`| Before the snapshot is taken     |
+| `post_snapshot_hook`| After the snapshot, before backup |
+| `post_backup_hook` | After the backup is complete     |
 
-+ `pre_snapshot_hook` - a shell command to run before snapshots for the archive
-+ `post_snapshot_hook` - a shell command to run after snapshots for the archive
-+ `post_backup_hook` - a shell command to run after backups for the archive
+Hooks use substitution strings that are replaced at run time:
 
-To make the hooks more useful, it is possible to use substitution strings when
-creating a hook command.  bubtrsnap will parse the command and swap in the
-appropriate value for the substitution string.  The available substitution
-strings are:
+| Placeholder   | Available in              |
+|---------------|---------------------------|
+| `{archive}`   | all                       |
+| `{subvol}`    | pre-snapshot              |
+| `{timestamp}` | all                       |
+| `{snapshotdir}`| all                       |
+| `{backupdir}` | all (may be empty)        |
+| `{snapshot}`  | post-snapshot, post-backup |
+| `{backup}`    | post-backup               |
 
-- `pre_snapshot_hook`
-  + `{archive}`     - the archive name
-  + `{subvol}`      - the subvolume path for the archive
-  + `{timestamp}`   - the current bubtrsnap timestamp
-  + `{snapshotdir}` - the configured snapshot directory
-  + `{backupdir}`   - the configured backup directory (may be empty)
-
-- `post_snapshot_hook`
-  + `{snapshot}`    - the full path and name of the snapshot just created
-  + `{archive}`     - the archive name
-  + `{timestamp}`   - the current bubtrsnap timestamp
-  + `{snapshotdir}` - the configured snapshot directory
-  + `{backupdir}`   - the configured backup directory (may be empty)
-
-- `post_backup_hook`
-  + `{backup}`      - the full path and name of the backup just created
-  + `{snapshot}`    - the full path and name of the snapshot used for the backup
-  + `{archive}`     - the archive name
-  + `{timestamp}`   - the current bubtrsnap timestamp
-  + `{backupdir}`   - the configured backup directory (may be empty)
-  + `{snapshotdir}` - the configured snapshot directory
-
-An example of a configuration file with some hooks in it:
+Example:
 
 ```toml
-    snapshot_dir = "/pool/snapshots"
-    backup_dir = "/backups"
+snapshot_dir = "/pool/snapshots"
+backup_dir = "/backups"
 
-    [archive1]
-    subvolume = "/home/user1"
-    pre_snapshot_hook = echo "Starting snapshot and backup process- {timestamp}" > ~/backuplog
-    post_snapshot_hook = "borg create --verbose --list --filter AME user@server:repo::{archive} {snapshot} 2>~/borglog"
-    post_backup_hook = 'echo "Can't think of anything more original to show here."'
-
-    [archive2]
-    subvolume = "/usr/local/cloud"
-    pre_snapshot_hook = /home/user/myspecialprebackupscript
-    post_backup_hook = "borg create user@server:repo::{archive} {backup} 2>>~/borglog"
-    .
-    .
-    .
-    .
+[archive1]
+subvolume = "/home/user1"
+pre_snapshot_hook = echo "Starting backup {timestamp}" >> ~/backuplog
+post_snapshot_hook = "borg create --verbose user@server:repo::{archive} {snapshot}"
+post_backup_hook = 'echo "Backup of {archive} complete" >> ~/backuplog'
 ```
 
-The `pre_snapshot_hook` is run prior to any snapshots and can be thought of
-like preprocessing for the archive.  In the above example, it is trivial just
-posting a message to a log file.  Regardless, it does show a substitution usage
-for `archive1`. It invokes a timestamp substitution, so the output of the echo
-would actually be something like `Starting snapshot and backup process-
-202608122148.`  The `archive2` entry would run the named script.
+## Dry-run and debugging
 
-A `post_snapshot_hook` is executed after the archive snapshot is done.  In the
-example above, the hook for `archive1` shows how a potential `borg backup` could
-be launched, using the just taken snapshot as the source for a backup to a
-remote server.  bubtrsnap will make sure that it does not exit until the borg
-process is completed.  The association with `archive1` gives the user access to
-the extra substitutions such as `{snapshot}`. In this case, `{archive}` would
-become `archive1` in the actual command and `{snapshot}` would become
-`/pool/snapshots/archive1.202006122148`. (Note I just made up the timestamp
-value.  Obviously this would be different when actually run.)
+To test a particular configuration or set of options, the `--dry-run` option
+shows what bubtrsnap would do without making changes:
 
-Finally, the `post_backup_hook` executes the given hook after the backup
-(`btrfs send`) is completed.  The `{backup}` substitution under `archive2`
-above would work out to be `/backups/archive2.202006122148` with the same
-caveat as before applying to the timestamp portion of the name.
+- Read-only validation (SSH checks, `btrfs subvolume show`/`list`, stream
+  header inspection) is still executed
+- Write operations (snapshot creation, send/receive, delete/prune) are
+  logged with a `[dry-run]` prefix and skipped
+- Stream file creation and deletion are also skipped
 
-All hooks are run on a per-archive basis.  So each archive is completely
-processed, including any associated hooks, prior to the processing of the next
-archive.
+Additionally, `--dry-run` raises verbosity to level 2 (commands) so all the
+commands that would execute are visible.  Use `--debug` (equivalent to
+`--verbose 3`) for maximum verbosity including UUIDs and internal decision
+details.
 
-## Dry-Run and Read-Only Validation
+Always use `--dry-run` to preview a new keep policy or remote configuration.
 
-bubtrsnap supports a `--dry-run` mode that shows what would be done without
-making changes.  During dry-run:
+## Configuration reference
 
-- Read-only operations (SSH validation, btrfs subvolume show/list, stream
-  header checks) are still executed so you get a realistic preview of what
-  bubtrsnap sees on the local and remote sides.
-- Write operations (snapshot creation, send/receive, delete/prune) are skipped
-  and logged with a `[dry-run]` prefix.
-- Stream file creation and deletion are also skipped.
+**Global-only options:**
+`snapshot_dir`, `local_sudo`, `stage_dir`, `verbose`, `dry_run`
 
-This is especially useful with SSH backups to verify that the remote host,
-remote directory, and parent subvolumes are reachable and valid before running
-a real backup.
+**Global or per-archive (archive overrides global):**
+`backup_dir`, `snaps_only`, `export_dir`, `import_dir`, `remote_host`,
+`remote_path`, `remote_sudo`, `rsync`, `rsync_opts`, `week_startday`,
+`keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly`
 
-## Unit Tests
+**Per-archive only:**
+`subvolume` (required), `export_file`, `import_file`, `stage_file`,
+`pre_snapshot_hook`, `post_snapshot_hook`, `post_backup_hook`, `forced_keep`
 
-The SSH branch includes unit tests covering:
+## Dependencies
 
-- CLI / per-archive / global precedence for `remote_host`, `remote_path`, and
-  `remote_sudo`.
-- SSH subvolume validation failure and success.
-- `iter_archive_items_ssh` output format, archive filtering, invalid timestamps,
-  and dry-run behavior.
-- `find_parents_ssh` matching by UUID and dry-run read-only execution.
-- `apply_keep_policy_ssh` pruning behavior and dry-run delete logging.
+- `btrfs-progs` (for `btrfs` commands)
+- `python3`
+- SSH client (only for remote backup, at least on the client side)
+- `rsync` (only when `--rsync` is enabled)
 
-Run them with:
+## Unit tests
 
-    python3 -m unittest discover -s /path/to/bubtrsnap
+```bash
+python3 unittests/test_keep_policy.py -v
+python3 unittests/test_ssh.py -v
+python3 unittests/test_file_options.py -v
+python3 unittests/test_runtime.py -v
+```
 
-[keep policy]: #keep-policy
+[btrbu]: https://github.com/lama7/btrbu
+[borgbackup]: https://borgbackup.org

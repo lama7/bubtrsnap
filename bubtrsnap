@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -45,6 +46,8 @@ DEFAULT_CONFIG = {
     "week_startday": "sunday",
     "verbose": 0,
     "dry_run": False,
+    "rsync": False,
+    "rsync_opts": None,
 }
 
 # Day name to weekday (Mon=0 ... Sun=6)
@@ -59,8 +62,106 @@ _DAY_TO_WEEKDAY = {
 }
 
 # ---------------------------------------------------------------------------
-# Logging/ Verbosity level handling
+# rsync options blocked from user-specified --rsync-opts
+# (dangerous or incompatible with bubtrsnap's stream-file workflow)
 # ---------------------------------------------------------------------------
+_BLOCKED_RSYNC_OPTS = frozenset({
+    # user must never control partial-dir — bubtrsnap manages it
+    "--partial-dir",
+    # destructive / file-removing options
+    "--remove-source-files",
+    "--delete", "--delete-excluded", "--delete-after", "--delete-before",
+    "--delete-during", "--delete-delay",
+    "--backup", "--backup-dir", "--suffix",
+    "--inplace", "--delay-updates",
+    # options that produce stdout / progress output
+    "-v", "--verbose", "--progress", "--info", "--stats",
+    "--human-readable", "--out-format", "--itemize-changes",
+    # dry-run / daemon / batch / server modes (incompatible)
+    "--dry-run", "--daemon", "--server", "--read-batch", "--write-batch",
+    "--only-write-batch",
+    # file-list and connection options (bubtrsnap controls the file)
+    "--files-from", "--files-from0", "--from0", "--no-from0",
+    "--files-from-dir",
+    "--bwlimit", "--port", "--address", "--bind-address", "--contimeout",
+    "--timeout", "--blocking-io",
+    "--rsh", "--rsync-path", "--password-file",
+    # path / content manipulation
+    "--filter", "--filter-from",
+    "--exclude", "--exclude-from",
+    "--include", "--include-from",
+    "--no-implied-dirs", "--no-dirs",
+    "--link-dest", "--hard-link",
+    "--copy-links", "--copy-unsafe-links", "--copy-dirlinks",
+    "--no-times", "--no-perms", "--no-owner", "--no-group",
+    "--no-links", "--no-devices", "--no-specials",
+    "--acls", "--xattrs", "--extended-attributes",
+    "--atimes", "--no-atimes",
+    "--numeric-ids", "--fake-super", "--sparse",
+    "--relative", "--time-dir", "--stop-at",
+    "--chmod", "--chown", "--checksum", "--checksum-seed",
+    "--no-whole-file", "--old-dirs",
+})
+
+
+def _filter_rsync_opts(user_opts: str | None) -> list[str]:
+    """
+    Parse user-supplied rsync options string, filter out blocked options,
+    and return a list of individual option tokens.
+    Blocked options are reported via stderr to the user.
+    """
+    if not user_opts:
+        return []
+    import shlex
+    tokens = shlex.split(user_opts)
+    filtered: list[str] = []
+    for tok in tokens:
+        # Strip '--option=value' to just '--option' for comparison
+        opt_base = tok.split("=", 1)[0]
+        # Expand combined short options: -avz → -a, -v, -z
+        if opt_base.startswith("-") and not opt_base.startswith("--"):
+            short_flags = opt_base[1:]
+            blocked_shorts = set()
+            kept_parts = []
+            for flag in short_flags:
+                short_opt = f"-{flag}"
+                if short_opt in _BLOCKED_RSYNC_OPTS:
+                    blocked_shorts.add(flag)
+                else:
+                    kept_parts.append(flag)
+            if blocked_shorts:
+                for flag in sorted(blocked_shorts):
+                    print(f"Warning: blocking unsafe rsync option -{flag} from --rsync-opts",
+                          file=sys.stderr)
+            if kept_parts:
+                filtered.append(f"-{''.join(kept_parts)}")
+            continue
+        # Long option
+        if opt_base in _BLOCKED_RSYNC_OPTS:
+            print(f"Warning: blocking unsafe rsync option {opt_base} from --rsync-opts",
+                  file=sys.stderr)
+            continue
+        filtered.append(tok)
+    return filtered
+
+
+def _quote_for_display(s: str) -> str:
+    """Quote a string for shell display, using double quotes for args with spaces.
+
+    Unlike shlex.quote (which defaults to single quotes), this preserves the
+    double-quote style that users typically write in config files (e.g.
+    ``-e "ssh -p 2222"``).  Falls back to shlex.quote for strings that contain
+    double quotes or other shell metacharacters.
+    """
+    s = str(s)
+    if " " not in s:
+        return s
+    if '"' in s or any(c in s for c in "\\$`"):
+        import shlex
+        return shlex.quote(s)
+    return f'"{s}"'
+
+
 def log(msg: str, level: int, verbosity: int) -> None:
     """
     level 1 = flow / progress
@@ -95,7 +196,7 @@ def run(cmd: list[str] | str,
                    Returns None so callers that check for None don't proceed
                    with write operations.
     """
-    pretty = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+    pretty = cmd if isinstance(cmd, str) else " ".join(_quote_for_display(c) for c in cmd)
 
     if dry_run:
         if read_only:
@@ -422,6 +523,8 @@ ALLOWED_GLOBAL_OPTIONS = {
     "week_startday": str,
     "verbose": int,
     "dry_run": bool,
+    "rsync": bool,
+    "rsync_opts": str,
 }
 
 ALLOWED_ARCHIVE_OPTIONS = {
@@ -446,6 +549,8 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "backup_dir": str,
     "export_dir": str,
     "import_dir": str,
+    "rsync": bool,
+    "rsync_opts": str,
 }
 
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
@@ -638,6 +743,14 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     if cli_remote_sudo:
         global_cfg["remote_sudo"] = True
 
+    # rsync / rsync_opts CLI overrides (global level)
+    cli_rsync = getattr(cli, "rsync", False)
+    if cli_rsync:
+        global_cfg["rsync"] = True
+    cli_rsync_opts = getattr(cli, "rsync_opts", None)
+    if cli_rsync_opts:
+        global_cfg["rsync_opts"] = cli_rsync_opts
+
     # Track if CLI explicitly set backup_dir for precedence over archive-specific config
     cli_backup_dir = getattr(cli, "backup_dir", None)
     if cli_backup_dir is not None:
@@ -741,8 +854,8 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         if val is not None:
             cli_keeps[key] = val
 
-    # CLI keep options (--keep) - requires exactly one archive total
-    cli_keep = getattr(cli, "keep", None)
+    # CLI forced-keep options (--forced-keep) - requires exactly one archive total
+    cli_keep = getattr(cli, "forced_keep", None)
     if cli_keep:
         # Count total archives that would be processed
         cli_archives = parse_cli_archives(cli.archives) if cli.archives else {}
@@ -751,7 +864,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         total_archives = n_cli if n_cli > 0 else n_cfg
         if total_archives != 1:
             print(
-                "Error: --keep requires exactly one archive to process "
+                "Error: --forced-keep requires exactly one archive to process "
                 f"(found {total_archives})",
                 file=sys.stderr,
             )
@@ -829,9 +942,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             sys.exit(1)
 
         subvol_path = Path(subvol)
-        if not subvol_path.exists():
-            print(f"Error: subvolume path does not exist: {subvol}", file=sys.stderr)
-            sys.exit(1)
+        chk_btrfs_subvolume(subvol_path, global_cfg)
 
         if cli_has_file_related:
             # Rule 1: CLI only — ignore all config file-related options
@@ -848,6 +959,9 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             # Initialize export/import dirs for CLI mode
             export_dir = None
             import_dir = None
+            # rsync settings: CLI global value always wins
+            archive_rsync = global_cfg["rsync"]
+            archive_rsync_opts = global_cfg.get("rsync_opts")
         else:
             # Rules 2 & 3: archive-specific first; global only if none
             send_file = raw.get("export_file")
@@ -910,6 +1024,15 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             if getattr(cli, "snaps_only", False)
             else raw.get("snaps_only", global_cfg.get("snaps_only", False))
         )
+        # Resolve rsync with precedence: CLI > archive-specific > global
+        if cli_rsync:
+            archive_rsync = True
+        else:
+            archive_rsync = bool(raw.get("rsync", global_cfg.get("rsync", False)))
+        if cli_rsync_opts:
+            archive_rsync_opts = cli_rsync_opts
+        else:
+            archive_rsync_opts = raw.get("rsync_opts", global_cfg.get("rsync_opts"))
         if snaps_only and (
             send_file or recv_file or stage_file or send_dir or recv_dir or stage_dir
         ):
@@ -940,6 +1063,14 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         if remote_path and not remote_host:
             print(f"Error in archive '{name}': 'remote_path' requires 'remote_host' to be set (global, per-archive, or CLI)", file=sys.stderr)
             sys.exit(1)
+
+        # Validate external tool availability when they'll be needed.
+        if archive_rsync and remote_path and shutil.which("rsync") is None:
+            print(f"Error in archive '{name}': rsync is enabled but rsync was not found on the system PATH", file=sys.stderr)
+            sys.exit(1)
+        if remote_host and shutil.which("ssh") is None:
+            print(f"Error in archive '{name}': remote_host is set but ssh was not found on the system PATH", file=sys.stderr)
+            sys.exit(1)
         
         # Resolve backup_dir with precedence: CLI > archive-specific > global
         if cli_backup_dir is not None:
@@ -966,7 +1097,9 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                     "post_backup_hook": raw.get("post_backup_hook"),
                     "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
                     "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
-                    "forced_keep": _merge_keep(raw.get("forced_keep"), getattr(cli, "keep", None)),
+                    "forced_keep": _merge_keep(raw.get("forced_keep"), getattr(cli, "forced_keep", None)),
+                    "rsync": archive_rsync,
+                    "rsync_opts": archive_rsync_opts,
                 }
         resolved.append(entry)
 
@@ -984,6 +1117,13 @@ def btrfs_cmd(cfg: dict, *args: str, sudo: bool | None = None) -> list[str]:
 
 # makes sure the dir is a subvolume, errors out if not
 def chk_btrfs_subvolume(dir: Path, cfg: dict):
+    # Cache: avoid redundant btrfs subvolume show for the same path across
+    # multiple archives in a single run (e.g. shared snapshot_dir/backup_dir).
+    cache_key = f"local:{dir}"
+    validated = cfg.setdefault("_validated_paths", set())
+    if cache_key in validated:
+        return
+    log(f"Checking {dir} is a valid btrfs subvolume...", 1, cfg["verbose"])
     try:
         run(btrfs_cmd(cfg, "subvolume", "show", str(dir)),
             dry_run=False,
@@ -992,7 +1132,8 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
             stderr=subprocess.DEVNULL,
             check=True)
         log(f"\t{dir} is a valid btrfs subvolume", 2, cfg["verbose"])
-                                   
+        validated.add(cache_key)
+
     except subprocess.CalledProcessError:
         print(f"Error: '{dir}' is not a btrfs subvolume "
         f"(required for snapshot/backup/receive operations)", file=sys.stderr)
@@ -1000,6 +1141,13 @@ def chk_btrfs_subvolume(dir: Path, cfg: dict):
 
 def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False):
     """Check if a remote directory is a btrfs subvolume via SSH."""
+    # Cache: avoid redundant SSH round-trips for the same remote path across
+    # multiple archives in a single run.
+    cache_key = f"ssh:{remote}:{remote_dir}"
+    validated = cfg.setdefault("_validated_paths", set())
+    if cache_key in validated:
+        return
+    log(f"Checking {remote}:{remote_dir} is a valid btrfs subvolume...", 1, cfg["verbose"])
     # Build SSH command: ssh remote sudo -n btrfs subvolume show remote_dir
     sudo_prefix = ["sudo", "-n"] if remote_sudo else []
     ssh_cmd = ["ssh", remote] + sudo_prefix + ["btrfs", "subvolume", "show", remote_dir]
@@ -1011,6 +1159,7 @@ def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict, remote_sudo
                      verbosity=cfg["verbose"],
                      check=True, capture_output=True, text=True, timeout=30)
         log(f"\t{remote}:{remote_dir} is a valid btrfs subvolume", 2, cfg["verbose"])
+        validated.add(cache_key)
     except subprocess.CalledProcessError as e:
         print(f"Error: '{remote}:{remote_dir}' is not a btrfs subvolume "
               f"(required for snapshot/backup/receive operations)", file=sys.stderr)
@@ -1033,7 +1182,7 @@ def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Pat
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
-        print(f"Error executing `{cmd}`")
+        print(f"Error executing `{cmd}`", file=sys.stderr)
         sys.exit(1)
 
     return dest
@@ -1313,9 +1462,8 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     has_local = backup_dir is not None
     has_remote = remote and remote_dir
 
-    if not has_local and not has_remote:
-        log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
-        return stream_file
+    # When only stream_file is configured (export_file-only, no backup_dir
+    # or remote), create a full send stream with no parents.
 
     # Find parents for the stream file.
     # When sending to a remote destination (via SCP + receive), parents must
@@ -1380,7 +1528,7 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     if result is not None and result.returncode != 0:
         seq_elapsed = (datetime.now() - seq_start).total_seconds()
         log(f"SCP + receive sequence failed after {format_duration(seq_elapsed)}", 1, cfg["verbose"])
-        print(f"Error copying stream to remote via SCP:\\n{result.stderr}", file=sys.stderr)
+        print(f"Error copying stream to remote via SCP:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
 
     # Now receive on remote using the copied file
@@ -1409,7 +1557,7 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
             print(f"Warning: subvolume from '{stream.name}' already exists in "
                   f"{remote_dir} – skipping", file=sys.stderr)
             return None
-        print(f"Error receiving '{stream}' via SSH:\\n{stderr}", file=sys.stderr)
+        print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
         sys.exit(1)
     
     # Extract subvolume name reported by btrfs
@@ -1428,6 +1576,127 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     if not subvol_name:
         subvol_name = stream.stem
     
+    log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
+    return subvol_name
+
+def _check_interrupted_rsync(remote: str, cfg: dict) -> bool:
+    """
+    Check if a previous rsync transfer was interrupted by looking for
+    the --partial-dir on the remote.
+    """
+    remote_partial_dir = "/tmp/.bubtrsnap-partial"
+    check_cmd = ["ssh", remote, "test", "-d", remote_partial_dir]
+    if cfg.get("local_sudo"):
+        check_cmd = ["sudo", "-n"] + check_cmd
+
+    result = run(check_cmd,
+                  dry_run=False,  # always execute — read-only check, should run even during dry-run
+                  verbosity=cfg["verbose"],
+                  capture_output=True, text=True, check=False)
+
+    if result is not None and result.returncode == 0:
+        return True
+    return False
+
+
+def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
+                       remote_sudo: bool = False, rsync_opts: str | None = None) -> str | None:
+    """
+    Copy stream file to remote via rsync (with --partial-dir for recovery),
+    then receive locally on remote via SSH.
+
+    Uses --partial-dir=DIR for interrupted transfer recovery. If a partial
+    transfer is detected (a partial-dir exists from a previous interrupted run),
+    rsync completes the transfer before the receive step proceeds.
+
+    Returns the received subvolume basename on success, None on 'already exists'.
+    Aborts the whole program on any other error.
+    """
+    # The remote temp file that rsync will place (same as SCP path for consistency)
+    remote_tmp = f"/tmp/bubtrsnap-{stream.name}"
+    partial_dir_name = ".bubtrsnap-partial"
+    remote_partial_dir = f"/tmp/{partial_dir_name}"
+
+    # Build the rsync command
+    rsync_cmd = ["rsync", "-a", "--partial-dir", partial_dir_name]
+
+    # Add user-specified options (filtered through blocklist)
+    user_opts = _filter_rsync_opts(rsync_opts)
+    rsync_cmd += user_opts
+
+    # rsync source -> dest. rsync uses host:path syntax (same as scp)
+    if cfg.get("local_sudo"):
+        rsync_cmd = ["sudo", "-n"] + rsync_cmd
+    rsync_cmd += [str(stream), f"{remote}:{remote_tmp}"]
+
+    # Receive command (same as SCP path)
+    recv_cmd = build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo)
+    recv_cmd = recv_cmd[:-1] + ["-f", remote_tmp, remote_dir]
+
+    # Overall timing for the complete rsync + SSH receive sequence
+    seq_start = datetime.now()
+
+    # rsync with --partial-dir will resume any interrupted transfer automatically
+    # (the partial-dir check is done earlier in process_archive via
+    # _check_interrupted_rsync, before the stream file is created/reused)
+    log("Copying stream to remote via rsync...", 1, cfg["verbose"])
+
+    # Execute rsync
+    rsync_start = datetime.now()
+    result = run(rsync_cmd, dry_run=cfg.get("dry_run", False),
+                 verbosity=cfg["verbose"], capture_output=True, text=True, check=False)
+    rsync_elapsed = (datetime.now() - rsync_start).total_seconds()
+    if result is not None:
+        log(f"rsync transfer completed in {format_duration(rsync_elapsed)}", 1, cfg["verbose"])
+    if result is not None and result.returncode != 0:
+        seq_elapsed = (datetime.now() - seq_start).total_seconds()
+        log(f"rsync + receive sequence failed after {format_duration(seq_elapsed)}", 1, cfg["verbose"])
+        print(f"Error copying stream to remote via rsync:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    # Now receive on remote using the transferred file
+    start = datetime.now()
+    ssh_result = run(recv_cmd, dry_run=cfg.get("dry_run", False),
+                     verbosity=cfg["verbose"],
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    elapsed = (datetime.now() - start).total_seconds()
+    if ssh_result is not None:
+        log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+    seq_elapsed = (datetime.now() - seq_start).total_seconds()
+    log(f"rsync + receive sequence completed in {format_duration(seq_elapsed)}", 1, cfg["verbose"])
+    stderr = (ssh_result.stderr if ssh_result else "") or ""
+    stderr = stderr.strip()
+
+    # Clean up remote temp file
+    cleanup_cmd = ["ssh", remote, "rm", "-f", remote_tmp]
+    run(cleanup_cmd, dry_run=cfg.get("dry_run", False),
+        verbosity=cfg["verbose"],
+        capture_output=True, check=False)
+
+    if ssh_result is not None and ssh_result.returncode != 0:
+        if "already exists" in stderr.lower():
+            print(f"Warning: subvolume from '{stream.name}' already exists in "
+                  f"{remote_dir} – skipping", file=sys.stderr)
+            return None
+        print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract subvolume name reported by btrfs
+    subvol_name = None
+    for line in stderr.splitlines():
+        line = line.strip()
+        if "At subvol" in line or "Receiving subvol" in line:
+            parts = line.split()
+            for i, tok in enumerate(parts):
+                if tok in ("subvol", "subvolume") and i + 1 < len(parts):
+                    subvol_name = parts[i + 1].strip("'\"")
+                    break
+            if subvol_name:
+                break
+
+    if not subvol_name:
+        subvol_name = stream.stem
+
     log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
     return subvol_name
 
@@ -1459,17 +1728,25 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
 
 
 def _receive_remote(stream: Path, remote: str, remote_dir: str, cfg: dict,
-                    remote_sudo: bool = False) -> str | None:
-    """Copy stream file to remote via SCP, then receive locally on remote.
+                    remote_sudo: bool = False,
+                    use_rsync: bool = False, rsync_opts: str | None = None) -> str | None:
+    """
+    Copy stream file to remote, then receive locally on remote.
+
+    Uses rsync (with --partial-dir for interrupted transfer recovery) when
+    ``use_rsync`` is True, otherwise falls back to SCP.
     Returns the received subvolume basename on success, None on 'already exists'.
     Aborts the whole program on any other error.
     """
+    if use_rsync:
+        return _rsync_and_receive(stream, remote, remote_dir, cfg, remote_sudo, rsync_opts)
     return _scp_and_receive(stream, remote, remote_dir, cfg, remote_sudo)
 
 
 def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict,
                    remote: str | None = None, remote_dir: str | None = None,
-                   remote_sudo: bool = False) -> str | None:
+                   remote_sudo: bool = False,
+                   use_rsync: bool = False, rsync_opts: str | None = None) -> str | None:
     """
     Dispatch to `_receive_local` and/or `_receive_remote` based on which
     destinations are configured.  When both are set, both are invoked.
@@ -1480,7 +1757,8 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict,
     if backup_dir:
         received = _receive_local(stream, backup_dir, cfg)
     if remote and remote_dir:
-        remote_received = _receive_remote(stream, remote, remote_dir, cfg, remote_sudo)
+        remote_received = _receive_remote(stream, remote, remote_dir, cfg, remote_sudo,
+                                          use_rsync, rsync_opts)
         # Prefer the local result if it succeeded, else use remote result
         if not received:
             received = remote_received
@@ -1821,63 +2099,24 @@ def build_keep_set(ts_list: list[str], keep: dict, week_start_day: int = 6) -> d
 
     return keeps
 
-def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict, remote_sudo: bool = False) -> None:
-    """
-    Apply the given keep policy to backups of an archive on a remote SSH host.
-    Mirrors apply_keep_policy but operates via SSH.
-    """
-    keep_values = [
-        keep.get("keep_hourly", 0),
-        keep.get("keep_daily", 0),
-        keep.get("keep_weekly", 0),
-        keep.get("keep_monthly", 0),
-        keep.get("keep_yearly", 0),
-    ]
-    if not any(v > 0 for v in keep_values):
-        log(
-            f"No keep policy specified for {archive} on SSH remote – skipping pruning",
-            1,
-            cfg["verbose"],
-        )
-        return
+def _apply_keep_policy_core(
+    archive: str,
+    keep: dict,
+    cfg: dict,
+    location: str,
+    items: list[tuple[str, str, list[str]]],
+    no_policy_msg: str,
+    no_items_msg: str,
+    forced_keep: list[str] | None = None,
+) -> None:
+    """Shared keep-policy engine used by apply_keep_policy and apply_keep_policy_ssh.
 
-    log(f"Keep policy for {archive} on SSH remote {remote}:{remote_dir}: {format_keep_policy(keep)}", 1, cfg["verbose"])
-    log(f"Applying to {archive} in {remote}:{remote_dir}:", 1, cfg["verbose"])
+    *items* is a pre-materialised list of (timestamp, display_name, delete_cmd)
+    triples produced by the caller (who knows how to enumerate its destination).
 
-    items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg, remote_sudo))
-    if not items:
-        log(f"\tNo prior archives for {archive} found in {remote}:{remote_dir}", 1, cfg["verbose"])
-        return
-
-    # ascending timestamp order (btrbu style)
-    items.sort(key=lambda x: x[0])
-    ts_list = [t for t, _ in items]
-
-    keeps = build_keep_set(ts_list, keep)
-
-    for t, remote_path in items:
-        if t in keeps:
-            reason = _KEEP_REASON.get(keeps[t], keeps[t])
-            log(f"\tKeeping {remote_path} ({reason})", 1, cfg["verbose"])
-        else:
-            log(f"\tPruning {remote_path}", 1, cfg["verbose"])
-            # Build SSH delete command
-            delete_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "delete", remote_path, sudo=False), remote_sudo)
-            try:
-                run(delete_cmd,
-                    dry_run=cfg.get("dry_run", False),
-                    verbosity=cfg["verbose"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True)
-            except subprocess.CalledProcessError:
-                print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
-                sys.exit(1)
-
-def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> None:
-    """
-    Apply the given keep policy to snapshots or backups of an archive.
-    Uses the btrbu algorithm (non-overlapping interval slots from newest backward).
+    *forced_keep* is the archive-specific list of timestamps to preserve; it is
+    passed explicitly rather than read from *cfg* so per-archive values do not
+    leak across archives in the same run.
     """
     keep_values = [
         keep.get("keep_hourly", 0),
@@ -1887,50 +2126,37 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         keep.get("keep_yearly", 0),
     ]
     if not any(v > 0 for v in keep_values):
-        log(
-            f"No keep policy specified for {archive} – skipping pruning "
-            f"(default: leave existing snapshots/backups untouched)",
-            1,
-            cfg["verbose"],
-        )
+        log(no_policy_msg, 1, cfg["verbose"])
         return
 
-    if not directory.is_dir():
-        log(
-            f"Directory '{directory}' does not exist – skipping keep policy for {archive}",
-            1,
-            cfg["verbose"],
-        )
-        return
+    log(f"Keep policy for {archive} in {location}: {format_keep_policy(keep)}",
+        1, cfg["verbose"])
+    log(f"Applying to {archive} in {location}:", 1, cfg["verbose"])
 
-    log(f"Keep policy for {archive}: {format_keep_policy(keep)}", 1, cfg["verbose"])
-    log(f"Applying to {archive} in {directory}:", 1, cfg["verbose"])
-
-    items = list(iter_archive_items(directory, archive))
     if not items:
-        log(f"\tNo prior archives for {archive} found in {directory}", 1, cfg["verbose"])
+        log(f"\t{no_items_msg}", 1, cfg["verbose"])
         return
 
     # ascending timestamp order (btrbu style)
     items.sort(key=lambda x: x[0])
-    ts_list = [t for t, _ in items]
+    ts_list = [t for t, _, _ in items]
 
-    # Parse week_startday from config
-    week_startday_str = cfg.get("week_startday", "sunday").lower()
-    week_start_day = _DAY_TO_WEEKDAY.get(week_startday_str, 6)
+    # Parse week_startday from config (shared — both local and SSH honour it)
+    week_start_day = _DAY_TO_WEEKDAY.get(
+        cfg.get("week_startday", "sunday").lower(), 6)
 
     # Handle forced_keep: validate timestamps exist for this archive
-    forced_keep_list = cfg.get("forced_keep", [])
+    forced_keep_list = forced_keep or []
     if forced_keep_list:
         valid_forced_keep = []
         for ts in forced_keep_list:
             if ts not in ts_list:
-                log(f"Warning: --keep timestamp '{ts}' not found for archive '{archive}' – ignoring", 1, cfg["verbose"])
+                log(f"Warning: --forced-keep timestamp '{ts}' not found for archive '{archive}' – ignoring", 1, cfg["verbose"])
             else:
                 valid_forced_keep.append(ts)
         forced_keep_list = valid_forced_keep
 
-    # Apply forced keeps first - these are guaranteed to be kept
+    # Apply forced keeps first — these are guaranteed to be kept
     keeps = {}
     for ts in forced_keep_list:
         keeps[ts] = "forced"
@@ -1942,23 +2168,74 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         if ts not in keeps:
             keeps[ts] = reason
 
-    for t, p in items:
-        if t in keeps:
-            reason = _KEEP_REASON.get(keeps[t], keeps[t])
-            log(f"\tKeeping {p.name} ({reason})", 1, cfg["verbose"])
+    for ts, display_name, delete_cmd in items:
+        if ts in keeps:
+            reason = _KEEP_REASON.get(keeps[ts], keeps[ts])
+            log(f"\tKeeping {display_name} ({reason})", 1, cfg["verbose"])
         else:
-            log(f"\tPruning {p.name}", 1, cfg["verbose"])
-            cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))
+            log(f"\tPruning {display_name}", 1, cfg["verbose"])
             try:
-                run(cmd,
+                run(delete_cmd,
                     dry_run=cfg.get("dry_run", False),
                     verbosity=cfg["verbose"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=True)
             except subprocess.CalledProcessError:
-                print(f"Error during prune: `{cmd}`", file=sys.stderr)
+                print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
                 sys.exit(1)
+
+def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict, remote_sudo: bool = False, forced_keep: list[str] | None = None) -> None:
+    """Apply the given keep policy to backups of an archive on a remote SSH host.
+
+    Mirrors apply_keep_policy but operates via SSH.  Delegates the shared
+    algorithm to _apply_keep_policy_core so fixes are applied in one place.
+    """
+    raw_items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg, remote_sudo))
+    items = [
+        (ts, remote_path,
+         build_ssh_cmd(remote,
+                       btrfs_cmd(cfg, "subvolume", "delete", remote_path, sudo=False),
+                       remote_sudo))
+        for ts, remote_path in raw_items
+    ]
+    _apply_keep_policy_core(
+        archive, keep, cfg,
+        f"{remote}:{remote_dir}",
+        items,
+        f"No keep policy specified for {archive} on SSH remote – skipping pruning",
+        f"No prior archives for {archive} found in {remote}:{remote_dir}",
+        forced_keep,
+    )
+
+def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forced_keep: list[str] | None = None) -> None:
+    """Apply the given keep policy to snapshots or backups of an archive.
+
+    Uses the btrbu algorithm (non-overlapping interval slots from newest
+    backward).  Delegates the shared algorithm to _apply_keep_policy_core so
+    fixes are applied in one place.
+    """
+    if not directory.is_dir():
+        log(
+            f"Directory '{directory}' does not exist – skipping keep policy for {archive}",
+            1,
+            cfg["verbose"],
+        )
+        return
+
+    raw_items = list(iter_archive_items(directory, archive))
+    items = [
+        (ts, p.name, btrfs_cmd(cfg, "subvolume", "delete", str(p)))
+        for ts, p in raw_items
+    ]
+    _apply_keep_policy_core(
+        archive, keep, cfg,
+        str(directory),
+        items,
+        f"No keep policy specified for {archive} – skipping pruning (default: leave existing snapshots/backups untouched)",
+        f"No prior archives for {archive} found in {directory}",
+        forced_keep,
+    )
 
 #-----------------------------------------------------------------
 # Does all archive related actions
@@ -2001,14 +2278,15 @@ def _build_hook_context(
 def _apply_all_keep_policies(
     snap_dir: Path | None, backup_dir: Path | None, remote: str | None,
     remote_dir: str | None, remote_sudo: bool, name: str, keep: dict, cfg: dict,
+    forced_keep: list[str] | None = None,
 ) -> None:
     """Apply keep policy to snap_dir, backup_dir, and remote in one place."""
     if snap_dir:
-        apply_keep_policy(snap_dir, name, keep, cfg)
+        apply_keep_policy(snap_dir, name, keep, cfg, forced_keep)
     if backup_dir:
-        apply_keep_policy(backup_dir, name, keep, cfg)
+        apply_keep_policy(backup_dir, name, keep, cfg, forced_keep)
     if remote and remote_dir:
-        apply_keep_policy_ssh(remote, remote_dir, name, keep, cfg, remote_sudo)
+        apply_keep_policy_ssh(remote, remote_dir, name, keep, cfg, remote_sudo, forced_keep)
 
 
 def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict, name: str) -> None:
@@ -2035,16 +2313,17 @@ def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict
 def _receive_and_post(received: str | None, archive: dict, name: str, snap: Path | None,
                       backup_dir: Path | None, remote: str | None, remote_dir: str | None,
                       snap_dir: Path | None, keep: dict, cfg: dict,
-                      remote_sudo: bool = False) -> None:
+                      remote_sudo: bool = False,
+                      forced_keep: list[str] | None = None) -> None:
     """After a receive, run post-backup hook and all keep policies."""
     if received:
         run_hook(archive.get("post_backup_hook"),
                  _build_hook_context(name, snap, received, backup_dir, remote, remote_dir, cfg), cfg)
         _apply_all_keep_policies(snap_dir or None, backup_dir, remote, remote_dir, remote_sudo,
-                                 name, keep, cfg)
+                                 name, keep, cfg, forced_keep)
 
 
-def process_archive(archive: dict, cfg: dict) -> None:
+def process_archive(archive: dict, cfg: dict) -> str | None:
     """
     Normal processing for a single archive:
     pre-hook -> snapshot -> post-snapshot-hook -> backup -> post-backup-hook -> keep policy
@@ -2060,7 +2339,10 @@ def process_archive(archive: dict, cfg: dict) -> None:
     name = archive["name"]
     subvol = archive["subvolume"]
     keep = archive["keep"]
+    forced_keep_list = archive.get("forced_keep", [])
     remote_sudo = archive.get("remote_sudo", False)
+    use_rsync = archive.get("rsync", False)
+    archive_rsync_opts = archive.get("rsync_opts")
 
     log(f"=== Processing archive: {name} ({subvol}) ===", 1, cfg["verbose"])
 
@@ -2088,20 +2370,29 @@ def process_archive(archive: dict, cfg: dict) -> None:
     remote_dir = archive.get("remote_path")
     staged = bool(archive.get("stage_file") or stage_dir)
 
+    # Validate all archive paths early — fail fast before any mutation.
+    # Caching inside chk_btrfs_subvolume/chk_btrfs_subvolume_ssh avoids
+    # redundant validation when the same path is checked across archives
+    # (e.g. a shared snapshot_dir or backup_dir).
+    chk_btrfs_subvolume(Path(subvol), cfg)
+    if snap_dir:
+        chk_btrfs_subvolume(snap_dir, cfg)
+    _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
+
     # ---- receive-only (file) ----
     if recv_file and not send_file:
         if not backup_dir and not (remote and remote_dir):
             print(f"Error: archive '{name}' import_file requires backup_dir or remote_dir (with remote)",
                   file=sys.stderr)
             sys.exit(1)
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
         p = Path(recv_file)
         if not p.is_file() or not is_btrfs_stream(p, cfg):
             print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
             sys.exit(1)
-        received = receive_stream(p, backup_dir, cfg, remote, remote_dir, remote_sudo)
+        received = receive_stream(p, backup_dir, cfg, remote, remote_dir, remote_sudo,
+                                  use_rsync, archive_rsync_opts)
         _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
-                          snap_dir, keep, cfg, remote_sudo)
+                          snap_dir, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2110,16 +2401,16 @@ def process_archive(archive: dict, cfg: dict) -> None:
         if not backup_dir and not (remote and remote_dir):
             print("Error: import_dir requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
         stream = find_newest_stream_for_archive(Path(recv_dir), name, cfg)
         if not stream:
             log(f"No matching stream for archive '{name}' in {recv_dir}", 1, cfg["verbose"])
             log(f"Finished archive: {name}\n", 1, cfg["verbose"])
             return
         log(f"Using stream {stream} for archive {name}", 1, cfg["verbose"])
-        received = receive_stream(stream, backup_dir, cfg, remote, remote_dir, remote_sudo)
+        received = receive_stream(stream, backup_dir, cfg, remote, remote_dir, remote_sudo,
+                                  use_rsync, archive_rsync_opts)
         _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
-                          snap_dir, keep, cfg, remote_sudo)
+                          snap_dir, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2128,25 +2419,48 @@ def process_archive(archive: dict, cfg: dict) -> None:
         print("Error: snapshot_dir is required for snapshot/send operations",
               file=sys.stderr)
         sys.exit(1)
-    chk_btrfs_subvolume(Path(subvol), cfg)
-    chk_btrfs_subvolume(snap_dir, cfg)
 
-    log("Running pre-snapshot hook...", 1, cfg["verbose"])
-    run_hook(archive.get("pre_snapshot_hook"), {
-        "archive": name, "subvol": subvol, "timestamp": timestamp(),
-        "snapshotdir": str(snap_dir),
-        "backupdir": str(backup_dir) if backup_dir else "",
-    }, cfg)
+    # Check for interrupted rsync transfer before taking a snapshot
+    # so we can reuse the existing stream file instead of creating a new one
+    interrupted_rsync = False
+    interrupted_stream: Path | None = None
+    if use_rsync and remote and remote_dir:
+        log(f"Checking for interrupted rsync transfer to {remote}...", 1, cfg["verbose"])
+        interrupted_rsync = _check_interrupted_rsync(remote, cfg)
+        if interrupted_rsync:
+            # Determine which stream file was being transferred
+            if send_file:
+                interrupted_stream = Path(send_file)
+            elif send_dir:
+                interrupted_stream = find_newest_stream_for_archive(Path(send_dir), name, cfg)
+            if interrupted_stream and interrupted_stream.is_file():
+                log(f"Found interrupted rsync transfer with stream file: {interrupted_stream}", 1, cfg["verbose"])
+            else:
+                log(f"Partial-dir found but no matching stream file; proceeding with new transfer", 1, cfg["verbose"])
+                interrupted_rsync = False
 
-    log("Creating snapshot...", 1, cfg["verbose"])
-    snap = create_snapshot(name, subvol, snap_dir, cfg)
+    if interrupted_rsync and interrupted_stream and interrupted_stream.is_file():
+        log(f"Resuming interrupted rsync transfer (stream file already exists)", 1, cfg["verbose"])
+        snap = interrupted_stream  # use the existing stream file as 'snap' placeholder
+        post_hook_snap_name = interrupted_stream.stem
+    else:
+        log("Running pre-snapshot hook...", 1, cfg["verbose"])
+        run_hook(archive.get("pre_snapshot_hook"), {
+            "archive": name, "subvol": subvol, "timestamp": timestamp(),
+            "snapshotdir": str(snap_dir),
+            "backupdir": str(backup_dir) if backup_dir else "",
+        }, cfg)
 
-    log("Running post-snapshot hook...", 1, cfg["verbose"])
-    run_hook(archive.get("post_snapshot_hook"), {
-        "snapshot": str(snap), "archive": name, "timestamp": timestamp(),
-        "snapshotdir": str(snap_dir),
-        "backupdir": str(backup_dir) if backup_dir else "",
-    }, cfg)
+        log("Creating snapshot...", 1, cfg["verbose"])
+        snap = create_snapshot(name, subvol, snap_dir, cfg)
+        post_hook_snap_name = snap.name
+
+        log("Running post-snapshot hook...", 1, cfg["verbose"])
+        run_hook(archive.get("post_snapshot_hook"), {
+            "snapshot": str(snap), "archive": name, "timestamp": timestamp(),
+            "snapshotdir": str(snap_dir),
+            "backupdir": str(backup_dir) if backup_dir else "",
+        }, cfg)
 
     stream_path: Path | None = None
     dest: Path | None = None
@@ -2154,36 +2468,41 @@ def process_archive(archive: dict, cfg: dict) -> None:
 
     if send_file:
         stream_path = Path(send_file)
-        send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+        if not interrupted_rsync:
+            send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
         # When export_file is set with a local backup_dir and no import_file,
         # also do a normal piped send|receive to the local backup_dir (in
         # addition to any file-based remote transfer).
         if backup_dir and not recv_file:
-            _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
+            if not interrupted_rsync:
+                _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif send_dir:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
-        stream_path = Path(send_dir) / f"{snap.name}.btrfs"
-        send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+        stream_path = Path(send_dir) / f"{post_hook_snap_name}.btrfs"
+        if not interrupted_rsync:
+            send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
         dest = backup_dir / snap.name if backup_dir else stream_path
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
         log("Starting backup...", 1, cfg["verbose"])
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
 
         if (send_file or send_dir) and remote and remote_dir:
-            dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+            if not interrupted_rsync:
+                dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
+            else:
+                dest = stream_path
         else:
             dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
 
         run_hook(archive.get("post_backup_hook"),
                  _build_hook_context(name, snap, dest, backup_dir, remote, remote_dir, cfg), cfg)
-        _apply_all_keep_policies(snap_dir, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
+        _apply_all_keep_policies(snap_dir, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
     # snaps_only or no backup destination
     if snaps_only or not (backup_dir or (remote and remote_dir)):
-        _apply_all_keep_policies(snap_dir, None, None, None, False, name, keep, cfg)
+        _apply_all_keep_policies(snap_dir, None, None, None, False, name, keep, cfg, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2205,7 +2524,6 @@ def process_archive(archive: dict, cfg: dict) -> None:
         if not backup_dir and not (remote and remote_dir):
             print("Error: receive requires backup_dir or remote_dir (with remote)", file=sys.stderr)
             sys.exit(1)
-        _validate_destinations(archive, cfg, backup_dir, remote, remote_dir, remote_sudo)
 
         if staged:
             recv_path = stream_path
@@ -2237,16 +2555,20 @@ def process_archive(archive: dict, cfg: dict) -> None:
         # stream file into backup_dir (which the piped send already covered).
         # Keep policy still needs to target backup_dir, so pass it separately.
         recv_dest_dir = None if auto_ssh_receive else backup_dir
-        received = receive_stream(recv_path, recv_dest_dir, cfg, remote, remote_dir, remote_sudo)
+        received = receive_stream(recv_path, recv_dest_dir, cfg, remote, remote_dir, remote_sudo,
+                                  use_rsync, archive_rsync_opts)
         # snap_dir keep policy is handled by the final apply_keep_policy call
         _receive_and_post(received, archive, name, snap, backup_dir, remote, remote_dir,
-                          None, keep, cfg, remote_sudo)
+                          None, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
 
         if staged and stream_path is not None:
             remove_stage_file(stream_path, cfg)
 
-    apply_keep_policy(snap_dir, name, keep, cfg)
+    apply_keep_policy(snap_dir, name, keep, cfg, forced_keep_list)
     log(f"Finished archive: {name}\n", 1, cfg["verbose"])
+    if interrupted_rsync:
+        log(f"Archive {name} recovered from interrupted rsync; will re-process for complete backup", 1, cfg["verbose"])
+        return "RECOVERED"
 
 
 def main() -> int:
@@ -2334,6 +2656,25 @@ Examples:
         action="store_true",
         help="Run local btrfs commands with 'sudo -n'"
     )
+    parser.add_argument(
+        "--rsync",
+        action="store_true",
+        help="Use rsync instead of scp for stream file transfer to SSH remote. "
+             "Provides partial-transfer recovery via --partial-dir. "
+             "Can be set globally or per-archive in config file. "
+             "Implies rsync uses -a and --partial-dir by default."
+    )
+    parser.add_argument(
+        "--rsync-opts",
+        type=str,
+        metavar="OPTS",
+        help="Additional rsync options (space-separated). "
+             "Applies when --rsync is enabled. "
+             "Blocked: --partial-dir, --delete, --backup, -v/--verbose, --progress, "
+             "--stats, --dry-run, --daemon, --files-from, --bwlimit, --rsh, "
+             "--rsync-path, --exclude, --include, --filter, and other potentially "
+             "dangerous options. Blocked options are reported via stderr."
+    )
 
     # Keep policy (CLI keeps are all-or-nothing)
     parser.add_argument("--keep-hourly", type=int, metavar="N", help="Number of hourly snapshots/backups to retain")
@@ -2345,7 +2686,7 @@ Examples:
         help="Day that starts the week: monday..sunday (default: sunday). Affects keep policy weekly boundary.")
 
     # Per-archive forced keep
-    parser.add_argument("--keep", type=str, metavar="TIMESTAMP", action="append",
+    parser.add_argument("--forced-keep", type=str, metavar="TIMESTAMP", action="append",
         help="Force keep of a specific timestamp for the archive (format: YYYYMMDDhhmm). "
              "Can be specified multiple times. Comma-separated list also accepted. "
              "Must match an existing snapshot/backup for the archive. Archive-specific only.")
@@ -2472,12 +2813,27 @@ Examples:
         return 1
 
     # Process each archive fully
+    recovered_archives = []
     for archive in archives:
         try:
-            process_archive(archive, global_cfg)
+            result = process_archive(archive, global_cfg)
+            if result == "RECOVERED":
+                recovered_archives.append(archive)
         except Exception as e:
             log(f"Error processing {archive['name']}: {e}", 1, global_cfg["verbose"])
             return 1
+
+    # Re-process archives that were recovered from interrupted rsync transfers.
+    # The first pass completed the interrupted transfer; this second pass runs
+    # the full normal flow (new snapshot, hooks, backup, keep policy).
+    if recovered_archives:
+        log(f"Re-processing {len(recovered_archives)} recovered archive(s)...", 1, global_cfg["verbose"])
+        for archive in recovered_archives:
+            try:
+                process_archive(archive, global_cfg)
+            except Exception as e:
+                log(f"Error re-processing {archive['name']}: {e}", 1, global_cfg["verbose"])
+                return 1
 
     log("All archives processed.", 1, global_cfg["verbose"])
     return 0    
