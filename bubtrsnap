@@ -864,7 +864,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         total_archives = n_cli if n_cli > 0 else n_cfg
         if total_archives != 1:
             print(
-                "Error: --keep requires exactly one archive to process "
+                "Error: --forced-keep requires exactly one archive to process "
                 f"(found {total_archives})",
                 file=sys.stderr,
             )
