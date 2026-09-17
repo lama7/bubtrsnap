@@ -1182,7 +1182,7 @@ def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Pat
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
-        print(f"Error executing `{cmd}`")
+        print(f"Error executing `{cmd}`", file=sys.stderr)
         sys.exit(1)
 
     return dest
@@ -1528,7 +1528,7 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     if result is not None and result.returncode != 0:
         seq_elapsed = (datetime.now() - seq_start).total_seconds()
         log(f"SCP + receive sequence failed after {format_duration(seq_elapsed)}", 1, cfg["verbose"])
-        print(f"Error copying stream to remote via SCP:\\n{result.stderr}", file=sys.stderr)
+        print(f"Error copying stream to remote via SCP:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
 
     # Now receive on remote using the copied file
@@ -1557,7 +1557,7 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
             print(f"Warning: subvolume from '{stream.name}' already exists in "
                   f"{remote_dir} – skipping", file=sys.stderr)
             return None
-        print(f"Error receiving '{stream}' via SSH:\\n{stderr}", file=sys.stderr)
+        print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
         sys.exit(1)
     
     # Extract subvolume name reported by btrfs
