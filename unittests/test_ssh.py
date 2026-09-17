@@ -401,6 +401,52 @@ class TestApplyKeepPolicySSH(unittest.TestCase):
             self.assertIn("/remote/backup/lama7.202608280230", deleted_paths)
             self.assertIn("/remote/backup/lama7.202608290230", deleted_paths)
 
+    @patch("bubtrsnap.run")
+    def test_apply_keep_policy_ssh_forced_keep_prevents_pruning(self, mock_run):
+        """apply_keep_policy_ssh must respect the forced_keep parameter (Bug 2).
+
+        With keep_daily=2 and 4 items, the oldest 2 are pruned.  A forced_keep
+        timestamp in one of those pruned slots must be preserved.
+        """
+        def run_mock(cmd, **kwargs):
+            if kwargs.get("dry_run", False):
+                return None
+            mock = MagicMock()
+            mock.returncode = 0
+            return mock
+
+        mock_run.side_effect = run_mock
+
+        cfg = {"local_sudo": False, "verbose": 1, "dry_run": True}
+
+        with patch.object(bs, "iter_archive_items_ssh") as mock_iter:
+            mock_iter.return_value = [
+                ("202608280230", "/remote/backup/lama7.202608280230"),
+                ("202608290230", "/remote/backup/lama7.202608290230"),
+                ("202608300230", "/remote/backup/lama7.202608300230"),
+                ("202608310230", "/remote/backup/lama7.202608310230"),
+            ]
+
+            bs.apply_keep_policy_ssh("user@host", "/remote/backup", "lama7",
+                                     {"keep_daily": 2}, cfg,
+                                     forced_keep=["202608290230"])
+
+            delete_calls = []
+            for call in mock_run.call_args_list:
+                args, _ = call
+                cmd_str = " ".join(args[0]) if args else ""
+                if "delete" in cmd_str:
+                    delete_calls.append(args[0])
+
+            # keep_daily=2 keeps newest 2 (0830, 0831); 0829 is forced →
+            # only 0828 should be pruned.
+            self.assertEqual(len(delete_calls), 1)
+            self.assertIn("202608280230", delete_calls[0][-1])
+            self.assertFalse(
+                any("202608290230" in c[-1] for c in delete_calls),
+                "Forced-keep timestamp must NOT be pruned on SSH remote",
+            )
+
 
 class TestFindParentsSSH(unittest.TestCase):
     """Test find_parents_ssh mirrors local find_parents logic."""

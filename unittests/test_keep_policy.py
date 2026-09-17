@@ -717,8 +717,8 @@ class TestForcedKeepRouting(unittest.TestCase):
             (backup_dir / f"{archive_name}.{ts}").mkdir()
 
     @patch("bubtrsnap.run")
-    def test_forced_keep_in_cfg_prevents_pruning(self, mock_run):
-        """Control: when forced_keep IS in cfg, it works correctly."""
+    def test_forced_keep_prevents_pruning(self, mock_run):
+        """Control: forced_keep passed as parameter is respected."""
         with tempfile.TemporaryDirectory() as td:
             backup_dir = Path(td)
             archive_name = "testarchive"
@@ -727,12 +727,13 @@ class TestForcedKeepRouting(unittest.TestCase):
 
             cfg = {
                 "verbose": 1, "dry_run": True, "local_sudo": False,
-                "forced_keep": ["202601021200"],  # in cfg — works
             }
             keep = {"keep_hourly": 0, "keep_daily": 1,
                     "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0}
 
-            bs.apply_keep_policy(backup_dir, archive_name, keep, cfg)
+            # forced_keep is passed as an explicit parameter (no longer via cfg)
+            bs.apply_keep_policy(backup_dir, archive_name, keep, cfg,
+                                 forced_keep=["202601021200"])
 
             # Oldest (0101) should be pruned
             delete_cmds = [
@@ -749,17 +750,13 @@ class TestForcedKeepRouting(unittest.TestCase):
                              "Forced-keep timestamp must NOT be pruned")
 
     @patch("bubtrsnap.run")
-    def test_forced_keep_in_archive_but_not_cfg_gets_pruned(self, mock_run):
-        """Bug demonstration: forced_keep is in archive dict but cfg lacks it.
+    def test_forced_keep_routed_to_apply_keep_policy(self, mock_run):
+        """forced_keep is routed from the archive dict through _apply_all_keep_policies.
 
         load_and_resolve_archives stores forced_keep in archive["forced_keep"],
-        but process_archive passes cfg (global config) to _apply_all_keep_policies
-        which passes it to apply_keep_policy.  Since cfg never gets
-        forced_keep set, cfg.get("forced_keep", []) returns [] and the
-        forced-keep timestamp is silently pruned.
-
-        This test asserts the EXPECTED behavior (forced keep should survive)
-        and WILL FAIL until the routing bug is fixed.
+        and process_archive now extracts it and passes it as an explicit
+        parameter to _apply_all_keep_policies (not via cfg), so the
+        forced-keep timestamp is correctly preserved.
         """
         with tempfile.TemporaryDirectory() as td:
             backup_dir = Path(td)
@@ -767,20 +764,19 @@ class TestForcedKeepRouting(unittest.TestCase):
             timestamps = ["202601011200", "202601021200", "202601031200"]
             self._setup_backup_dir(backup_dir, archive_name, timestamps)
 
-            # Simulate what process_archive does: forced_keep is in the
-            # archive dict, but cfg (global config) does NOT have it.
+            # process_archive extracts forced_keep from the archive dict and
+            # passes it as an explicit parameter to _apply_all_keep_policies
+            # (it is no longer read from cfg).
             cfg = {
                 "verbose": 1, "dry_run": True, "local_sudo": False,
-                # forced_keep is NOT in cfg -- this is the bug
             }
             keep = {"keep_hourly": 0, "keep_daily": 1,
                     "keep_weekly": 0, "keep_monthly": 0, "keep_yearly": 0}
 
-            # process_archive calls _apply_all_keep_policies(..., cfg)
-            # which calls apply_keep_policy(dir, archive_name, keep, cfg)
             bs._apply_all_keep_policies(
                 None, backup_dir, None, None, False,
                 archive_name, keep, cfg,
+                forced_keep=["202601021200"],
             )
 
             # Check which timestamps were targeted for deletion

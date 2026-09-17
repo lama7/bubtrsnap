@@ -2099,63 +2099,24 @@ def build_keep_set(ts_list: list[str], keep: dict, week_start_day: int = 6) -> d
 
     return keeps
 
-def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict, remote_sudo: bool = False) -> None:
-    """
-    Apply the given keep policy to backups of an archive on a remote SSH host.
-    Mirrors apply_keep_policy but operates via SSH.
-    """
-    keep_values = [
-        keep.get("keep_hourly", 0),
-        keep.get("keep_daily", 0),
-        keep.get("keep_weekly", 0),
-        keep.get("keep_monthly", 0),
-        keep.get("keep_yearly", 0),
-    ]
-    if not any(v > 0 for v in keep_values):
-        log(
-            f"No keep policy specified for {archive} on SSH remote – skipping pruning",
-            1,
-            cfg["verbose"],
-        )
-        return
+def _apply_keep_policy_core(
+    archive: str,
+    keep: dict,
+    cfg: dict,
+    location: str,
+    items: list[tuple[str, str, list[str]]],
+    no_policy_msg: str,
+    no_items_msg: str,
+    forced_keep: list[str] | None = None,
+) -> None:
+    """Shared keep-policy engine used by apply_keep_policy and apply_keep_policy_ssh.
 
-    log(f"Keep policy for {archive} on SSH remote {remote}:{remote_dir}: {format_keep_policy(keep)}", 1, cfg["verbose"])
-    log(f"Applying to {archive} in {remote}:{remote_dir}:", 1, cfg["verbose"])
+    *items* is a pre-materialised list of (timestamp, display_name, delete_cmd)
+    triples produced by the caller (who knows how to enumerate its destination).
 
-    items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg, remote_sudo))
-    if not items:
-        log(f"\tNo prior archives for {archive} found in {remote}:{remote_dir}", 1, cfg["verbose"])
-        return
-
-    # ascending timestamp order (btrbu style)
-    items.sort(key=lambda x: x[0])
-    ts_list = [t for t, _ in items]
-
-    keeps = build_keep_set(ts_list, keep)
-
-    for t, remote_path in items:
-        if t in keeps:
-            reason = _KEEP_REASON.get(keeps[t], keeps[t])
-            log(f"\tKeeping {remote_path} ({reason})", 1, cfg["verbose"])
-        else:
-            log(f"\tPruning {remote_path}", 1, cfg["verbose"])
-            # Build SSH delete command
-            delete_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "delete", remote_path, sudo=False), remote_sudo)
-            try:
-                run(delete_cmd,
-                    dry_run=cfg.get("dry_run", False),
-                    verbosity=cfg["verbose"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True)
-            except subprocess.CalledProcessError:
-                print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
-                sys.exit(1)
-
-def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> None:
-    """
-    Apply the given keep policy to snapshots or backups of an archive.
-    Uses the btrbu algorithm (non-overlapping interval slots from newest backward).
+    *forced_keep* is the archive-specific list of timestamps to preserve; it is
+    passed explicitly rather than read from *cfg* so per-archive values do not
+    leak across archives in the same run.
     """
     keep_values = [
         keep.get("keep_hourly", 0),
@@ -2165,50 +2126,37 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         keep.get("keep_yearly", 0),
     ]
     if not any(v > 0 for v in keep_values):
-        log(
-            f"No keep policy specified for {archive} – skipping pruning "
-            f"(default: leave existing snapshots/backups untouched)",
-            1,
-            cfg["verbose"],
-        )
+        log(no_policy_msg, 1, cfg["verbose"])
         return
 
-    if not directory.is_dir():
-        log(
-            f"Directory '{directory}' does not exist – skipping keep policy for {archive}",
-            1,
-            cfg["verbose"],
-        )
-        return
+    log(f"Keep policy for {archive} in {location}: {format_keep_policy(keep)}",
+        1, cfg["verbose"])
+    log(f"Applying to {archive} in {location}:", 1, cfg["verbose"])
 
-    log(f"Keep policy for {archive}: {format_keep_policy(keep)}", 1, cfg["verbose"])
-    log(f"Applying to {archive} in {directory}:", 1, cfg["verbose"])
-
-    items = list(iter_archive_items(directory, archive))
     if not items:
-        log(f"\tNo prior archives for {archive} found in {directory}", 1, cfg["verbose"])
+        log(f"\t{no_items_msg}", 1, cfg["verbose"])
         return
 
     # ascending timestamp order (btrbu style)
     items.sort(key=lambda x: x[0])
-    ts_list = [t for t, _ in items]
+    ts_list = [t for t, _, _ in items]
 
-    # Parse week_startday from config
-    week_startday_str = cfg.get("week_startday", "sunday").lower()
-    week_start_day = _DAY_TO_WEEKDAY.get(week_startday_str, 6)
+    # Parse week_startday from config (shared — both local and SSH honour it)
+    week_start_day = _DAY_TO_WEEKDAY.get(
+        cfg.get("week_startday", "sunday").lower(), 6)
 
     # Handle forced_keep: validate timestamps exist for this archive
-    forced_keep_list = cfg.get("forced_keep", [])
+    forced_keep_list = forced_keep or []
     if forced_keep_list:
         valid_forced_keep = []
         for ts in forced_keep_list:
             if ts not in ts_list:
-                log(f"Warning: --keep timestamp '{ts}' not found for archive '{archive}' – ignoring", 1, cfg["verbose"])
+                log(f"Warning: --forced-keep timestamp '{ts}' not found for archive '{archive}' – ignoring", 1, cfg["verbose"])
             else:
                 valid_forced_keep.append(ts)
         forced_keep_list = valid_forced_keep
 
-    # Apply forced keeps first - these are guaranteed to be kept
+    # Apply forced keeps first — these are guaranteed to be kept
     keeps = {}
     for ts in forced_keep_list:
         keeps[ts] = "forced"
@@ -2220,23 +2168,74 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict) -> N
         if ts not in keeps:
             keeps[ts] = reason
 
-    for t, p in items:
-        if t in keeps:
-            reason = _KEEP_REASON.get(keeps[t], keeps[t])
-            log(f"\tKeeping {p.name} ({reason})", 1, cfg["verbose"])
+    for ts, display_name, delete_cmd in items:
+        if ts in keeps:
+            reason = _KEEP_REASON.get(keeps[ts], keeps[ts])
+            log(f"\tKeeping {display_name} ({reason})", 1, cfg["verbose"])
         else:
-            log(f"\tPruning {p.name}", 1, cfg["verbose"])
-            cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))
+            log(f"\tPruning {display_name}", 1, cfg["verbose"])
             try:
-                run(cmd,
+                run(delete_cmd,
                     dry_run=cfg.get("dry_run", False),
                     verbosity=cfg["verbose"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=True)
             except subprocess.CalledProcessError:
-                print(f"Error during prune: `{cmd}`", file=sys.stderr)
+                print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
                 sys.exit(1)
+
+def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict, remote_sudo: bool = False, forced_keep: list[str] | None = None) -> None:
+    """Apply the given keep policy to backups of an archive on a remote SSH host.
+
+    Mirrors apply_keep_policy but operates via SSH.  Delegates the shared
+    algorithm to _apply_keep_policy_core so fixes are applied in one place.
+    """
+    raw_items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg, remote_sudo))
+    items = [
+        (ts, remote_path,
+         build_ssh_cmd(remote,
+                       btrfs_cmd(cfg, "subvolume", "delete", remote_path, sudo=False),
+                       remote_sudo))
+        for ts, remote_path in raw_items
+    ]
+    _apply_keep_policy_core(
+        archive, keep, cfg,
+        f"{remote}:{remote_dir}",
+        items,
+        f"No keep policy specified for {archive} on SSH remote – skipping pruning",
+        f"No prior archives for {archive} found in {remote}:{remote_dir}",
+        forced_keep,
+    )
+
+def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forced_keep: list[str] | None = None) -> None:
+    """Apply the given keep policy to snapshots or backups of an archive.
+
+    Uses the btrbu algorithm (non-overlapping interval slots from newest
+    backward).  Delegates the shared algorithm to _apply_keep_policy_core so
+    fixes are applied in one place.
+    """
+    if not directory.is_dir():
+        log(
+            f"Directory '{directory}' does not exist – skipping keep policy for {archive}",
+            1,
+            cfg["verbose"],
+        )
+        return
+
+    raw_items = list(iter_archive_items(directory, archive))
+    items = [
+        (ts, p.name, btrfs_cmd(cfg, "subvolume", "delete", str(p)))
+        for ts, p in raw_items
+    ]
+    _apply_keep_policy_core(
+        archive, keep, cfg,
+        str(directory),
+        items,
+        f"No keep policy specified for {archive} – skipping pruning (default: leave existing snapshots/backups untouched)",
+        f"No prior archives for {archive} found in {directory}",
+        forced_keep,
+    )
 
 #-----------------------------------------------------------------
 # Does all archive related actions
@@ -2279,14 +2278,15 @@ def _build_hook_context(
 def _apply_all_keep_policies(
     snap_dir: Path | None, backup_dir: Path | None, remote: str | None,
     remote_dir: str | None, remote_sudo: bool, name: str, keep: dict, cfg: dict,
+    forced_keep: list[str] | None = None,
 ) -> None:
     """Apply keep policy to snap_dir, backup_dir, and remote in one place."""
     if snap_dir:
-        apply_keep_policy(snap_dir, name, keep, cfg)
+        apply_keep_policy(snap_dir, name, keep, cfg, forced_keep)
     if backup_dir:
-        apply_keep_policy(backup_dir, name, keep, cfg)
+        apply_keep_policy(backup_dir, name, keep, cfg, forced_keep)
     if remote and remote_dir:
-        apply_keep_policy_ssh(remote, remote_dir, name, keep, cfg, remote_sudo)
+        apply_keep_policy_ssh(remote, remote_dir, name, keep, cfg, remote_sudo, forced_keep)
 
 
 def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict, name: str) -> None:
@@ -2313,13 +2313,14 @@ def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict
 def _receive_and_post(received: str | None, archive: dict, name: str, snap: Path | None,
                       backup_dir: Path | None, remote: str | None, remote_dir: str | None,
                       snap_dir: Path | None, keep: dict, cfg: dict,
-                      remote_sudo: bool = False) -> None:
+                      remote_sudo: bool = False,
+                      forced_keep: list[str] | None = None) -> None:
     """After a receive, run post-backup hook and all keep policies."""
     if received:
         run_hook(archive.get("post_backup_hook"),
                  _build_hook_context(name, snap, received, backup_dir, remote, remote_dir, cfg), cfg)
         _apply_all_keep_policies(snap_dir or None, backup_dir, remote, remote_dir, remote_sudo,
-                                 name, keep, cfg)
+                                 name, keep, cfg, forced_keep)
 
 
 def process_archive(archive: dict, cfg: dict) -> str | None:
@@ -2338,6 +2339,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     name = archive["name"]
     subvol = archive["subvolume"]
     keep = archive["keep"]
+    forced_keep_list = archive.get("forced_keep", [])
     remote_sudo = archive.get("remote_sudo", False)
     use_rsync = archive.get("rsync", False)
     archive_rsync_opts = archive.get("rsync_opts")
@@ -2390,7 +2392,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         received = receive_stream(p, backup_dir, cfg, remote, remote_dir, remote_sudo,
                                   use_rsync, archive_rsync_opts)
         _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
-                          snap_dir, keep, cfg, remote_sudo)
+                          snap_dir, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2408,7 +2410,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         received = receive_stream(stream, backup_dir, cfg, remote, remote_dir, remote_sudo,
                                   use_rsync, archive_rsync_opts)
         _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
-                          snap_dir, keep, cfg, remote_sudo)
+                          snap_dir, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2494,13 +2496,13 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
 
         run_hook(archive.get("post_backup_hook"),
                  _build_hook_context(name, snap, dest, backup_dir, remote, remote_dir, cfg), cfg)
-        _apply_all_keep_policies(snap_dir, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg)
+        _apply_all_keep_policies(snap_dir, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
     # snaps_only or no backup destination
     if snaps_only or not (backup_dir or (remote and remote_dir)):
-        _apply_all_keep_policies(snap_dir, None, None, None, False, name, keep, cfg)
+        _apply_all_keep_policies(snap_dir, None, None, None, False, name, keep, cfg, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -2557,12 +2559,12 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
                                   use_rsync, archive_rsync_opts)
         # snap_dir keep policy is handled by the final apply_keep_policy call
         _receive_and_post(received, archive, name, snap, backup_dir, remote, remote_dir,
-                          None, keep, cfg, remote_sudo)
+                          None, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
 
         if staged and stream_path is not None:
             remove_stage_file(stream_path, cfg)
 
-    apply_keep_policy(snap_dir, name, keep, cfg)
+    apply_keep_policy(snap_dir, name, keep, cfg, forced_keep_list)
     log(f"Finished archive: {name}\n", 1, cfg["verbose"])
     if interrupted_rsync:
         log(f"Archive {name} recovered from interrupted rsync; will re-process for complete backup", 1, cfg["verbose"])
