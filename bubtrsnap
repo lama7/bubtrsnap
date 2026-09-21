@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 
 # ---------------------------------------------------------------------------
@@ -1011,10 +1011,10 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                 import_dir = None
             else:
                 # Rule 3: globals apply only when archive has no file opts
-                send_dir = global_cfg.get("export_dir")
-                recv_dir = global_cfg.get("import_dir")
-                stage_dir = global_cfg.get("stage_dir")
-                # Preserve archive's export_dir/import_dir/stage_dir if set
+                send_dir = None
+                recv_dir = None
+                # Preserve archive's export_dir/import_dir/stage_dir if set;
+                # fall back to global if not
                 if export_dir is None:
                     export_dir = global_cfg.get("export_dir")
                 if import_dir is None:

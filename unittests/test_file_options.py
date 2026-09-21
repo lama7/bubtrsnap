@@ -300,6 +300,92 @@ class TestPrecedence(unittest.TestCase):
             self.assertIsNone(a["import_file"])
             self.assertIsNone(a["export_file"])
 
+    def test_archive_export_dir_overrides_global(self):
+        """Per-archive export_dir should override the global default."""
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a", "b")
+            streams_global = td_path / "global_streams"
+            streams_a = td_path / "a_streams"
+            streams_global.mkdir()
+            streams_a.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f'''
+                snapshot_dir = "{td_path}"
+                export_dir = "{streams_global}"
+                [a]
+                subvolume = "{subs["a"]}"
+                export_dir = "{streams_a}"
+                [b]
+                subvolume = "{subs["b"]}"
+                ''',
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            by_name = {x["name"]: x for x in archives}
+            # Archive A overrides global → should use its own dir
+            self.assertEqual(by_name["a"]["export_dir"], str(streams_a))
+            # Archive B has no per-archive setting → inherits global
+            self.assertEqual(by_name["b"]["export_dir"], str(streams_global))
+
+    def test_archive_import_dir_overrides_global(self):
+        """Per-archive import_dir should override the global default."""
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a", "b")
+            recv_global = td_path / "global_recv"
+            recv_a = td_path / "a_recv"
+            recv_global.mkdir()
+            recv_a.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f'''
+                snapshot_dir = "{td_path}"
+                import_dir = "{recv_global}"
+                [a]
+                subvolume = "{subs["a"]}"
+                import_dir = "{recv_a}"
+                [b]
+                subvolume = "{subs["b"]}"
+                ''',
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            by_name = {x["name"]: x for x in archives}
+            self.assertEqual(by_name["a"]["import_dir"], str(recv_a))
+            self.assertEqual(by_name["b"]["import_dir"], str(recv_global))
+
+    def test_archive_stage_dir_overrides_global(self):
+        """Per-archive stage_dir should override the global default."""
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a", "b")
+            stage_global = td_path / "global_staging"
+            stage_a = td_path / "a_staging"
+            stage_global.mkdir()
+            stage_a.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f'''
+                snapshot_dir = "{td_path}"
+                stage_dir = "{stage_global}"
+                [a]
+                subvolume = "{subs["a"]}"
+                stage_dir = "{stage_a}"
+                [b]
+                subvolume = "{subs["b"]}"
+                ''',
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            by_name = {x["name"]: x for x in archives}
+            self.assertEqual(by_name["a"]["stage_dir"], str(stage_a))
+            self.assertEqual(by_name["b"]["stage_dir"], str(stage_global))
+
 
 class TestSingleArchiveRequirement(unittest.TestCase):
     def test_export_file_two_cli_archives(self):
