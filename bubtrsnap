@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +549,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "backup_dir": str,
     "export_dir": str,
     "import_dir": str,
+    "stage_dir": str,
     "rsync": bool,
     "rsync_opts": str,
 }
@@ -974,13 +975,16 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             if stage_file:
                 stage_file = expand_path(stage_file)
 
-            # Also read export_dir and import_dir from archive config
+            # Also read export_dir, import_dir and stage_dir from archive config
             export_dir = raw.get("export_dir")
             import_dir = raw.get("import_dir")
+            stage_dir = raw.get("stage_dir")
             if export_dir:
                 export_dir = expand_path(export_dir)
             if import_dir:
                 import_dir = expand_path(import_dir)
+            if stage_dir:
+                stage_dir = expand_path(stage_dir)
 
             if stage_file and (send_file or recv_file):
                 print(
@@ -990,13 +994,13 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                 )
                 sys.exit(1)
 
-            # Initialize send_dir/recv_dir to None before check
+            # Initialize send_dir/recv_dir to None (dir vars not yet set);
+            # stage_dir/export_dir/import_dir were set from raw above.
             send_dir = None
             recv_dir = None
-            stage_dir = None
             
             # Only file options (send_file, recv_file, stage_file) count as "file opts"
-            # export_dir/import_dir are directory options that should be preserved
+            # export_dir/import_dir/stage_dir are directory options that should be preserved
             archive_has_file_opts = bool(send_file or recv_file or stage_file)
             if archive_has_file_opts:
                 # Rule 2: archive-specific only — no global dirs
@@ -1010,14 +1014,15 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                 send_dir = global_cfg.get("export_dir")
                 recv_dir = global_cfg.get("import_dir")
                 stage_dir = global_cfg.get("stage_dir")
-                # Preserve archive's export_dir/import_dir if set
+                # Preserve archive's export_dir/import_dir/stage_dir if set
                 if export_dir is None:
                     export_dir = global_cfg.get("export_dir")
                 if import_dir is None:
                     import_dir = global_cfg.get("import_dir")
+                if stage_dir is None:
+                    stage_dir = global_cfg.get("stage_dir")
                 send_dir = export_dir
                 recv_dir = import_dir
-                stage_dir = global_cfg.get("stage_dir")
 
         snaps_only = (
             True
