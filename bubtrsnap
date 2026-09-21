@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 
 # ---------------------------------------------------------------------------
@@ -1115,60 +1115,84 @@ def btrfs_cmd(cfg: dict, *args: str, sudo: bool | None = None) -> list[str]:
         cmd = ["sudo", "-n"] + cmd
     return cmd + list(args)
 
+
+# Core validation: cache check → log L1 → execute → log L2 / error exit.
+# Each public wrapper builds its command and delegates here.
+def _validate_subvol_path(
+    cache_key: str,
+    location: str,
+    success_msg: str,
+    verbose: int,
+    cfg: dict,
+    cmd: list[str],
+    *,
+    is_ssh: bool = False,
+    timeout: int | None = None,
+    **kwargs,
+) -> None:
+    """Execute *cmd* and verify it succeeds (exit 0).
+
+    Caching lives in ``cfg["_validated_paths"]`` so callers only supply the
+    unique cache key, not the dedup logic.
+    """
+    validated = cfg.setdefault("_validated_paths", set())
+    if cache_key in validated:
+        return
+
+    log(f"Checking {location} is a valid btrfs subvolume...", 1, verbose)
+
+    try:
+        run(cmd, dry_run=False, verbosity=verbose, timeout=timeout, **kwargs)
+        log(success_msg, 2, verbose)
+        validated.add(cache_key)
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"Error: '{location}' is not a btrfs subvolume "
+            "(required for snapshot/backup/receive operations)",
+            file=sys.stderr,
+        )
+        if exc.stderr and is_ssh:
+            print(f"  SSH error: {exc.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"Error: validation of '{location}' timed out", file=sys.stderr)
+        sys.exit(1)
+
+
 # makes sure the dir is a subvolume, errors out if not
 def chk_btrfs_subvolume(dir: Path, cfg: dict):
     # Cache: avoid redundant btrfs subvolume show for the same path across
     # multiple archives in a single run (e.g. shared snapshot_dir/backup_dir).
     cache_key = f"local:{dir}"
-    validated = cfg.setdefault("_validated_paths", set())
-    if cache_key in validated:
-        return
-    log(f"Checking {dir} is a valid btrfs subvolume...", 1, cfg["verbose"])
-    try:
-        run(btrfs_cmd(cfg, "subvolume", "show", str(dir)),
-            dry_run=False,
-            verbosity=cfg["verbose"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True)
-        log(f"\t{dir} is a valid btrfs subvolume", 2, cfg["verbose"])
-        validated.add(cache_key)
-
-    except subprocess.CalledProcessError:
-        print(f"Error: '{dir}' is not a btrfs subvolume "
-        f"(required for snapshot/backup/receive operations)", file=sys.stderr)
-        sys.exit(1)
+    cmd = btrfs_cmd(cfg, "subvolume", "show", str(dir))
+    _validate_subvol_path(
+        cache_key,
+        str(dir),
+        f"\t{dir} is a valid btrfs subvolume",
+        cfg["verbose"],
+        cfg,
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 def chk_btrfs_subvolume_ssh(remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False):
     """Check if a remote directory is a btrfs subvolume via SSH."""
-    # Cache: avoid redundant SSH round-trips for the same remote path across
-    # multiple archives in a single run.
     cache_key = f"ssh:{remote}:{remote_dir}"
-    validated = cfg.setdefault("_validated_paths", set())
-    if cache_key in validated:
-        return
-    log(f"Checking {remote}:{remote_dir} is a valid btrfs subvolume...", 1, cfg["verbose"])
-    # Build SSH command: ssh remote sudo -n btrfs subvolume show remote_dir
     sudo_prefix = ["sudo", "-n"] if remote_sudo else []
     ssh_cmd = ["ssh", remote] + sudo_prefix + ["btrfs", "subvolume", "show", remote_dir]
-    
-    # Always execute validation during dry-run (read-only operation)
-    try:
-        result = run(ssh_cmd,
-                     dry_run=False,
-                     verbosity=cfg["verbose"],
-                     check=True, capture_output=True, text=True, timeout=30)
-        log(f"\t{remote}:{remote_dir} is a valid btrfs subvolume", 2, cfg["verbose"])
-        validated.add(cache_key)
-    except subprocess.CalledProcessError as e:
-        print(f"Error: '{remote}:{remote_dir}' is not a btrfs subvolume "
-              f"(required for snapshot/backup/receive operations)", file=sys.stderr)
-        if e.stderr:
-            print(f"  SSH error: {e.stderr.strip()}", file=sys.stderr)
-        sys.exit(1)
-    except subprocess.TimeoutExpired:
-        print(f"Error: SSH connection to {remote} timed out", file=sys.stderr)
-        sys.exit(1)
+    _validate_subvol_path(
+        cache_key,
+        f"{remote}:{remote_dir}",
+        f"\t{remote}:{remote_dir} is a valid btrfs subvolume",
+        cfg["verbose"],
+        cfg,
+        ssh_cmd,
+        is_ssh=True,
+        timeout=30,
+        capture_output=True,
+        text=True,
+    )
 
 def create_snapshot(archive: str, subvol: str, snap_dir: Path, cfg: dict) -> Path:
     name = f"{archive}.{timestamp()}"
