@@ -1810,6 +1810,94 @@ class TestNoDuplicateKeepPolicy(unittest.TestCase):
                              f"Expected keep policy applied once to snap_dir, got {snap_dir_applies}:\\n{output}")
 
 
+class TestExportDirDualDestination(unittest.TestCase):
+    """Test that export_dir + remote_host/remote_path + backup_dir populates BOTH:
+      1. local backup_dir via piped send|receive
+      2. remote via auto-receive (SCP + SSH receive)
+
+    This mirrors TestNoDuplicateReceiveWithAutoSSHDestination which verifies
+    the same dual-destination flow for export_file.  The export_dir path must
+    behave identically — the only difference is the stream file naming convention
+    ({archive}.{timestamp}.btrfs in a directory vs an explicit single file).
+    """
+
+    def setUp(self):
+        self.subvol_patcher = patch("bubtrsnap.chk_btrfs_subvolume")
+        self.ssh_patcher = patch("bubtrsnap.chk_btrfs_subvolume_ssh")
+        self.addCleanup(self.subvol_patcher.stop)
+        self.addCleanup(self.ssh_patcher.stop)
+        self.subvol_patcher.start()
+        self.ssh_patcher.start()
+
+    @patch("bubtrsnap._piped_send_to_local")
+    @patch("bubtrsnap.run")
+    def test_export_dir_with_remote_and_backup_dir_calls_piped_send(
+        self, mock_run, mock_piped
+    ):
+        """With export_dir + remote + backup_dir, _piped_send_to_local MUST be
+        called so that backup_dir gets populated alongside the SSH transfer."""
+
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+            export_dir = snap_dir / "streams"
+            export_dir.mkdir()
+
+            archive_name = "testarc"
+            snap_path = snap_dir / f"{archive_name}.202601011200"
+            snap_path.mkdir()
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "keep_daily": 3,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "export_dir": str(export_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/run/media/gerry/backup",
+                "remote_sudo": True,
+                "backup_dir": str(backup_dir),
+                "keep": {"keep_daily": 3, "keep_weekly": 0, "keep_monthly": 0,
+                         "keep_hourly": 0, "keep_yearly": 0},
+            }
+
+            # Mock run(): return successful results for validation/parent-finding,
+            # None for all write operations (dry-run).
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if ("subvolume show" in cmd_str or "subvolume list" in cmd_str
+                        or "test -d" in cmd_str):
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str and "Received UUID" not in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    elif "list" in cmd_str:
+                        result.stdout = ""
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            bs.process_archive(archive, cfg)
+
+            # THE ASSERTION: _piped_send_to_local must have been called to
+            # populate backup_dir via local piped send|receive
+            mock_piped.assert_called_once()
+
+
 class TestNoDuplicateReceiveWithAutoSSHDestination(unittest.TestCase):
     """Regression test for stray 'btrfs receive -f file.btrfs /backup_dir' when
     export_file + remote + backup_dir are all configured.
