@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 
 
 # ---------------------------------------------------------------------------
@@ -1615,8 +1615,6 @@ def _check_interrupted_rsync(remote: str, cfg: dict) -> bool:
     """
     remote_partial_dir = "/tmp/.bubtrsnap-partial"
     check_cmd = ["ssh", remote, "test", "-d", remote_partial_dir]
-    if cfg.get("local_sudo"):
-        check_cmd = ["sudo", "-n"] + check_cmd
 
     result = run(check_cmd,
                   dry_run=False,  # always execute — read-only check, should run even during dry-run

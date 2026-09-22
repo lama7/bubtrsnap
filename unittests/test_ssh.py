@@ -1257,6 +1257,23 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         result = bs._check_interrupted_rsync("user@host", cfg)
         self.assertTrue(result)
 
+    @patch("bubtrsnap.run")
+    def test_check_interrupted_rsync_no_sudo_prefix(self, mock_run):
+        """_check_interrupted_rsync must NOT run the ssh client as root, even
+        when local_sudo is set. The check reads no local file (unlike scp/rsync,
+        which need root to read the root-owned stream file), and running ssh as
+        root would use root's ~/.ssh config/keys/known_hosts, which can break
+        the connection and silently disable interrupted-rsync recovery."""
+        mock_run.return_value = MagicMock(returncode=1)
+
+        cfg = {"verbose": 0, "dry_run": False, "local_sudo": True}
+        result = bs._check_interrupted_rsync("user@host", cfg)
+        self.assertFalse(result)
+
+        cmd = mock_run.call_args.args[0]
+        self.assertEqual(cmd, ["ssh", "user@host", "test", "-d", "/tmp/.bubtrsnap-partial"])
+        self.assertNotIn("sudo", cmd)
+
 
 class TestValidationCache(unittest.TestCase):
     """Test that btrfs subvolume validation results are cached across
