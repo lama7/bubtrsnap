@@ -246,6 +246,88 @@ class TestStageFileBackup(unittest.TestCase):
             all_cmds = " ".join(cmd_strs)
             self.assertIn("sudo", all_cmds)
 
+    @patch("bubtrsnap.receive_stream")
+    @patch("bubtrsnap._piped_send_to_local")
+    @patch("bubtrsnap.run")
+    def test_stage_file_dual_destination_local_uses_piped_send(self, mock_run, mock_piped, mock_receive):
+        """stage_file + backup_dir + remote (dual-destination, staged) must route
+        the LOCAL backup_dir through an independent piped send (fresh parents from
+        find_parents(backup_dir)) and pass backup_dir=None to receive_stream so it
+        only handles the remote. Otherwise the single exported stream — whose
+        parents are matched to the REMOTE history by send_backup_tofile — is
+        re-received into the local backup_dir, producing a mismatched incremental
+        where the two histories diverge."""
+        with tempfile.TemporaryDirectory() as snap_td, tempfile.TemporaryDirectory() as backup_td:
+            snap_dir = Path(snap_td)
+            backup_dir = Path(backup_td)
+
+            archive_name = "keenan"
+            snap_name = f"{archive_name}.202601011200"
+            snap_path = snap_dir / snap_name
+            snap_path.mkdir()
+
+            stage_file_path = Path(f"/tmp/{archive_name}.btrfs")
+
+            cfg = {
+                "local_sudo": True,
+                "verbose": 2,
+                "dry_run": True,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": str(backup_dir),
+                "remote_host": None,
+                "remote_path": None,
+                "remote_sudo": False,
+                "keep_daily": 3,
+                "keep_weekly": 3,
+                "keep_monthly": 3,
+                "keep_yearly": 1,
+                "week_startday": "sunday",
+            }
+
+            archive = {
+                "name": archive_name,
+                "subvolume": str(snap_path),
+                "stage_file": str(stage_file_path),
+                "backup_dir": str(backup_dir),
+                "remote_host": "gerry@thorin",
+                "remote_path": "/remote/backup",
+                "remote_sudo": True,
+                "keep": {
+                    "keep_daily": 3,
+                    "keep_weekly": 2,
+                    "keep_monthly": 3,
+                    "keep_yearly": 0,
+                },
+            }
+
+            def run_mock(cmd, **kwargs):
+                cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+                if "subvolume show" in cmd_str or "subvolume list" in cmd_str:
+                    result = MagicMock()
+                    result.returncode = 0
+                    if "subvolume show" in cmd_str:
+                        result.stdout = "UUID: some-uuid-123\nReceived UUID: -\n"
+                    else:
+                        result.stdout = ""
+                    return result
+                return None
+
+            mock_run.side_effect = run_mock
+
+            bs.process_archive(archive, cfg)
+
+            # Local backup_dir must be populated via an independent piped send
+            self.assertTrue(mock_piped.called,
+                            "_piped_send_to_local must be called to populate local backup_dir")
+
+            # receive_stream must NOT re-receive into the local backup_dir — its
+            # second positional arg (backup_dir) must be None so it only handles remote
+            self.assertTrue(mock_receive.called, "receive_stream must be called for the remote")
+            recv_backup_dir = mock_receive.call_args.args[1]
+            self.assertIsNone(recv_backup_dir,
+                              f"receive_stream backup_dir must be None (got {recv_backup_dir!r}) — "
+                              "the remote-matched stream must not be re-received into local backup_dir")
+
 
 class TestExportFileBackup(unittest.TestCase):
     """Test the export_file configuration modeled after test_export_file.toml.
