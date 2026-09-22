@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 
 # ---------------------------------------------------------------------------
@@ -2511,11 +2511,11 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         stream_path = Path(send_dir) / f"{post_hook_snap_name}.btrfs"
         if not interrupted_rsync:
             send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
-        # When export_dir is set with a local backup_dir and no import_dir/stage,
+        # When export_dir is set with a local backup_dir and no import_dir,
         # also do a normal piped send|receive to the local backup_dir (in
         # addition to any file-based remote transfer). Mirrors the
         # _piped_send_to_local block for export_file.
-        if backup_dir and not recv_file and not stage_dir:
+        if backup_dir and not recv_file and not recv_dir:
             if not interrupted_rsync:
                 _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
         dest = backup_dir / snap.name if backup_dir else stream_path
@@ -2584,13 +2584,26 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         if recv_file and send_file and not staged:
             recv_path = Path(recv_file)
 
-        # When auto_ssh_receive is the trigger, the local piped send in the
-        # send_file branch already deposited the subvolume into backup_dir.
-        # Pass None for the receive destination so receive_stream only does
-        # the SSH receive, not a redundant local btrfs receive -f of the same
-        # stream file into backup_dir (which the piped send already covered).
-        # Keep policy still needs to target backup_dir, so pass it separately.
-        recv_dest_dir = None if auto_ssh_receive else backup_dir
+        # When both backup_dir AND remote are targets in a stage/import/export
+        # flow (auto_ssh_receive is False), the single exported stream carries
+        # parents matched only to whichever side was checked first by
+        # send_backup_tofile().  Using that same stream for local receive risks
+        # mismatched incrementals where histories diverge.  Route backup_dir
+        # through an independent piped send (fresh parents from
+        # find_parents(backup_dir)) and let receive_stream handle only the remote.
+        # Guard against duplicate runs (auto_ssh_receive fires above, skipping
+        # this block because the send_file branch already ran piped send) and
+        # against interrupted-rsync recovery (snap points to a .btrfs file).
+        if backup_dir and remote and remote_dir and snap_dir and not interrupted_rsync and not auto_ssh_receive:
+            log("Finding parents for local backup directory...", 1, cfg["verbose"])
+            _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
+            recv_dest_dir = None
+        else:
+            # auto_ssh_receive: send_file branch already piped-sent to backup_dir,
+            # so receive_stream must not re-receive locally.  Otherwise (pure local
+            # import/export, no remote) receive_stream is the only path that
+            # populates backup_dir, so it must receive locally.
+            recv_dest_dir = None if auto_ssh_receive else backup_dir
         received = receive_stream(recv_path, recv_dest_dir, cfg, remote, remote_dir, remote_sudo,
                                   use_rsync, archive_rsync_opts)
         # snap_dir keep policy is handled by the final apply_keep_policy call

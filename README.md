@@ -228,6 +228,12 @@ explicit `import_file`/`import_dir`/`stage_file`), bubtrsnap:
 For `rsync` transport, the stream file is transferred via `rsync` instead of
 `scp`, and interrupted transfers can be resumed.
 
+If `backup_dir` is configured alongside this setup, an **additional** local
+piped `btrfs send | btrfs receive` writes directly to `backup_dir`. This uses
+parents matched to `backup_dir`'s history — independent from the parents used
+for the exported stream going to the remote. See [Combining local and remote
+stream receive](#combining-local-and-remote-stream-receive) below.
+
 ### Combining local and remote stream receive
 
 An archive configured with `backup_dir` + `export_file`/`export_dir` +
@@ -237,6 +243,13 @@ An archive configured with `backup_dir` + `export_file`/`export_dir` +
 2. Stream file written, transferred, and received on remote
 
 Keep policy is applied independently to each destination.
+
+Each destination receives its data through an **independent pipeline**:
+`backup_dir` gets a fresh piped send from the new snapshot with parents
+matched to `backup_dir`'s actual history, while the exported stream file
+goes to the remote with parents matched to the remote's history. This
+ensures correct incrementals even when the two backup locations have
+divergent snapshots.
 
 A CLI usage example:
 
@@ -284,7 +297,10 @@ bubtrsnap --stage-file /tmp/archive.btrfs archive1=/path/to/subvolume
 
 When combined with `--remote-host`/`--remote-path`, staging also transfers the
 stream to the remote (via `scp` or `rsync`) and receives it there, just like
-`export_file`/`import_file`.
+`export_file`/`import_file`. If `backup_dir` is set alongside remote staging,
+bubtrsnap uses an independent piped send for the local backup (with correct
+parents from `backup_dir`'s history) and sends the stream file exclusively to
+the remote — two separate pipelines with matching parents for each destination.
 
 ## Keep policy
 
