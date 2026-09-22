@@ -604,6 +604,27 @@ class TestSCPReceive(unittest.TestCase):
         with self.assertRaises(SystemExit):
             bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
 
+    @patch("bubtrsnap.run")
+    def test_scp_and_receive_cleanup_honors_remote_sudo(self, mock_run):
+        """The remote temp-file cleanup must honor remote_sudo — the rm must run
+        with 'sudo -n' when remote_sudo is set, matching every other remote
+        command. Without it, cleanup silently fails on root-owned temp files
+        (e.g. left by an interrupted run) and /tmp accumulates them."""
+        from pathlib import Path
+
+        stream = Path("/tmp/test.202608280230.btrfs")
+        cfg = {"dry_run": True, "verbose": 2, "remote_sudo": True}
+
+        # Dry-run: run() returns None for all three calls (SCP, receive, cleanup)
+        mock_run.return_value = None
+
+        bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg, remote_sudo=True)
+
+        # The last run() call is the cleanup command
+        cleanup_cmd = mock_run.call_args_list[-1].args[0]
+        self.assertEqual(cleanup_cmd,
+                         ["ssh", "user@host", "sudo", "-n", "rm", "-f", "/tmp/bubtrsnap-test.202608280230.btrfs"])
+
 
 class TestSendBackupToFile(unittest.TestCase):
     """Test send_backup_tofile behavior for stage_file vs export_file."""

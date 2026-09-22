@@ -1576,7 +1576,7 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     stderr = stderr.strip()
 
     # Clean up remote temp file
-    cleanup_cmd = ["ssh", remote, "rm", "-f", remote_tmp]
+    cleanup_cmd = build_ssh_cmd(remote, ["rm", "-f", remote_tmp], remote_sudo)
     run(cleanup_cmd, dry_run=cfg.get("dry_run", False),
         verbosity=cfg["verbose"],
         capture_output=True, check=False)
@@ -1695,7 +1695,7 @@ def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
     stderr = stderr.strip()
 
     # Clean up remote temp file
-    cleanup_cmd = ["ssh", remote, "rm", "-f", remote_tmp]
+    cleanup_cmd = build_ssh_cmd(remote, ["rm", "-f", remote_tmp], remote_sudo)
     run(cleanup_cmd, dry_run=cfg.get("dry_run", False),
         verbosity=cfg["verbose"],
         capture_output=True, check=False)
