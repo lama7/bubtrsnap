@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bubtrsnap"
+version = "0.2.7"
+description = "btrfs snapshot and backup tool (single-file, stdlib-only)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+bubtrsnap = "bubtrsnap:main"
+
+[tool.setuptools]
+py-modules = ["bubtrsnap"]

@@ -11,9 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 def _load():
-    path = Path(__file__).resolve().parent.parent / "bubtrsnap"
+    path = Path(__file__).resolve().parent.parent / "bubtrsnap.py"
     if not path.is_file():
-        raise FileNotFoundError(f"Cannot find bubtrsnap at {path}")
+        raise FileNotFoundError(f"Cannot find bubtrsnap.py at {path}")
     return SourceFileLoader("bubtrsnap", str(path)).load_module()
 
 bs = _load()

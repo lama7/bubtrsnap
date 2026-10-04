@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 # Load bubtrsnap as a module (same pattern as test_ssh.py)
-_path = Path(__file__).resolve().parent.parent / "bubtrsnap"
+_path = Path(__file__).resolve().parent.parent / "bubtrsnap.py"
 bs = SourceFileLoader("bubtrsnap", str(_path)).load_module()
 
 
