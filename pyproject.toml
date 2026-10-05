@@ -8,6 +8,28 @@ version = "0.2.7"
 description = "btrfs snapshot and backup tool (single-file, stdlib-only)"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE", expression = "MIT" }
+authors = [
+    { name = "Gerry" },
+]
+keywords = ["btrfs", "backup", "snapshot", "send", "receive", "rsync"]
+classifiers = [
+    "Environment :: CLI / End User",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Systems Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: File Systems",
+]
+
+[project.urls]
+homepage = "https://github.com/lama7/bubtrsnap"
 
 [project.scripts]
 bubtrsnap = "bubtrsnap:main"
