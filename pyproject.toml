@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bubtrsnap"
-version = "0.2.7"
 description = "btrfs snapshot and backup tool (single-file, stdlib-only)"
 readme = "README.md"
 requires-python = ">=3.10"
+# Single source of truth for the version string: VERSION in bubtrsnap.py.
+dynamic = ["version"]
 license = { file = "LICENSE", expression = "MIT" }
 authors = [
     { name = "Gerry" },
@@ -36,3 +37,5 @@ bubtrsnap = "bubtrsnap:main"
 
 [tool.setuptools]
 py-modules = ["bubtrsnap"]
+# Dynamic version (PEP 621 / setuptools): read from VERSION in bubtrsnap.py.
+dynamic = { version = { attr = "bubtrsnap.VERSION" } }
