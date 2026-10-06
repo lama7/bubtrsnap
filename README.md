@@ -428,6 +428,23 @@ Always use `--dry-run` to preview a new keep policy or remote configuration.
 `subvolume` (required), `export_file`, `import_file`, `stage_file`,
 `pre_snapshot_hook`, `post_snapshot_hook`, `post_backup_hook`, `forced_keep`
 
+## Installing
+
+```bash
+pipx install bubtrsnap     # recommended: puts `bubtrsnap` on your PATH, isolated from system python
+pip install bubtrsnap      # or into a virtualenv (see note below)
+```
+
+**Note for Arch / other "externally-managed" distros:** on Arch (and similar distros that ship the PEP 668 "externally managed" marker), `pip install` / `pip3 install` fails with `externally-managed-environment` because it would write into distro-managed site-packages. The fix is to install into an isolated environment instead:
+
+```bash
+pipx install bubtrsnap             # simplest; pipx creates its own venv
+# or
+python3 -m venv ~/venvs/bubtrsnap && ~/venvs/bubtrsnap/bin/pip install bubtrsnap
+```
+
+On Arch, `pipx` itself is the `python-pipx` package: `pacman -S python-pipx` (not `pipx` or `pip3`). Avoid `--break-system-packages` unless you specifically want to override the distro guard.
+
 ## Dependencies
 
 - `btrfs-progs` (for `btrfs` commands)
