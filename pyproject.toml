@@ -15,9 +15,9 @@ authors = [
 ]
 keywords = ["btrfs", "backup", "snapshot", "send", "receive", "rsync"]
 classifiers = [
-    "Environment :: CLI / End User",
+    "Environment :: Console",
     "Intended Audience :: Developers",
-    "Intended Audience :: Systems Administrators",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
@@ -26,7 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Topic :: System :: File Systems",
+    "Topic :: System :: Filesystems",
 ]
 
 [project.urls]
