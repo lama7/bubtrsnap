@@ -2618,184 +2618,261 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         return "RECOVERED"
 
 
-def main() -> int:
 
-    parser = argparse.ArgumentParser(
-        description=f"bubtrsnap v{VERSION} — btrfs snapshot & backup tool",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup home=/home
-  bubtrsnap --config=~/.config/bubtrsnap.toml
-  bubtrsnap -v --snaps-only root=/
-  bubtrsnap --export-file /dirfor/streamdata/file/ maildir=/home/user/Maildir
-        """
-    )
+# ---------------------------------------------------------------------------
+# Maintenance mode: argparse subcommand CLI (backup / list / prune / rebuild)
+#
+# The legacy invocation `bubtrsnap <archive>...` (no subcommand) is preserved
+# as the implicit `backup` default, so every existing invocation keeps working
+# unchanged.  Because argparse subparsers consume the first positional token as
+# the subcommand name (which would break the legacy `bubtrsnap home=/home`
+# form), a pre-dispatch function scans argv to find the first positional token;
+# if it is a known subcommand we parse with that sub-parser (dropping only the
+# command token), otherwise we fall through to the legacy backup parser with
+# all positionals treated as archives.
+# ---------------------------------------------------------------------------
 
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"bubtrsnap {VERSION}",
-    )
+MAINTENANCE_SUBCOMMANDS = ("backup", "list", "prune", "rebuild")
 
-    # Global options
-    parser.add_argument(
-        "--config",
-        type=Path,
-        help="Path to TOML configuration file (default: ~/.config/bubtrsnap.toml)"
-    )
-    parser.add_argument(
-        "--snapshot-dir",
-        type=str,
-        help="Directory where read-only snapshots will be created"
-    )
-    parser.add_argument(
-        "--backup-dir",
-        type=str,
-        help="Directory where backups will be sent via btrfs send/receive"
-    )
-    parser.add_argument(
-        "--snaps-only",
-        action="store_true",
-        help="Only create snapshots; skip the backup step"
-    )
-    parser.add_argument("--export-file", type=str, metavar="FILE",
+# Options that consume the following token as a VALUE when scanning argv.
+_MAINT_VALUE_TAKERS = {
+    "--config", "--snapshot-dir", "--backup-dir", "--snaps-only",
+    "--export-file", "--import-file", "--export-dir", "--import-dir",
+    "--stage-file", "--stage-dir",
+    "--remote-host", "--remote-path", "--remote-sudo", "--local-sudo",
+    "--rsync", "--rsync-opts",
+    "--keep-hourly", "--keep-daily", "--keep-weekly",
+    "--keep-monthly", "--keep-yearly", "--week-startday",
+    "--forced-keep", "--ts",
+}
+# Short flags that take NO value.
+_MAINT_NO_VALUE_SHORT = {"-h"}
+# Flags that take an OPTIONAL value (-v / --verbose).
+_MAINT_OPT_VTAKERS = {"-v", "--verbose"}
+
+
+def _maint_first_positional(tokens) -> int | None:
+    """Return the index of the first positional token in `tokens` (argv[1:])
+    that names a known subcommand, otherwise None.
+
+    Skips options and their values.  An optional-value flag (-v/--verbose)
+    consumes the following token only when that token is present and is not
+    itself a flag or subcommand — mirroring argparse's own parsing, so legacy
+    forms such as `bubtrsnap -v 2 list` and `bubtrsnap -v2 home=/home` resolve
+    as they do today.
+    """
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok == "--":
+            nxt = tokens[i + 1] if i + 1 < n else None
+            return None if nxt is None else (i + 1 if nxt in MAINTENANCE_SUBCOMMANDS else None)
+        if tok.startswith("--"):
+            name = tok.split("=", 1)[0]
+            # --opt=value is one token; --opt takes the next token as its value.
+            if name == "--version" or "=" in tok:
+                i += 1
+            elif name in _MAINT_VALUE_TAKERS:
+                i += 2
+            else:
+                i += 1
+        elif tok.startswith("-"):
+            if tok in _MAINT_NO_VALUE_SHORT:
+                i += 1
+            elif tok in _MAINT_OPT_VTAKERS:
+                if i + 1 < n:
+                    nxt = tokens[i + 1]
+                    if not nxt.startswith("-") and nxt not in MAINTENANCE_SUBCOMMANDS:
+                        i += 2
+                    else:
+                        i += 1
+                else:
+                    i += 1
+            else:
+                i += 1
+        else:
+            return i if tok in MAINTENANCE_SUBCOMMANDS else None
+    return None
+
+
+def _add_maint_global_options(p: argparse.ArgumentParser) -> None:
+    """Register the options shared by every sub-parser.  These mirror the
+    legacy main() definitions verbatim (types, metavar, help, defaults)."""
+    p.add_argument("--version", action="version", version=f"bubtrsnap {VERSION}")
+    p.add_argument("--config", type=Path,
+        help="Path to TOML configuration file (default: ~/.config/bubtrsnap.toml)")
+    p.add_argument("--snapshot-dir", type=str,
+        help="Directory where read-only snapshots will be created")
+    p.add_argument("--backup-dir", type=str,
+        help="Directory where backups will be sent via btrfs send/receive")
+    p.add_argument("--snaps-only", action="store_true",
+        help="Only create snapshots; skip the backup step")
+    p.add_argument("--export-file", type=str, metavar="FILE",
         help="Send stream to FILE (archive-specific). Exactly one archive required. "
              "Mutually exclusive with --snaps-only and the *-dir options.")
-    parser.add_argument("--import-file", type=str, metavar="FILE",
+    p.add_argument("--import-file", type=str, metavar="FILE",
         help="Receive stream from FILE (archive-specific). Exactly one archive required. "
              "If used with --export-file, both must name the same file.")
-    parser.add_argument("--export-dir", type=str, metavar="DIR",
+    p.add_argument("--export-dir", type=str, metavar="DIR",
         help="Write per-archive streams into DIR as {archive}.{timestamp}.btrfs. "
              "Global; applies to CLI archives or all config archives.")
-    parser.add_argument("--import-dir", type=str, metavar="DIR",
+    p.add_argument("--import-dir", type=str, metavar="DIR",
         help="Receive newest matching stream for each archive from DIR.")
-    parser.add_argument(
-        "--stage-file", type=str, metavar="FILE",
+    p.add_argument("--stage-file", type=str, metavar="FILE",
         help="Stage via FILE: btrfs send -f FILE then receive -f FILE, then delete FILE. "
              "Exactly one archive. Mutually exclusive with other export/import/stage options "
-             "and with --snaps-only.",
-    )
-    parser.add_argument(
-        "--stage-dir", type=str, metavar="DIR",
+             "and with --snaps-only.")
+    p.add_argument("--stage-dir", type=str, metavar="DIR",
         help="Stage via DIR: write {archive}.{timestamp}.btrfs, receive it, then delete it. "
              "Applies to listed or all archives. Mutually exclusive with other export/import/stage "
-             "options and with --snaps-only.",
-    )
-    parser.add_argument(
-        "--remote-host", type=str, metavar="USER@HOST",
+             "options and with --snaps-only.")
+    p.add_argument("--remote-host", type=str, metavar="USER@HOST",
         help="SSH remote host in user@host format for sending backups over SSH. "
-             "Can be set globally or per-archive in config file."
-    )
-    parser.add_argument(
-        "--remote-path", type=str, metavar="DIR",
+             "Can be set globally or per-archive in config file.")
+    p.add_argument("--remote-path", type=str, metavar="DIR",
         help="Target directory on the SSH remote for receiving backups. "
-             "Can be set globally or per-archive in config file."
-    )
-    parser.add_argument(
-        "--remote-sudo",
-        action="store_true",
+             "Can be set globally or per-archive in config file.")
+    p.add_argument("--remote-sudo", action="store_true",
         help="Run btrfs commands on SSH remote with 'sudo -n'. "
-             "Can be set globally or per-archive in config file."
-    )
-    parser.add_argument(
-        "--local-sudo",
-        action="store_true",
-        help="Run local btrfs commands with 'sudo -n'"
-    )
-    parser.add_argument(
-        "--rsync",
-        action="store_true",
+             "Can be set globally or per-archive in config file.")
+    p.add_argument("--local-sudo", action="store_true",
+        help="Run local btrfs commands with 'sudo -n'")
+    p.add_argument("--rsync", action="store_true",
         help="Use rsync instead of scp for stream file transfer to SSH remote. "
              "Provides partial-transfer recovery via --partial-dir. "
              "Can be set globally or per-archive in config file. "
-             "Implies rsync uses -a and --partial-dir by default."
-    )
-    parser.add_argument(
-        "--rsync-opts",
-        type=str,
-        metavar="OPTS",
-        help="Additional rsync options (space-separated). "
-             "Applies when --rsync is enabled. "
+             "Implies rsync uses -a and --partial-dir by default.")
+    p.add_argument("--rsync-opts", type=str, metavar="OPTS",
+        help="Additional rsync options (space-separated). Applies when --rsync is enabled. "
              "Blocked: --partial-dir, --delete, --backup, -v/--verbose, --progress, "
              "--stats, --dry-run, --daemon, --files-from, --bwlimit, --rsh, "
              "--rsync-path, --exclude, --include, --filter, and other potentially "
-             "dangerous options. Blocked options are reported via stderr."
-    )
-
-    # Keep policy (CLI keeps are all-or-nothing)
-    parser.add_argument("--keep-hourly", type=int, metavar="N", help="Number of hourly snapshots/backups to retain")
-    parser.add_argument("--keep-daily", type=int, metavar="N", help="Number of daily snapshots/backups to retain")
-    parser.add_argument("--keep-weekly", type=int, metavar="N", help="Number of weekly snapshots/backups to retain")
-    parser.add_argument("--keep-monthly", type=int, metavar="N", help="Number of monthly snapshots/backups to retain")
-    parser.add_argument("--keep-yearly", type=int, metavar="N", help="Number of yearly snapshots/backups to retain")
-    parser.add_argument("--week-startday", type=str, metavar="DAY",
+             "dangerous options. Blocked options are reported via stderr.")
+    p.add_argument("--keep-hourly", type=int, metavar="N", help="Number of hourly snapshots/backups to retain")
+    p.add_argument("--keep-daily", type=int, metavar="N", help="Number of daily snapshots/backups to retain")
+    p.add_argument("--keep-weekly", type=int, metavar="N", help="Number of weekly snapshots/backups to retain")
+    p.add_argument("--keep-monthly", type=int, metavar="N", help="Number of monthly snapshots/backups to retain")
+    p.add_argument("--keep-yearly", type=int, metavar="N", help="Number of yearly snapshots/backups to retain")
+    p.add_argument("--week-startday", type=str, metavar="DAY",
         help="Day that starts the week: monday..sunday (default: sunday). Affects keep policy weekly boundary.")
-
-    # Per-archive forced keep
-    parser.add_argument("--forced-keep", type=str, metavar="TIMESTAMP", action="append",
+    p.add_argument("--forced-keep", type=str, metavar="TIMESTAMP", action="append",
         help="Force keep of a specific timestamp for the archive (format: YYYYMMDDhhmm). "
              "Can be specified multiple times. Comma-separated list also accepted. "
              "Must match an existing snapshot/backup for the archive. Archive-specific only.")
-
-    # Verbosity
-    parser.add_argument(
-        "-v", "--verbose",
-        type=int,
-        nargs="?",
-        const=1,
-        default=0,
-        metavar="LEVEL",
+    p.add_argument("-v", "--verbose", type=int, nargs="?", const=1, default=0, metavar="LEVEL",
         help="Verbosity level: 0=quiet (default), 1=progress, 2=commands. "
-             "-v alone means level 1, --verbose 2 means level 2"
+             "-v alone means level 1, --verbose 2 means level 2")
+    p.add_argument("--debug", action="store_true", help="Enable debug output (highest level)")
+    p.add_argument("--dry-run", action="store_true",
+        help="Show what would be done without making changes (implies -vv)")
+
+
+def _build_backup_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bubtrsnap",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=f"bubtrsnap v{VERSION} — btrfs snapshot & backup tool",
+        epilog=(
+            "Examples:\n"
+            "  bubtrsnap --snapshot-dir=/pool/snapshots --backup-dir=/backup home=/home\n"
+            "  bubtrsnap --config=~/.config/bubtrsnap.toml\n"
+            "  bubtrsnap -v --snaps-only root=/\n"
+            "  bubtrsnap backup --snapshot-dir=/pool/snap --backup-dir=/backup home=/home\n"
+            "  bubtrsnap list home\n"
+            "  bubtrsnap prune --ts 202601010000 home --yes\n"
+            "  bubtrsnap rebuild home\n"
+            "With no subcommand the legacy backup behaviour applies (all positionals "
+            "are archive names); with a subcommand the command token is consumed and "
+            "the remaining options/archives are parsed for that subcommand.\n"
+        ),
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug output (highest level)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes (implies -vv)"
-    )
-    parser.add_argument(
-        "archives",
-        nargs="*",
-        metavar="ARCHIVE[=SUBVOLUME]",
+    _add_maint_global_options(p)
+    p.add_argument("archives", nargs="*", metavar="ARCHIVE[=SUBVOLUME]",
         help="Archives to process. Can be just the archive name (looked up in the "
-             "config file) or name=/path/to/subvolume. "
-             "If none are given, all archives from the config file are processed."
+             "config file) or name=/path/to/subvolume. If none are given, all "
+             "archives from the config file are processed.")
+    return p
+
+
+def _build_list_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bubtrsnap list",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="List snapshots/backups present for the given archive(s). Read-only.",
     )
+    _add_maint_global_options(p)
+    p.add_argument("archives", nargs="*", metavar="ARCHIVE[=SUBVOLUME]",
+        help="Archives to list (all config archives if none given). Can be just the "
+             "archive name or name=/path/to/subvolume.")
+    return p
 
-    # parse them args...
-    args = parser.parse_args()
 
+def _build_prune_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bubtrsnap prune",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Delete snapshot/backup subvolumes matching the given timestamp(s) "
+                    "or inclusive dotted range(s). Requires at least one archive.",
+    )
+    _add_maint_global_options(p)
+    p.add_argument("--ts", action="append", type=str,
+        help="Timestamp (YYYYMMDDhhmm) or dotted inclusive range '<from>..<to>' "
+             "(e.g. 202601010000..202601050000) to delete. Bounds are inclusive. "
+             "Specify multiple --ts to match any of them.")
+    p.add_argument("archives", nargs="+", metavar="ARCHIVE[=SUBVOLUME]",
+        help="Archives to prune. At least one required (prune never operates on "
+             "'all' archives). Can be just the archive name or "
+             "name=/path/to/subvolume.")
+    p.add_argument("--yes", action="store_true",
+        help="Confirm and perform deletions without an interactive prompt. "
+             "Without --yes (and without --dry-run) the user is asked to confirm.")
+    return p
+
+
+def _build_rebuild_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bubtrsnap rebuild",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Reconcile snapshot/backup locations: restore a lost local snapshot "
+                    "from a local backup (btrfs subvolume snapshot), restore a lost "
+                    "local backup from a local snapshot (btrfs send/receive), and "
+                    "re-send to a remote when it is missing. Never deletes; only restores.",
+    )
+    _add_maint_global_options(p)
+    p.add_argument("archives", nargs="*", metavar="ARCHIVE[=SUBVOLUME]",
+        help="Archives to rebuild (all config archives if none given). Can be just the "
+             "archive name or name=/path/to/subvolume.")
+    return p
+
+
+_SUB_BUILDERS = {
+    "backup": _build_backup_parser,
+    "list": _build_list_parser,
+    "prune": _build_prune_parser,
+    "rebuild": _build_rebuild_parser,
+}
+
+
+# ---------------------------------------------------------------------------
+# Command execution
+# ---------------------------------------------------------------------------
+
+def _run_backup(args: argparse.Namespace) -> int:
     # various pre-checks for certain options and option combinations
-    # snaps-only and either of the send-to-*, recv-from-* or stage-* don't make
-    # sense so we'll flag that...
     if args.snaps_only and (
         args.export_file or args.import_file or args.stage_file
         or args.export_dir or args.import_dir or args.stage_dir
     ):
-        print(
-            "Error: --snaps-only is mutually exclusive with send/receive/stage "
-            "file and directory options",
-            file=sys.stderr,
-        )
+        print("Error: --snaps-only is mutually exclusive with send/receive/stage "
+              "file and directory options", file=sys.stderr)
         return 1
-
     if (args.export_file or args.import_file or args.stage_file) and (
         args.export_dir or args.import_dir or args.stage_dir
     ):
-        print(
-            "Error: cannot mix file options with directory options",
-            file=sys.stderr,
-        )
+        print("Error: cannot mix file options with directory options", file=sys.stderr)
         return 1
-
     if args.stage_file and (
-        args.export_file or args.import_file
+        args.export_file or args.import_file or args.stage_file
         or args.export_dir or args.import_dir or args.stage_dir
     ):
         print("Error: --stage-file is mutually exclusive with other send/receive/stage options",
@@ -2808,19 +2885,16 @@ Examples:
         print("Error: --stage-dir is mutually exclusive with other send/receive/stage options",
               file=sys.stderr)
         return 1
-
-    # don't mix file specific send/recv options with dir versions of the options
     if (args.export_file or args.import_file) and (args.export_dir or args.import_dir):
         print("Error: cannot mix --export-file/--import-file with "
               "--export-dir/--import-dir", file=sys.stderr)
         return 1
-
-    # remote_host and remote_path must be used together
     if (args.remote_host and not args.remote_path) or (args.remote_path and not args.remote_host):
-        print("Error: --remote-host and --remote-path must be specified together", file=sys.stderr)
+        print("Error: --remote-host and --remote-path must be specified together",
+              file=sys.stderr)
         return 1
 
-    # Verbosity handling 
+    # Verbosity handling
     verbosity = args.verbose
     if args.debug:
         verbosity = 3
@@ -2871,8 +2945,6 @@ Examples:
             return 1
 
     # Re-process archives that were recovered from interrupted rsync transfers.
-    # The first pass completed the interrupted transfer; this second pass runs
-    # the full normal flow (new snapshot, hooks, backup, keep policy).
     if recovered_archives:
         log(f"Re-processing {len(recovered_archives)} recovered archive(s)...", 1, global_cfg["verbose"])
         for archive in recovered_archives:
@@ -2883,7 +2955,79 @@ Examples:
                 return 1
 
     log("All archives processed.", 1, global_cfg["verbose"])
-    return 0    
+    return 0
+
+
+def _run_maintenance(args: argparse.Namespace) -> int:
+    cmd = getattr(args, "subcommand", "backup")
+    if cmd not in ("list", "prune", "rebuild"):
+        print(f"Error: unknown command {cmd!r}", file=sys.stderr)
+        return 1
+    verbosity = args.verbose
+    if args.debug:
+        verbosity = 3
+    if args.dry_run:
+        verbosity = max(verbosity, 2)
+
+    config_path = args.config or Path.home() / ".config" / "bubtrsnap.toml"
+    try:
+        global_cfg, archives = load_and_resolve_archives(
+            args, config_path if config_path.exists() else None
+        )
+    except SystemExit:
+        return 1
+
+    global_cfg["verbose"] = verbosity
+    global_cfg["dry_run"] = args.dry_run
+    if not archives:
+        print("No archives to process.", file=sys.stderr)
+        return 1
+
+    if cmd == "list":
+        return _run_list(archives, cfg=global_cfg, verbosity=verbosity)
+    if cmd == "prune":
+        return _run_prune(archives, cfg=global_cfg, verbosity=verbosity, args=args)
+    if cmd == "rebuild":
+        return _run_rebuild(archives, cfg=global_cfg, verbosity=verbosity)
+    return 1
+
+
+def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
+    """STUB (Commit B): list snapshots/backups present for the given archive(s)."""
+    print("bubtrsnap list: not yet implemented (see maintenance-mode docs).", file=sys.stderr)
+    return 1
+
+
+def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.Namespace) -> int:
+    """STUB (Commit B): delete matching snapshot/backup subvolumes (requires --yes)."""
+    print("bubtrsnap prune: not yet implemented (see maintenance-mode docs).", file=sys.stderr)
+    return 1
+
+
+def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
+    """STUB (Commit B): restore missing snapshot/backup/remote subvolumes."""
+    print("bubtrsnap rebuild: not yet implemented (see maintenance-mode docs).", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# main() — pre-dispatch between legacy backup and subcommand parsing.
+# ---------------------------------------------------------------------------
+def main() -> int:
+    tokens = sys.argv[1:]
+    idx = _maint_first_positional(tokens)
+    if idx is None:
+        # Legacy backup: parse everything (all positionals are archives).
+        parser = _build_backup_parser()
+        args = parser.parse_args(tokens)
+    else:
+        # Maintenance: drop the command token and parse with its sub-parser.
+        cmd = tokens[idx]
+        args = _SUB_BUILDERS[cmd]().parse_args(tokens[:idx] + tokens[idx + 1:])
+        args.subcommand = cmd
+    if getattr(args, "subcommand", "backup") != "backup":
+        return _run_maintenance(args)
+    return _run_backup(args)
 
 if __name__ == "__main__":
     sys.exit(main())
