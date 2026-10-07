@@ -3202,12 +3202,18 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
         if not all_ts:
             log("    (no snapshots/backups found)", 0, verbosity)
             continue
-        log(f"    {'timestamp':<20} {'snapshot':<10} {'backup':<10} {'remote':<10}", 0, verbosity)
+        # Only show columns that are actually configured for this archive.
+        # snapshot_dir is global, so the snapshot column is always present.
+        cols = [("snapshot", snap_ts)]
+        if bak_d:
+            cols.append(("backup", bak_ts))
+        if remote and remote_dir:
+            cols.append(("remote", rem_ts))
+        hdr = "    " + f"{'timestamp':<20}" + " ".join(f"{label:<10}" for label, _ in cols)
+        log(hdr, 0, verbosity)
         for ts in all_ts:
-            s = "yes" if ts in snap_ts else "no"
-            b = "yes" if ts in bak_ts else "no"
-            r = "yes" if ts in rem_ts else "no"
-            log(f"    {ts:<20} {s:<10} {b:<10} {r:<10}", 0, verbosity)
+            cells = [f"{ts:<20}"] + [f"{'yes' if ts in tset else 'no':<10}" for tset in (_x[1] for _x in cols)]
+            log("    " + "".join(cells), 0, verbosity)
     log("List complete.", 0, verbosity)
     return 0
 
