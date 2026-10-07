@@ -3026,11 +3026,12 @@ def _size_of(path: Path) -> int:
 
 
 def _human_size(nbytes: int) -> str:
+    """Human-readable byte size (portable du-style)."""
     for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
         if nbytes < 1024 or unit == "PiB":
-            return f"{nbytes:.0f}{unit}" if unit == "B" else f"{nbytes / 1024:.1f}{unit[1:]}"
+            return f"{nbytes:.0f} {unit}" if unit == "B" else f"{nbytes:.1f} {unit}"
         nbytes /= 1024
-    return f"{nbytes:.0f}B"
+    return f"{nbytes:.0f} B"
 
 
 def _space_check(target: Path, needed: int, label: str, cfg: dict) -> bool:
@@ -3207,7 +3208,14 @@ def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.N
 
 
 def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
+    """Reconcile snapshot/backup locations: preview the work, check space,
+    then restore what is missing (lost local snapshot <- backup via a
+    metadata-only subvolume snapshot, lost local backup <- snapshot via
+    send/receive, lost remote <- local re-send).  Never deletes; proceeds
+    automatically (no --yes gate)."""
+    dry = cfg.get("dry_run", False)
     restored = 0
+    any_actionable = False
     for archive in archives:
         name = archive["name"]
         loc = _loc_of(archive, cfg)
@@ -3216,7 +3224,6 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
         remote = loc["remote"]
         remote_dir = loc["remote_dir"]
         remote_sudo = loc["remote_sudo"]
-        dry = cfg.get("dry_run", False)
 
         log(f"\n=== Rebuild: {name} ===", 1, cfg["verbose"])
         if not (snap_d and snap_d.is_dir()) and not bak_d and not (remote and remote_dir):
@@ -3229,80 +3236,137 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
         if remote and remote_dir:
             rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
 
-        # Estimate space needed for backups we may create (snapshots missing a backup).
-        needed = 0
-        if bak_d:
-            for ts in snap_ts - bak_ts:
-                p = snap_d / f"{name}.{ts}" if snap_d else None
-                if p and p.exists():
-                    needed += _size_of(p)
-        if not _space_check(bak_d or (snap_d or Path(".")), needed, f"backup for {name}", cfg):
-            continue
-
         all_ts = sorted(snap_ts | bak_ts | rem_ts)
         if not all_ts:
             log("  no archives found anywhere — nothing to rebuild", 1, cfg["verbose"])
             continue
 
+        # Phase 1: determine the plan (no side effects) and the local space it
+        # would need.  Only new local backups consume local disk.
+        items = []
+        needed = 0
         for ts in all_ts:
             in_s, in_b, in_r = ts in snap_ts, ts in bak_ts, ts in rem_ts
             snap_p = snap_d / f"{name}.{ts}" if snap_d else None
             bak_p = bak_d / f"{name}.{ts}" if bak_d else None
-
-            # Missing local backup, snapshot present → re-send to local backup.
+            base = {
+                "name": name, "ts": ts, "snap_dir": snap_d,
+                "remote": remote, "remote_dir": remote_dir, "remote_sudo": remote_sudo,
+            }
             if in_s and not in_b:
-                log(f"  {ts}: restore local backup from snapshot", 1, cfg["verbose"])
+                if snap_p and snap_p.exists():
+                    needed += _size_of(snap_p)
+                base.update({"kind": "backup", "action": "restore local backup",
+                             "from": "snapshot", "source": snap_p, "dest": bak_d})
+                items.append(base)
+            elif in_b and not in_s and bak_p and bak_p.exists():
+                base.update({"kind": "snapshot",
+                             "action": "restore snapshot (metadata-only)",
+                             "from": "backup", "source": bak_p, "dest": snap_d})
+                items.append(base)
+            elif remote and remote_dir and not in_r:
+                src = snap_p if (in_s and snap_p and snap_p.exists()) else (
+                    bak_p if (bak_p and bak_p.exists()) else None)
+                if src is None:
+                    base.update({"kind": "skip",
+                                 "action": "skip (remote missing, no local source)",
+                                 "from": "", "source": None, "dest": remote_dir})
+                else:
+                    src_kind = "snapshot" if (snap_p and snap_p.exists()) else "backup"
+                    base.update({"kind": "remote",
+                                 "action": f"re-send to remote ({src_kind})",
+                                 "from": f"local {src_kind}", "source": src, "dest": remote_dir})
+                items.append(base)
+            else:
+                if not in_s and not in_b and not in_r:
+                    base.update({"kind": "skip", "action": "skip (not present anywhere)",
+                                 "from": "", "source": None, "dest": None})
+                else:
+                    base.update({"kind": "ok", "action": "ok (nothing to do)",
+                                 "from": "", "source": None, "dest": None})
+                items.append(base)
+
+        # Phase 2: preview the work to be done.
+        log(f"    {'timestamp':<20} {'action':<38} source -> destination", 1, cfg["verbose"])
+        for it in items:
+            ts = it["ts"]
+            if it["kind"] in ("backup", "snapshot", "remote"):
+                src = it["source"]
+                src_disp = (src.name if (src and hasattr(src, "name")) else str(src))
+                dest = it["dest"]
+                dest_disp = (dest.name if (dest and hasattr(dest, "name"))
+                             else (str(dest).rsplit("/", 1)[-1] if dest else "-"))
+                arrow = f"{src_disp} -> {dest_disp}"
+            else:
+                arrow = "-"
+            log(f"    {ts:<20} {it['action']:<38} {arrow}", 1, cfg["verbose"])
+
+        # Phase 3: report the memory/space requirement, then hard-stop if it
+        # won't fit (warning emitted by _space_check when >=25% of free is used).
+        if needed > 0:
+            target = bak_d or (snap_d or Path("."))
+            try:
+                free = _disk_free(target)
+            except OSError:
+                free = 0
+            log(f"    memory required: {_human_size(needed)} "
+                f"(free at {target.name or target}: {_human_size(free)})", 1, cfg["verbose"])
+            if not _space_check(target, needed, f"backup for {name}", cfg):
+                continue  # _space_check already logged the reason; preview above is shown
+
+        # Phase 4: execute the plan.
+        for it in items:
+            kind = it["kind"]
+            if kind not in ("backup", "snapshot", "remote"):
+                continue
+            any_actionable = True
+            ts = it["ts"]
+            label = f"{name}.{ts}"
+            if kind == "backup":
+                log(f"    {label}: restoring local backup from snapshot", 1, cfg["verbose"])
                 try:
-                    _piped_send_to_local(snap_p, snap_d, bak_d, cfg, name)
-                    log(f"  {ts}: local backup restored", 1, cfg["verbose"])
+                    _piped_send_to_local(it["source"], it["snap_dir"], it["dest"], cfg, name)
+                    log(f"    {label}: local backup restored", 1, cfg["verbose"])
                     restored += 1
                 except Exception as e:
-                    log(f"  {ts}: local backup restore failed: {e}", 1, cfg["verbose"])
-
-            # Missing snapshot, local backup present → metadata-only subvolume snapshot.
-            if in_b and not in_s and bak_p and bak_p.exists():
-                log(f"  {ts}: restore snapshot (metadata-only) from backup", 1, cfg["verbose"])
+                    log(f"    {label}: local backup restore failed: {e}", 1, cfg["verbose"])
+            elif kind == "snapshot":
+                log(f"    {label}: restoring snapshot (metadata-only) from backup", 1, cfg["verbose"])
                 try:
-                    dest = snap_d / f"{name}.{ts}"
-                    cmd = btrfs_cmd(cfg, "subvolume", "snapshot", "-r", str(bak_p), str(dest))
+                    cmd = btrfs_cmd(cfg, "subvolume", "snapshot", "-r",
+                                    str(it["source"]), str(it["dest"]))
                     run(cmd, dry_run=dry, verbosity=cfg["verbose"],
                         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    log(f"  {ts}: snapshot restored", 1, cfg["verbose"])
+                    log(f"    {label}: snapshot restored", 1, cfg["verbose"])
                     restored += 1
                 except Exception as e:
-                    log(f"  {ts}: snapshot restore failed: {e}", 1, cfg["verbose"])
-
-            # Missing remote, local source present -> re-send to remote.
-            if remote and remote_dir and not in_r:
-                src = snap_p if (in_s and snap_p and snap_p.exists()) else None
-                if src is None:
-                    src = bak_p if (bak_p and bak_p.exists()) else None
-                if src is None:
-                    log(f"  {ts}: remote missing; no local source to re-send", 1, cfg["verbose"])
-                    continue
-                log(f"  {ts}: re-send to remote {remote}", 1, cfg["verbose"])
+                    log(f"    {label}: snapshot restore failed: {e}", 1, cfg["verbose"])
+            elif kind == "remote":
+                log(f"    {label}: re-sending to remote {remote}", 1, cfg["verbose"])
                 try:
-                    ssh_parents = find_parents_ssh(name, snap_d, remote, remote_dir, cfg, remote_sudo)
+                    ssh_parents = find_parents_ssh(name, it["snap_dir"], remote,
+                                                   remote_dir, cfg, remote_sudo)
                     ssh_send = btrfs_cmd(cfg, "send")
                     for i, pp in enumerate(ssh_parents):
                         ssh_send += ["-p" if i == 0 else "-c", str(pp)]
-                    ssh_send.append(str(src))
-                    rc, stderr = piped_run(ssh_send, build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo),
+                    ssh_send.append(str(it["source"]))
+                    rc, stderr = piped_run(ssh_send,
+                                           build_ssh_receive_cmd(remote, remote_dir, cfg,
+                                                                remote_sudo),
                                            dry_run=dry, verbosity=cfg["verbose"])
                     if rc == 0:
-                        log(f"  {ts}: remote restored", 1, cfg["verbose"])
+                        log(f"    {label}: remote restored", 1, cfg["verbose"])
                         restored += 1
                     else:
-                        log(f"  {ts}: remote re-send failed: {stderr.strip()}", 3, cfg["verbose"])
+                        log(f"    {label}: remote re-send failed: {stderr.strip()}", 3, cfg["verbose"])
                 except Exception as e:
-                    log(f"  {ts}: remote re-send error: {e}", 1, cfg["verbose"])
+                    log(f"    {label}: remote re-send error: {e}", 1, cfg["verbose"])
 
-            if not in_s and not in_b and not in_r:
-                log(f"  {ts}: not present anywhere, skipping", 1, cfg["verbose"])
-
-    dry = cfg.get("dry_run", False)
-    prefix = "[dry-run] " if dry else ""
-    log(f"{prefix}Rebuild complete: {restored} restored.", 1, cfg["verbose"])
+    dry_prefix = "[dry-run] " if dry else ""
+    if not any_actionable:
+        log(f"{dry_prefix}Rebuild complete: nothing to do.", 1, cfg["verbose"])
+    else:
+        log(f"{dry_prefix}Rebuild complete: {restored} restored.", 1, cfg["verbose"])
     return 0
 
 
