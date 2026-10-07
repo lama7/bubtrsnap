@@ -3058,11 +3058,12 @@ def _space_check(target: Path, needed: int, label: str, cfg: dict) -> bool:
 
 def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = False) -> int | None:
     """Free bytes on the filesystem backing `remote_dir` on the SSH `remote`
-    host, via 'df -P'.  Returns None if the query could not be run or parsed
-    (ssh not reachable, no df, or it timed out).  Read-only."""
+    host, via 'df -P -B 1' (free space in bytes).  Returns None if the query
+    could not be run or parsed (ssh not reachable, no df, or it timed out).
+    Read-only."""
     try:
         sudo = ["sudo", "-n"] if remote_sudo else []
-        cmd = ["ssh", remote] + sudo + ["df", "-P", str(remote_dir)]
+        cmd = ["ssh", remote] + sudo + ["df", "-P", "-B", "1", str(remote_dir)]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except subprocess.TimeoutExpired:
         log(f"[space] remote df timed out on {remote}", 1, cfg["verbose"])
@@ -3072,8 +3073,9 @@ def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = Fa
         return None
     if proc.returncode != 0:
         return None
-    # df -P header: Filesystem  Size  Used  Avail  Use%  Mounted on
-    # Avail is column 4 (index 3): bytes with a trailing 'B'.
+    # df -P -B 1 header: Filesystem  1-blocks  Used  Available  Use%  Mounted on
+    # With -B 1 the columns are raw bytes (no unit suffix).  Avail/Available
+    # is column 4 (index 3).
     for line in proc.stdout.splitlines():
         parts = line.split()
         if not parts or parts[0] == "Filesystem":
