@@ -3300,7 +3300,9 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
             if not in_s and not in_b and not in_r:
                 log(f"  {ts}: not present anywhere, skipping", 1, cfg["verbose"])
 
-    log(f"Rebuild complete: {restored} restored.", 1, cfg["verbose"])
+    dry = cfg.get("dry_run", False)
+    prefix = "[dry-run] " if dry else ""
+    log(f"{prefix}Rebuild complete: {restored} restored.", 1, cfg["verbose"])
     return 0
 
 
