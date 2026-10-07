@@ -3056,6 +3056,72 @@ def _space_check(target: Path, needed: int, label: str, cfg: dict) -> bool:
     return True
 
 
+def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = False) -> int | None:
+    """Free bytes on the filesystem backing `remote_dir` on the SSH `remote`
+    host, via 'df -P'.  Returns None if the query could not be run or parsed
+    (ssh not reachable, no df, or it timed out).  Read-only."""
+    try:
+        sudo = ["sudo", "-n"] if remote_sudo else []
+        cmd = ["ssh", remote] + sudo + ["df", "-P", str(remote_dir)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        log(f"[space] remote df timed out on {remote}", 1, cfg["verbose"])
+        return None
+    except Exception as e:
+        log(f"[space] could not query remote free space on {remote}: {e}", 1, cfg["verbose"])
+        return None
+    if proc.returncode != 0:
+        return None
+    # df -P header: Filesystem  Size  Used  Avail  Use%  Mounted on
+    # Avail is column 4 (index 3): bytes with a trailing 'B'.
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if not parts or parts[0] == "Filesystem":
+            continue
+        if len(parts) >= 4:
+            avail = parts[3]
+            if avail.endswith("B"):
+                avail = avail[:-1]
+            try:
+                return int(avail)
+            except ValueError:
+                continue
+    return None
+
+
+
+def _space_check_remote(remote, remote_dir, needed, label, cfg,
+                        remote_sudo: bool = False, free: int | None = None) -> bool:
+    """Guard for remote re-sends: return False if `needed` won't fit on
+    `remote`, True otherwise (warning emitted when >=25% of free space would
+    be used).  `free` may be pre-fetched to avoid a second SSH query.
+    Returns True (proceed) if the remote's free space can't be measured,
+    since we can't know it won't fit."""
+    if needed <= 0:
+        return True
+    if free is None:
+        free = _remote_disk_free(remote, remote_dir, cfg, remote_sudo)
+    if free is None:
+        log(f"[space] {label}: cannot measure free space on {remote}; "
+            f"proceeding.", 1, cfg["verbose"])
+        return True
+    if free <= 0:
+        log(f"[space] {label}: need {_human_size(needed)} but no free space "
+            f"on {remote} — will not fit. Skipping remote part.",
+            1, cfg["verbose"])
+        return False
+    if needed > free:
+        log(f"[space] {label}: need {_human_size(needed)} but only "
+            f"{_human_size(free)} free on {remote} — will not fit. "
+            f"Skipping remote part.", 1, cfg["verbose"])
+        return False
+    if needed / free >= 0.25:
+        log(f"[space] {label}: need {_human_size(needed)} of "
+            f"{_human_size(free)} free ({needed / free * 100:.0f}%) — low "
+            f"space, proceeding.", 1, cfg["verbose"])
+    return True
+
+
 def _ts_match(ts: str, spec: str) -> bool:
     """Match a 12-digit timestamp against a spec: exact, or dotted inclusive range."""
     if ".." in spec:
@@ -3245,6 +3311,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
         # would need.  Only new local backups consume local disk.
         items = []
         needed = 0
+        remote_needed = 0
         for ts in all_ts:
             in_s, in_b, in_r = ts in snap_ts, ts in bak_ts, ts in rem_ts
             snap_p = snap_d / f"{name}.{ts}" if snap_d else None
@@ -3273,6 +3340,8 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                                  "from": "", "source": None, "dest": remote_dir})
                 else:
                     src_kind = "snapshot" if (snap_p and snap_p.exists()) else "backup"
+                    if src:
+                        remote_needed += _size_of(src)
                     base.update({"kind": "remote",
                                  "action": f"re-send to remote ({src_kind})",
                                  "from": f"local {src_kind}", "source": src, "dest": remote_dir})
@@ -3313,6 +3382,26 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                 f"(free at {target.name or target}: {_human_size(free)})", 1, cfg["verbose"])
             if not _space_check(target, needed, f"backup for {name}", cfg):
                 continue  # _space_check already logged the reason; preview above is shown
+
+
+        # Report the remote requirement (if any) and guard the remote re-sends:
+        # if it won't fit we skip just the remote part, so local work still runs.
+        if remote_needed > 0 and remote and remote_dir:
+            rem_free = _remote_disk_free(remote, remote_dir, cfg, remote_sudo)
+            if rem_free is None:
+                log(f"    [space] cannot measure free space on {remote} — "
+                    f"proceeding (remote size not checked).", 1, cfg["verbose"])
+            else:
+                log(f"    memory required (remote {remote}): "
+                    f"{_human_size(remote_needed)} "
+                    f"(free on {remote}: {_human_size(rem_free)})",
+                    1, cfg["verbose"])
+                if not _space_check_remote(remote, remote_dir, remote_needed,
+                                           f"re-send for {name}", cfg,
+                                           remote_sudo, rem_free):
+                    for it in items:
+                        if it["kind"] == "remote":
+                            it["kind"] = "skip"
 
         # Phase 4: execute the plan.
         for it in items:
