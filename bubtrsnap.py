@@ -3129,17 +3129,17 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
             rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
 
         all_ts = sorted(snap_ts | bak_ts | rem_ts)
-        log(f"\n=== {name} ===", 1, verbosity)
+        log(f"\n=== {name} ===", 0, verbosity)
         if not all_ts:
-            log("    (no snapshots/backups found)", 1, verbosity)
+            log("    (no snapshots/backups found)", 0, verbosity)
             continue
-        log(f"    {'timestamp':<20} {'snapshot':<10} {'backup':<10} {'remote':<10}", 1, verbosity)
+        log(f"    {'timestamp':<20} {'snapshot':<10} {'backup':<10} {'remote':<10}", 0, verbosity)
         for ts in all_ts:
             s = "yes" if ts in snap_ts else "no"
             b = "yes" if ts in bak_ts else "no"
             r = "yes" if ts in rem_ts else "no"
-            log(f"    {ts:<20} {s:<10} {b:<10} {r:<10}", 1, verbosity)
-    log("List complete.", 1, verbosity)
+            log(f"    {ts:<20} {s:<10} {b:<10} {r:<10}", 0, verbosity)
+    log("List complete.", 0, verbosity)
     return 0
 
 
