@@ -2860,6 +2860,40 @@ _SUB_BUILDERS = {
 }
 
 
+# Top-level "menu" help shown for a bare `bubtrsnap --help` / `-h`.
+# Printed before sub-dispatch so a no-subcommand -h gives an overview of all
+# subcommands rather than (only) the legacy backup option list.
+_TOP_LEVEL_HELP = f"""\
+bubtrsnap v{VERSION} — btrfs snapshot & backup tool
+
+Usage:
+  bubtrsnap <subcommand> [options]
+  bubtrsnap [options] [ARCHIVE[=SUBVOLUME] ...]   legacy backup (no subcommand)
+                                           use 'bubtrsnap backup --help' for the option list
+
+Subcommands:
+  backup     Take snapshots and send backups.  Default when no subcommand is given.
+             Full option list: 'bubtrsnap backup --help'.
+  list       Read-only table of snapshot / backup / remote timestamps.
+             Use 'bubtrsnap list --help' for options.
+  prune      Delete snapshots/backups matching a timestamp (or a dotted inclusive
+             range '<from>..<to>').  Requires at least one archive and --yes.
+  rebuild    Reconcile snapshot/backup/remote locations: restore lost local
+             snapshots/backups and re-send to a remote when missing.  Never deletes.
+
+Global options are shared by every subcommand (e.g. --config, --snapshot-dir,
+--backup-dir, -v/--verbose, --dry-run, --rsync, and the keep policies).
+Run 'bubtrsnap <subcommand> --help' for that command's full option list.
+
+Examples:
+  bubtrsnap --config=~/.config/bubtrsnap.toml
+  bubtrsnap backup --snapshot-dir=/snap --backup-dir=/bck home=/home
+  bubtrsnap list home
+  bubtrsnap prune --ts 202601010000..202601050000 home --yes
+  bubtrsnap rebuild home
+"""
+
+
 # ---------------------------------------------------------------------------
 # Command execution
 # ---------------------------------------------------------------------------
@@ -3474,6 +3508,13 @@ def main() -> int:
     tokens = sys.argv[1:]
     idx = _maint_first_positional(tokens)
     if idx is None:
+        # Bare -h / --help with no subcommand: show the top-level overview
+        # (all subcommands + the legacy usage) rather than only the
+        # backup option list.  Per-subcommand help still comes from
+        # `bubtrsnap <subcommand> --help` below.
+        if any(tok in ("-h", "--help") for tok in tokens):
+            print(_TOP_LEVEL_HELP)
+            return 0
         # Legacy backup: parse everything (all positionals are archives).
         parser = _build_backup_parser()
         args = parser.parse_args(tokens)
