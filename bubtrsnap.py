@@ -2520,6 +2520,13 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
         log("Starting backup...", 1, cfg["verbose"])
 
+        # Space check before writing the backup (portable du/df-style).
+        # Hard-stop (non-zero exit) if the estimate won't fit; warn when tight.
+        if backup_dir:
+            needed = _size_of(snap)
+            if not _space_check(backup_dir, needed, "backup", cfg):
+                raise SystemExit(1)
+
         if (send_file or send_dir) and remote and remote_dir:
             if not interrupted_rsync:
                 dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
@@ -2992,22 +2999,309 @@ def _run_maintenance(args: argparse.Namespace) -> int:
     return 1
 
 
+# ---------------------------------------------------------------------------
+# Maintenance mode: real command bodies (list / prune / rebuild)
+# ---------------------------------------------------------------------------
+# Space estimation (portable du/df-style)
+
+def _disk_free(path: Path) -> int:
+    """Free bytes on the filesystem containing `path` (df-style)."""
+    return shutil.disk_usage(str(path)).free
+
+
+def _size_of(path: Path) -> int:
+    """Approximate on-disk size of a directory (du-style, recursive)."""
+    if not path.is_dir():
+        return 0
+    total = 0
+    try:
+        for p in path.iterdir():
+            if p.is_dir() and not p.is_symlink():
+                total += _size_of(p)
+            elif p.is_file() and not p.is_symlink():
+                total += p.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def _human_size(nbytes: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if nbytes < 1024 or unit == "PiB":
+            return f"{nbytes:.0f}{unit}" if unit == "B" else f"{nbytes / 1024:.1f}{unit[1:]}"
+        nbytes /= 1024
+    return f"{nbytes:.0f}B"
+
+
+def _space_check(target: Path, needed: int, label: str, cfg: dict) -> bool:
+    """Hard-stop (False) if `needed` won't fit in free space at `target`;
+    otherwise warn when it would consume >=25% of free space; return True."""
+    if needed <= 0:
+        return True
+    try:
+        free = _disk_free(target)
+    except OSError:
+        free = 0
+    if free <= 0:
+        log(f"[space] cannot measure free space at {target}", 1, cfg["verbose"])
+        return True
+    if needed > free:
+        log(f"[space] {label}: need {_human_size(needed)} but only {_human_size(free)} "
+            f"free at {target} — will not fit. Aborting.", 1, cfg["verbose"])
+        return False
+    if needed / free >= 0.25:
+        log(f"[space] {label}: need {_human_size(needed)} of {_human_size(free)} free "
+            f"({needed / free * 100:.0f}%) — low space, proceeding.", 1, cfg["verbose"])
+    return True
+
+
+def _ts_match(ts: str, spec: str) -> bool:
+    """Match a 12-digit timestamp against a spec: exact, or dotted inclusive range."""
+    if ".." in spec:
+        a, b = spec.split("..", 1)
+        a, b = a.strip(), b.strip()
+        return len(a) == 12 and len(b) == 12 and a.isdigit() and b.isdigit() and a <= ts <= b
+    return spec == ts
+
+
+def _validate_ts_specs(specs: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for raw in specs:
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ".." in part:
+                lo, hi = part.split("..", 1)
+                lo, hi = lo.strip(), hi.strip()
+                if not (len(lo) == 12 and lo.isdigit() and len(hi) == 12 and hi.isdigit()):
+                    raise ValueError(f"bad timestamp range {part!r} (expected <YYYYMMDDhhmm>..<YYYYMMDDhhmm>)")
+                if lo > hi:
+                    raise ValueError(f"timestamp range {part!r} has from > to")
+                cleaned.append(f"{lo}..{hi}")
+            else:
+                if not (len(part) == 12 and part.isdigit()):
+                    raise ValueError(f"bad timestamp {part!r} (expected YYYYMMDDhhmm)")
+                cleaned.append(part)
+    if not cleaned:
+        raise ValueError("no valid --ts value(s) given")
+    return cleaned
+
+
+def _iter_location(loc: dict, label: str, name: str, cfg: dict):
+    """Yield (ts, path_or_remote_path) for an archive in one location."""
+    if label == "remote":
+        remote, remote_dir = loc["remote"], loc["remote_dir"]
+        if remote and remote_dir:
+            yield from iter_archive_items_ssh(remote, remote_dir, name, cfg, loc.get("remote_sudo", False))
+    else:
+        d = loc["snap_dir"] if label == "snap" else loc["backup_dir"]
+        if d is not None:
+            yield from iter_archive_items(d, name)
+
+
+def _loc_of(archive: dict, cfg: dict) -> dict:
+    bd = archive.get("backup_dir") or cfg.get("backup_dir")
+    return {
+        "snap_dir": Path(cfg["snapshot_dir"]) if cfg.get("snapshot_dir") else None,
+        "backup_dir": Path(bd) if bd else None,
+        "remote": archive.get("remote_host"),
+        "remote_dir": archive.get("remote_path"),
+        "remote_sudo": archive.get("remote_sudo", False),
+    }
+
+
 def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
-    """STUB (Commit B): list snapshots/backups present for the given archive(s)."""
-    print("bubtrsnap list: not yet implemented (see maintenance-mode docs).", file=sys.stderr)
-    return 1
+    """Print a read-only table of timestamps across snapshot / backup / remote."""
+    for archive in archives:
+        name = archive["name"]
+        loc = _loc_of(archive, cfg)
+        snap_d = loc["snap_dir"]
+        bak_d = loc["backup_dir"]
+        remote = loc["remote"]
+        remote_dir = loc["remote_dir"]
+        remote_sudo = loc["remote_sudo"]
+
+        snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name)} if snap_d and snap_d.is_dir() else set()
+        bak_ts = {ts for ts, _ in iter_archive_items(bak_d, name)} if bak_d and bak_d.is_dir() else set()
+        rem_ts = set()
+        if remote and remote_dir:
+            rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
+
+        all_ts = sorted(snap_ts | bak_ts | rem_ts)
+        log(f"\n=== {name} ===", 1, verbosity)
+        if not all_ts:
+            log("    (no snapshots/backups found)", 1, verbosity)
+            continue
+        log(f"    {'timestamp':<20} {'snapshot':<10} {'backup':<10} {'remote':<10}", 1, verbosity)
+        for ts in all_ts:
+            s = "yes" if ts in snap_ts else "no"
+            b = "yes" if ts in bak_ts else "no"
+            r = "yes" if ts in rem_ts else "no"
+            log(f"    {ts:<20} {s:<10} {b:<10} {r:<10}", 1, verbosity)
+    log("List complete.", 1, verbosity)
+    return 0
 
 
 def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.Namespace) -> int:
-    """STUB (Commit B): delete matching snapshot/backup subvolumes (requires --yes)."""
-    print("bubtrsnap prune: not yet implemented (see maintenance-mode docs).", file=sys.stderr)
-    return 1
+    specs = getattr(args, "ts", None) or []
+    if not specs:
+        print("Error: prune requires at least one --ts", file=sys.stderr)
+        return 1
+    try:
+        specs = _validate_ts_specs(specs)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    total_to_del = 0
+    for archive in archives:
+        name = archive["name"]
+        loc = _loc_of(archive, cfg)
+        for label in ("snap", "backup", "remote"):
+            items = [(ts, p) for ts, p in _iter_location(loc, label, name, cfg)
+                     if any(_ts_match(ts, s) for s in specs)]
+            if items:
+                total_to_del += len(items)
+                for ts, p in items:
+                    disp = p.name if hasattr(p, "name") else str(p).rsplit("/", 1)[-1]
+                    log(f"    [{label}] would delete {ts} ({disp})", 1, cfg["verbose"])
+    if not total_to_del:
+        log(f"Nothing to prune (no matches for {specs}).", 1, cfg["verbose"])
+        return 0
+
+    if args.dry_run:
+        log(f"[dry-run] would delete {total_to_del} subvolume(s).", 1, cfg["verbose"])
+        return 0
+
+    if not args.yes:
+        try:
+            ans = input(f"Delete {total_to_del} snapshot/backup subvolume(s)? [y/N]: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.", file=sys.stderr)
+            return 1
+        if ans.strip().lower() not in ("y", "yes", "1"):
+            print("Aborted.", file=sys.stderr)
+            return 1
+
+    for archive in archives:
+        name = archive["name"]
+        loc = _loc_of(archive, cfg)
+        for label in ("snap", "backup", "remote"):
+            for ts, p in [(ts, p) for ts, p in _iter_location(loc, label, name, cfg)
+                          if any(_ts_match(ts, s) for s in specs)]:
+                if label == "remote":
+                    cmd = build_ssh_cmd(loc["remote"],
+                                        btrfs_cmd(cfg, "subvolume", "delete", str(p), sudo=False),
+                                        loc.get("remote_sudo", False))
+                else:
+                    cmd = btrfs_cmd(cfg, "subvolume", "delete", str(p))
+                try:
+                    run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"Error pruning: {e}", file=sys.stderr)
+                    return 1
+    log(f"Prune complete: deleted {total_to_del} subvolume(s).", 1, cfg["verbose"])
+    return 0
 
 
 def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
-    """STUB (Commit B): restore missing snapshot/backup/remote subvolumes."""
-    print("bubtrsnap rebuild: not yet implemented (see maintenance-mode docs).", file=sys.stderr)
-    return 1
+    restored = 0
+    for archive in archives:
+        name = archive["name"]
+        loc = _loc_of(archive, cfg)
+        snap_d = loc["snap_dir"]
+        bak_d = loc["backup_dir"]
+        remote = loc["remote"]
+        remote_dir = loc["remote_dir"]
+        remote_sudo = loc["remote_sudo"]
+        dry = cfg.get("dry_run", False)
+
+        log(f"\n=== Rebuild: {name} ===", 1, cfg["verbose"])
+        if not (snap_d and snap_d.is_dir()) and not bak_d and not (remote and remote_dir):
+            log("  no destination configured — nothing to rebuild", 1, cfg["verbose"])
+            continue
+
+        snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name)} if snap_d and snap_d.is_dir() else set()
+        bak_ts = {ts for ts, _ in iter_archive_items(bak_d, name)} if bak_d and bak_d.is_dir() else set()
+        rem_ts = set()
+        if remote and remote_dir:
+            rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
+
+        # Estimate space needed for backups we may create (snapshots missing a backup).
+        needed = 0
+        if bak_d:
+            for ts in snap_ts - bak_ts:
+                p = snap_d / f"{name}.{ts}" if snap_d else None
+                if p and p.exists():
+                    needed += _size_of(p)
+        if not _space_check(bak_d or (snap_d or Path(".")), needed, f"backup for {name}", cfg):
+            continue
+
+        all_ts = sorted(snap_ts | bak_ts | rem_ts)
+        if not all_ts:
+            log("  no archives found anywhere — nothing to rebuild", 1, cfg["verbose"])
+            continue
+
+        for ts in all_ts:
+            in_s, in_b, in_r = ts in snap_ts, ts in bak_ts, ts in rem_ts
+            snap_p = snap_d / f"{name}.{ts}" if snap_d else None
+            bak_p = bak_d / f"{name}.{ts}" if bak_d else None
+
+            # Missing local backup, snapshot present → re-send to local backup.
+            if in_s and not in_b:
+                log(f"  {ts}: restore local backup from snapshot", 1, cfg["verbose"])
+                try:
+                    _piped_send_to_local(snap_p, snap_d, bak_d, cfg, name)
+                    log(f"  {ts}: local backup restored", 1, cfg["verbose"])
+                    restored += 1
+                except Exception as e:
+                    log(f"  {ts}: local backup restore failed: {e}", 1, cfg["verbose"])
+
+            # Missing snapshot, local backup present → metadata-only subvolume snapshot.
+            if in_b and not in_s and bak_p and bak_p.exists():
+                log(f"  {ts}: restore snapshot (metadata-only) from backup", 1, cfg["verbose"])
+                try:
+                    dest = snap_d / f"{name}.{ts}"
+                    cmd = btrfs_cmd(cfg, "subvolume", "snapshot", "-r", str(bak_p), str(dest))
+                    run(cmd, dry_run=dry, verbosity=cfg["verbose"],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    log(f"  {ts}: snapshot restored", 1, cfg["verbose"])
+                    restored += 1
+                except Exception as e:
+                    log(f"  {ts}: snapshot restore failed: {e}", 1, cfg["verbose"])
+
+            # Missing remote, local source present -> re-send to remote.
+            if remote and remote_dir and not in_r:
+                src = snap_p if (in_s and snap_p and snap_p.exists()) else None
+                if src is None:
+                    src = bak_p if (bak_p and bak_p.exists()) else None
+                if src is None:
+                    log(f"  {ts}: remote missing; no local source to re-send", 1, cfg["verbose"])
+                    continue
+                log(f"  {ts}: re-send to remote {remote}", 1, cfg["verbose"])
+                try:
+                    ssh_parents = find_parents_ssh(name, snap_d, remote, remote_dir, cfg, remote_sudo)
+                    ssh_send = btrfs_cmd(cfg, "send")
+                    for i, pp in enumerate(ssh_parents):
+                        ssh_send += ["-p" if i == 0 else "-c", str(pp)]
+                    ssh_send.append(str(src))
+                    rc, stderr = piped_run(ssh_send, build_ssh_receive_cmd(remote, remote_dir, cfg, remote_sudo),
+                                           dry_run=dry, verbosity=cfg["verbose"])
+                    if rc == 0:
+                        log(f"  {ts}: remote restored", 1, cfg["verbose"])
+                        restored += 1
+                    else:
+                        log(f"  {ts}: remote re-send failed: {stderr.strip()}", 3, cfg["verbose"])
+                except Exception as e:
+                    log(f"  {ts}: remote re-send error: {e}", 1, cfg["verbose"])
+
+            if not in_s and not in_b and not in_r:
+                log(f"  {ts}: not present anywhere, skipping", 1, cfg["verbose"])
+
+    log(f"Rebuild complete: {restored} restored.", 1, cfg["verbose"])
+    return 0
 
 
 # ---------------------------------------------------------------------------
