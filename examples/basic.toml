@@ -1,0 +1,37 @@
+# bubtrsnap example: basic local snapshots + backups
+#
+# Snapshot two subvolumes and keep both the snapshots and the local backups
+# under a single global keep policy.  No remote host is configured here.
+#
+# To use:  bubtrsnap --config=examples/basic.toml
+#   (or copy the values into ~/.config/bubtrsnap.toml)
+#
+# Global options ----------------------------------------------------------------
+snapshot_dir = "/pool/snapshots"
+backup_dir   = "/backup"
+
+# local_sudo is only needed when the user running bubtrsnap does NOT own the
+# subvolumes it is backing up, or the snapshot/backup directories (a common
+# case is backing up system subvolumes such as /, /etc, /var, or a /pool that
+# is mounted and owned by root).  When set, bubtrsnap prepends `sudo -n` to its
+# local btrfs commands (snapshot, send/receive, subvolume show) and to any
+# local scp/rsync it runs.  The user must have a NOPASSWD sudo profile that
+# allows btrfs, scp and rsync.  If you own everything you back up, leave this
+# off (omit the line).
+local_sudo = true
+
+# Global keep policy -- applies to snapshots AND backups, to every archive that
+# does not define its own per-archive keep values (both archives below do not,
+# so they inherit these).
+keep_daily   = 7     # keep the last 7 daily snapshots/backups
+keep_weekly  = 4     # keep the last 4 weekly snapshots/backups
+keep_monthly = 2     # keep the last 2 monthly snapshots/backups
+
+# Archives ---------------------------------------------------------------------
+# Every [section_name] that contains a `subvolume` key becomes an archive; the
+# section name is the archive name (used in the snapshot/backup filenames).
+[home]
+subvolume = "/home"
+
+[varlib]
+subvolume = "/var/lib"

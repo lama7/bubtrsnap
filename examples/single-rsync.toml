@@ -1,0 +1,38 @@
+# bubtrsnap example: single archive with rsync remote transfer
+#
+# One archive that takes snapshots and backs up to a local destination plus a
+# remote host.  The stream that is transferred to the remote uses rsync (with
+# --partial-dir) so an interrupted transfer can be resumed on the next run
+# instead of restarting from zero.
+#
+# To use:  bubtrsnap --config=examples/single-rsync.toml
+#   (requires rsync on PATH)
+#
+# IMPORTANT: rsync only affects the FILE-BASED stream transfer.  A plain
+# "btrfs send | btrfs receive" over SSH is not rsync'd.  So a rsync config
+# must also produce a stream file (here export_dir) which is what rsync moves.
+
+snapshot_dir = "/pool/snapshots"
+backup_dir   = "/backup"
+
+remote_host = "backup@example.com"
+remote_path = "/btrfs/backup"
+
+# Stream directory: bubtrsnap writes each incremental stream here as
+# <archive>.<timestamp>.btrfs and (on the next run) transfers the needed file
+# to the remote.  This is what gives rsync a file it can resume.
+export_dir = "/pool/streams"
+
+# rsync transport
+rsync    = true
+rsync_opts = '-e "ssh -p 2222"'   # optional: non-standard SSH port / key
+# Note: --partial-dir .bubtrsnap-partial and -a are always added; dangerous
+# rsync options (e.g. --delete, --dry-run) are blocked with a warning.
+
+# Archive ---------------------------------------------------------------------
+[server]
+subvolume = "/var/lib"
+# Per-archive keep policy (archive-specific; global keeps ignored here):
+keep_daily   = 14
+keep_weekly  = 4
+keep_monthly = 4

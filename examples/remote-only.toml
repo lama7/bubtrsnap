@@ -1,0 +1,27 @@
+# bubtrsnap example: remote-only backups (no local backup destination)
+#
+# A common setup where the "local" machine only keeps the read-only snapshots
+# and the actual backups live on a remote host.  No backup_dir is configured
+# here, so there is no local copy of the data — only snapshots locally and
+# backups on the remote.
+#
+# To use:  bubtrsnap --config=examples/remote-only.toml
+#
+# If you later want a local copy too, add a backup_dir line (and it will
+# coexist with the remote automatically — keep policy applies to both).
+
+snapshot_dir = "/pool/snapshots"
+
+# The remote is the only backup destination.
+remote_host = "backup@example.com"
+remote_path = "/btrfs/backup"
+#remote_sudo = false
+
+# Archive ---------------------------------------------------------------------
+[server]
+subvolume = "/var/lib"
+# Per-archive keep policy (applies to the local snapshots and the remote
+# backups independently):
+keep_daily   = 14
+keep_weekly  = 4
+keep_monthly = 4

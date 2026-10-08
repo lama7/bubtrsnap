@@ -1,0 +1,33 @@
+# bubtrsnap example: single archive, local + remote backups
+#
+# One archive that takes snapshots and writes backups to BOTH a local
+# destination (backup_dir) and a remote host (remote_host/remote_path).
+# The keep policy is defined per-archive, so it fully controls retention
+# for this archive and is independent of any global keep values.
+#
+# To use:  bubtrsnap --config=examples/single-remote.toml
+#
+# NOTE on keep precedence: once an archive defines ANY keep_* value it takes
+# full control of its own policy; keep values it omits are treated as 0
+# (they are NOT inherited from the global section). So this archive's policy
+# is exactly the three keep_* lines shown.
+
+snapshot_dir = "/pool/snapshots"
+backup_dir   = "/backup"
+
+# Remote host (global level here; could also go in the archive section)
+remote_host = "backup@example.com"
+remote_path = "/btrfs/backup"
+# Set remote_sudo = true only if the remote commands must run under sudo on
+# the backup host.
+#remote_sudo = false
+
+# Archive ---------------------------------------------------------------------
+[server]
+subvolume = "/var/lib"
+# Per-archive keep policy (archive-specific; the global keeps are ignored for
+# this archive):
+keep_daily   = 14     # last 14 days
+keep_weekly  = 4      # last 4 weeks
+keep_monthly = 4      # last 4 months
+# keep_yearly is omitted -> 0 (no yearly retention for this archive)

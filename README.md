@@ -414,19 +414,153 @@ details.
 
 Always use `--dry-run` to preview a new keep policy or remote configuration.
 
+## Maintenance subcommands
+
+Beyond the legacy `bubtrsnap ARCHIVE[=SUBVOLUME] ...` invocation, bubtrsnap
+offers maintenance subcommands. When you give a subcommand name on the command
+line it is parsed with its own option set; with no subcommand the legacy backup
+behaviour applies (all positionals are archive names). The global options
+(`--config`, `--snapshot-dir`, `--backup-dir`, `-v/--verbose`, `--dry-run`,
+`--rsync`, and the `keep_*` policies) are shared by every subcommand. Run
+`bubtrsnap <subcommand> --help` for that command's full option list.
+
+**`bubtrsnap backup`** — take snapshots and send backups. This is the default
+behaviour when no subcommand is given.
+
+**`bubtrsnap list [ARCHIVE ...]`** — read-only table of the snapshot / backup /
+remote timestamps that exist for each archive. All config archives are shown if
+none are named.
+
+**`bubtrsnap prune --ts TS [ARCHIVE ...]`** — delete snapshot/backup subvolumes
+matching the given timestamp(s). `--ts` takes a single timestamp
+`YYYYMMDDhhmm` or a dotted inclusive range `<from>..<to>`; multiple `--ts`
+options match any of them. Prune never operates on "all" archives — name at
+least one. Without `--yes` (and without `--dry-run`) it asks for confirmation
+before deleting.
+
+**`bubtrsnap rebuild [ARCHIVE ...]`** — reconcile snapshot/backup/remote
+locations. It restores a lost local snapshot from a local backup, restores a
+lost local backup from a local snapshot (via `btrfs send`/`receive`), and
+re-sends to a remote when it is missing there; it can also recover a snapshot
+that exists only on the remote. It never deletes — it only restores. All
+config archives are rebuilt if none are named.
+
+Examples:
+
+```bash
+bubtrsnap --config=~/.config/bubtrsnap.toml
+bubtrsnap backup --snapshot-dir=/snap --backup-dir=/bck home=/home
+bubtrsnap list home
+bubtrsnap prune --ts 202601010000..202601050000 home --yes
+bubtrsnap rebuild home
+```
+
 ## Configuration reference
 
 **Global-only options:**
-`snapshot_dir`, `local_sudo`, `stage_dir`, `verbose`, `dry_run`
+`snapshot_dir`, `local_sudo`, `verbose`, `dry_run`
 
 **Global or per-archive (archive overrides global):**
-`backup_dir`, `snaps_only`, `export_dir`, `import_dir`, `remote_host`,
-`remote_path`, `remote_sudo`, `rsync`, `rsync_opts`, `week_startday`,
-`keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly`
+`backup_dir`, `snaps_only`, `export_dir`, `import_dir`, `stage_dir`,
+`remote_host`, `remote_path`, `remote_sudo`, `rsync`, `rsync_opts`,
+`week_startday`, `keep_hourly`, `keep_daily`, `keep_weekly`,
+`keep_monthly`, `keep_yearly`
 
 **Per-archive only:**
 `subvolume` (required), `export_file`, `import_file`, `stage_file`,
 `pre_snapshot_hook`, `post_snapshot_hook`, `post_backup_hook`, `forced_keep`
+
+### Keep-policy precedence (archive-specific keeps)
+
+If an archive defines **any** `keep_*` value, it fully controls its own keep
+policy — the other intervals it does **not** set default to `0` (they are not
+inherited from the global section). The global keep values are used only when
+the archive sets none of them. So an archive-specific policy is complete as
+written; to keep a yearly as well you must set `keep_yearly` too.
+
+## Configuration examples
+
+A set of ready-to-use configuration files ship in `examples/`. Copy one into
+`~/.config/bubtrsnap.toml` (or pass it to `--config`) and edit the paths.
+
+- `examples/basic.toml` — snapshots and local backups for **two archives** with
+  a single **global** keep policy, plus `local_sudo` (with a comment explaining
+  when it's needed).
+- `examples/single-remote.toml` — **one archive** that snapshots, keeps a
+  **local** backup, and also keeps a **remote** backup; uses an
+  **archive-specific** keep policy.
+- `examples/single-rsync.toml` — **one archive** that snapshots, keeps a local
+  backup, and sends the **stream to the remote over rsync** (resumable
+  transfers); uses an **archive-specific** keep policy.
+- `examples/remote-only.toml` — **one archive** that keeps only local
+  snapshots and sends backups to a **remote** (no local backup destination);
+  uses an **archive-specific** keep policy.
+
+Example — basic local snapshots and backups, two archives:
+
+```toml
+snapshot_dir = "/pool/snapshots"
+backup_dir   = "/backup"
+
+# Only needed when bubtrsnap doesn't own the subvolumes/directories (e.g.
+# backing up system subvolumes or a root-owned /pool). Prepends `sudo -n`.
+local_sudo = true
+
+# Global keep policy: applies to snapshots and backups of every archive that
+# does not define its own keep values.
+keep_daily   = 7
+keep_weekly  = 4
+keep_monthly = 2
+
+[home]
+subvolume = "/home"
+
+[varlib]
+subvolume = "/var/lib"
+```
+
+Example — one archive, local + remote, archive-specific keep policy:
+
+```toml
+snapshot_dir = "/pool/snapshots"
+backup_dir   = "/backup"
+remote_host  = "backup@example.com"
+remote_path  = "/btrfs/backup"
+
+[server]
+subvolume = "/var/lib"
+# Archive-specific: fully controls this archive's policy. Intervals omitted
+# here are 0 (not inherited from any global section).
+keep_daily   = 14
+keep_weekly  = 4
+keep_monthly = 4
+```
+
+Example — one archive with rsync remote transfer (resumable stream files):
+
+```toml
+snapshot_dir = "/pool/snapshots"
+backup_dir   = "/backup"
+remote_host  = "backup@example.com"
+remote_path  = "/btrfs/backup"
+
+# Stream directory: incremental streams are written here as
+# <archive>.<timestamp>.btrfs and rsync'd to the remote (resumable).
+export_dir = "/pool/streams"
+
+rsync      = true
+rsync_opts = '-e "ssh -p 2222"'   # optional: non-standard port / key
+
+[server]
+subvolume = "/var/lib"
+keep_daily   = 14
+keep_weekly  = 4
+keep_monthly = 4
+```
+
+**Note:** rsync only affects the *file-based* stream transfer. A plain
+`btrfs send | btrfs receive` over SSH is never rsync'd, so a rsync config must
+also produce a stream file (`export_file`/`export_dir`/`stage_file`).
 
 ## Installing
 
@@ -459,6 +593,7 @@ python3 unittests/test_keep_policy.py -v
 python3 unittests/test_ssh.py -v
 python3 unittests/test_file_options.py -v
 python3 unittests/test_runtime.py -v
+python3 unittests/test_rebuild.py -v
 ```
 
 [btrbu]: https://github.com/lama7/btrbu
