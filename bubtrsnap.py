@@ -2879,7 +2879,8 @@ Subcommands:
   prune      Delete snapshots/backups matching a timestamp (or a dotted inclusive
              range '<from>..<to>').  Requires at least one archive and --yes.
   rebuild    Reconcile snapshot/backup/remote locations: restore lost local
-             snapshots/backups and re-send to a remote when missing.  Never deletes.
+             snapshots/backups, and recover a snapshot lost only on the remote.
+             Never deletes.
 
 Global options are shared by every subcommand (e.g. --config, --snapshot-dir,
 --backup-dir, -v/--verbose, --dry-run, --rsync, and the keep policies).
@@ -3126,6 +3127,35 @@ def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = Fa
 
 
 
+def _remote_size_of(remote: str, subvol_path: str, cfg: dict,
+                    remote_sudo: bool = False) -> int | None:
+    """Approximate on-disk size (bytes) of a subvolume on the SSH remote, via
+    'du -sb'.  Returns None if the query could not be run or parsed (ssh not
+    reachable, no du, or it timed out).  Read-only.  Consistent with the
+    local _size_of() (both use logical file-size sums)."""
+    try:
+        sudo = ["sudo", "-n"] if remote_sudo else []
+        cmd = ["ssh", remote] + sudo + ["du", "-sb", subvol_path]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        log(f"[space] remote du timed out on {remote}", 1, cfg["verbose"])
+        return None
+    except Exception as e:
+        log(f"[space] could not measure remote subvolume size on {remote}: {e}", 1, cfg["verbose"])
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            return int(parts[0])
+        except ValueError:
+            continue
+    return None
+
+
 def _space_check_remote(remote, remote_dir, needed, label, cfg,
                         remote_sudo: bool = False, free: int | None = None) -> bool:
     """Guard for remote re-sends: return False if `needed` won't fit on
@@ -3319,8 +3349,9 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
     """Reconcile snapshot/backup locations: preview the work, check space,
     then restore what is missing (lost local snapshot <- backup via a
     metadata-only subvolume snapshot, lost local backup <- snapshot via
-    send/receive, lost remote <- local re-send).  Never deletes; proceeds
-    automatically (no --yes gate)."""
+    send/receive, lost remote <- local re-send, and a snapshot that exists
+    only on the remote recovered back locally via an SSH send/receive).
+    Never deletes; proceeds automatically (no --yes gate)."""
     dry = cfg.get("dry_run", False)
     restored = 0
     any_actionable = False
@@ -3354,6 +3385,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
         items = []
         needed = 0
         remote_needed = 0
+        snap_needed = 0
         for ts in all_ts:
             in_s, in_b, in_r = ts in snap_ts, ts in bak_ts, ts in rem_ts
             snap_p = snap_d / f"{name}.{ts}" if snap_d else None
@@ -3373,6 +3405,23 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                              "action": "restore snapshot (metadata-only)",
                              "from": "backup", "source": bak_p, "dest": snap_d})
                 items.append(base)
+            elif in_r and not in_s and not in_b and snap_d and remote and remote_dir:
+                # Lost snapshot, only present on the remote: recover the full
+                # subvolume by sending it from the remote and receiving it
+                # into snapshot_dir.  The received subvolume lands as a
+                # top-level readonly snapshot (btrfs receive default), matching
+                # the normal snapshot convention.  The remote side is a plain
+                # (non-incremental) send — the remote snapshot's own parent
+                # subvolumes already live there, so no parent flags are needed.
+                base.update({"kind": "from_remote",
+                             "action": "restore snapshot (from remote)",
+                             "from": "remote",
+                             "source": f"{remote_dir}/{name}.{ts}",
+                             "dest": snap_d})
+                items.append(base)
+                if snap_d.is_dir():
+                    snap_needed += _remote_size_of(remote, f"{remote_dir}/{name}.{ts}",
+                                                    cfg, remote_sudo) or 0
             elif remote and remote_dir and not in_r:
                 src = snap_p if (in_s and snap_p and snap_p.exists()) else (
                     bak_p if (bak_p and bak_p.exists()) else None)
@@ -3401,7 +3450,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
         log(f"    {'timestamp':<20} {'action':<38} source -> destination", 1, cfg["verbose"])
         for it in items:
             ts = it["ts"]
-            if it["kind"] in ("backup", "snapshot", "remote"):
+            if it["kind"] in ("backup", "snapshot", "remote", "from_remote"):
                 src = it["source"]
                 src_disp = (src.name if (src and hasattr(src, "name")) else str(src))
                 dest = it["dest"]
@@ -3425,6 +3474,25 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
             if not _space_check(target, needed, f"backup for {name}", cfg):
                 continue  # _space_check already logged the reason; preview above is shown
 
+        # Snapshot-space guard: restoring a lost snapshot from the remote writes
+        # a full subvolume into snapshot_dir (a different filesystem from
+        # backup_dir on this system), so check free space there.  We never
+        # hard-stop here on the *remote* — only on the local target — so a
+        # missing snapshot won't block the re-send to remote of other archives.
+        if snap_needed > 0 and snap_d:
+            target = snap_d
+            try:
+                free = _disk_free(target)
+            except OSError:
+                free = 0
+            log(f"    memory required (snapshot): {_human_size(snap_needed)} "
+                f"(free at {target.name or target}: {_human_size(free)})", 1, cfg["verbose"])
+            if not _space_check(target, snap_needed, f"snapshot restore for {name}", cfg):
+                # Downgrade the from_remote items for this archive to skip so the
+                # remaining local/remote work still runs.
+                for it in items:
+                    if it["kind"] == "from_remote":
+                        it["kind"] = "skip"
 
         # Report the remote requirement (if any) and guard the remote re-sends:
         # if it won't fit we skip just the remote part, so local work still runs.
@@ -3448,7 +3516,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
         # Phase 4: execute the plan.
         for it in items:
             kind = it["kind"]
-            if kind not in ("backup", "snapshot", "remote"):
+            if kind not in ("backup", "snapshot", "remote", "from_remote"):
                 continue
             any_actionable = True
             ts = it["ts"]
@@ -3492,6 +3560,28 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         log(f"    {label}: remote re-send failed: {stderr.strip()}", 3, cfg["verbose"])
                 except Exception as e:
                     log(f"    {label}: remote re-send error: {e}", 1, cfg["verbose"])
+            elif kind == "from_remote":
+                log(f"    {label}: restoring snapshot from remote {remote}", 1, cfg["verbose"])
+                try:
+                    # Remote → local: SSH into the remote and run `btrfs send`
+                    # on the remote subvolume (plain send — the snapshot is
+                    # top-level, so no parent flags are needed), then pipe
+                    # the stream into a local `btrfs receive` into snapshot_dir.
+                    # The received subvolume is created top-level and readonly,
+                    # matching the normal snapshot convention.
+                    send_cmd = btrfs_cmd(cfg, "send", sudo=False)
+                    send_cmd.append(str(it["source"]))
+                    send_cmd = build_ssh_cmd(remote, send_cmd, remote_sudo)
+                    recv_cmd = btrfs_cmd(cfg, "receive", str(it["dest"]))
+                    rc, stderr = piped_run(send_cmd, recv_cmd,
+                                           dry_run=dry, verbosity=cfg["verbose"])
+                    if rc == 0:
+                        log(f"    {label}: snapshot restored from remote", 1, cfg["verbose"])
+                        restored += 1
+                    else:
+                        log(f"    {label}: snapshot restore from remote failed: {stderr.strip()}", 3, cfg["verbose"])
+                except Exception as e:
+                    log(f"    {label}: snapshot restore from remote error: {e}", 1, cfg["verbose"])
 
     dry_prefix = "[dry-run] " if dry else ""
     if not any_actionable:
