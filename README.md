@@ -443,7 +443,15 @@ locations. It restores a lost local snapshot from a local backup, restores a
 lost local backup from a local snapshot (via `btrfs send`/`receive`), and
 re-sends to a remote when it is missing there; it can also recover a snapshot
 that exists only on the remote. It never deletes — it only restores. All
-config archives are rebuilt if none are named.
+config archives are rebuilt if none are named. A rebuild is plan-first: its
+action list is computed once from the state at the start of the run, and each
+action fills only one of the three locations. As a result, a snapshot missing
+in *two* locations needs two runs. For example, an archive that only exists as
+a local snapshot gets its local backup restored on the first run and is only
+re-sent to the remote on the second; likewise an archive that only exists on the
+remote is recovered as a local snapshot on the first run and gets its local
+backup filled in on the second. Run `bubtrsnap list` to confirm all three
+locations line up before calling it done.
 
 Examples:
 

@@ -3382,6 +3382,14 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
 
         # Phase 1: determine the plan (no side effects) and the local space it
         # would need.  Only new local backups consume local disk.
+        #
+        # The plan is computed once, from the state at the start of this run,
+        # then executed; each item restores exactly one of the three locations.
+        # Hence a timestamp missing in two locations needs two runs:
+        #   snapshot-only  -> run 1 restores the local backup, run 2 re-sends
+        #                     to the remote
+        #   remote-only    -> run 1 recovers the local snapshot, run 2 restores
+        #                     the local backup
         items = []
         needed = 0
         remote_needed = 0
