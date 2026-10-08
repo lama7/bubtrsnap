@@ -3282,6 +3282,17 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
     return 0
 
 
+def _confirm(prompt: str) -> bool:
+    """Ask a yes/no question; return True on y/yes/1, False otherwise.
+    Aborts (returns False) on EOF or Ctrl-C."""
+    try:
+        ans = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.", file=sys.stderr)
+        return False
+    return ans.strip().lower() in ("y", "yes", "1")
+
+
 def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.Namespace) -> int:
     specs = getattr(args, "ts", None) or []
     if not specs:
@@ -3294,9 +3305,11 @@ def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.N
         return 1
 
     total_to_del = 0
+    forced_items: list[tuple[dict, str, str]] = []
     for archive in archives:
         name = archive["name"]
         loc = _loc_of(archive, cfg)
+        fk = set(archive.get("forced_keep") or [])
         for label in ("snap", "backup", "remote"):
             items = [(ts, p) for ts, p in _iter_location(loc, label, name, cfg)
                      if any(_ts_match(ts, s) for s in specs)]
@@ -3304,7 +3317,11 @@ def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.N
                 total_to_del += len(items)
                 for ts, p in items:
                     disp = p.name if hasattr(p, "name") else str(p).rsplit("/", 1)[-1]
-                    log(f"    [{label}] would delete {ts} ({disp})", 1, cfg["verbose"])
+                    if ts in fk:
+                        forced_items.append((archive, label, ts))
+                        log(f"    [{label}] would delete {ts} ({disp})  [forced-keep]", 1, cfg["verbose"])
+                    else:
+                        log(f"    [{label}] would delete {ts} ({disp})", 1, cfg["verbose"])
     if not total_to_del:
         log(f"Nothing to prune (no matches for {specs}).", 1, cfg["verbose"])
         return 0
@@ -3313,14 +3330,22 @@ def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.N
         log(f"[dry-run] would delete {total_to_del} subvolume(s).", 1, cfg["verbose"])
         return 0
 
-    if not args.yes:
-        try:
-            ans = input(f"Delete {total_to_del} snapshot/backup subvolume(s)? [y/N]: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\nAborted.", file=sys.stderr)
+    # If any forced-keep timestamps are being targeted, require explicit
+    # confirmation even when --yes is set.  The forced-keep marking exists to
+    # protect a timestamp from being culled, but a hand-picked --ts range can
+    # capture one without the user noticing, so we surface it and ask.  We
+    # never partially delete: on a "no" the whole prune is aborted.
+    if forced_items:
+        warn = (
+            f"\nWarning: {len(forced_items)} of the target subvolume(s) are "
+            "marked forced_keep:\n"
+        )
+        for a, l, ts in forced_items:
+            warn += f"    {a['name']}.{l}  {ts}\n"
+        if not _confirm(warn + f"Prune them anyway? [y/N]: "):
             return 1
-        if ans.strip().lower() not in ("y", "yes", "1"):
-            print("Aborted.", file=sys.stderr)
+    elif not args.yes:
+        if not _confirm(f"Delete {total_to_del} snapshot/backup subvolume(s)? [y/N]: "):
             return 1
 
     for archive in archives:

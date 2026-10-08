@@ -436,7 +436,10 @@ matching the given timestamp(s). `--ts` takes a single timestamp
 `YYYYMMDDhhmm` or a dotted inclusive range `<from>..<to>`; multiple `--ts`
 options match any of them. Prune never operates on "all" archives — name at
 least one. Without `--yes` (and without `--dry-run`) it asks for confirmation
-before deleting.
+before deleting. If any timestamp in the target set is marked `forced_keep`,
+the preview labels it `[forced-keep]` and an *additional* confirmation is
+required even when `--yes` is set (a hand-picked range can capture a
+protected timestamp by accident); declining aborts the whole prune.
 
 **`bubtrsnap rebuild [ARCHIVE ...]`** — reconcile snapshot/backup/remote
 locations. It restores a lost local snapshot from a local backup, restores a

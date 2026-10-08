@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 def _load():
     path = Path(__file__).resolve().parent.parent / "bubtrsnap.py"
@@ -799,6 +799,110 @@ class TestForcedKeepRouting(unittest.TestCase):
                              "Forced-keep timestamp should NOT be pruned, "
                              "but was.  Bug: archive['forced_keep'] is never "
                              "copied into cfg before calling apply_keep_policy.")
+
+
+import argparse
+
+
+class TestPruneForcedKeep(unittest.TestCase):
+    """_run_prune must require explicit confirmation when the targeted
+    timestamp is marked forced_keep, even when --yes is present.
+
+    The forced-keep marker exists to shield a timestamp from culling, but
+    a hand-picked --ts range can sweep one up by accident, so prune must
+    call attention to it and get a deliberate "y" before deleting.
+    """
+
+    def _args(self, ts_list, yes=False, dry_run=False):
+        return argparse.Namespace(ts=list(ts_list), yes=yes, dry_run=dry_run)
+
+    def _prune(self, args, input_side_effect, cfg_extra=None):
+        with patch("builtins.input", side_effect=input_side_effect), \
+             patch("bubtrsnap.run") as mock_run:
+            with tempfile.TemporaryDirectory() as td:
+                backup_dir = Path(td)
+                for ts in ("202601011200", "202601021200", "202601031200"):
+                    (backup_dir / f"testarchive.{ts}").mkdir()
+
+                cfg = {"verbose": 1, "dry_run": args.dry_run, "local_sudo": False,
+                       "backup_dir": str(backup_dir)}
+                if cfg_extra:
+                    cfg.update(cfg_extra)
+
+                archive = {"name": "testarchive",
+                           "forced_keep": ["202601021200"],
+                           "snaps_only": False}
+                rc = bs._run_prune([archive], cfg, 1, args)
+            return rc, mock_run
+
+    def test_forced_keep_target_no_confirms_abort(self):
+        """A forced-keep ts is targeted; user declines -> abort, nothing deleted."""
+        args = self._args(["202601021200"])
+        rc, mock_run = self._prune(args, ["no"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(mock_run.call_count, 0, "nothing deleted")
+
+    def test_forced_keep_target_yes_deletes(self):
+        """A forced-keep ts is targeted; explicit yes -> it is deleted."""
+        args = self._args(["202601021200"])
+        rc, mock_run = self._prune(args, ["yes"])
+        self.assertEqual(rc, 0)
+        self.assertGreaterEqual(mock_run.call_count, 1, "expected a delete command")
+        joined = " ".join(str(a) for c in mock_run.call_args_list for a in c.args)
+        self.assertIn("202601021200", joined)
+
+    def test_forced_keep_with_yes_still_confirms(self):
+        """--yes must NOT bypass the forced-keep confirmation."""
+        args = self._args(["202601021200"], yes=True)
+        rc, mock_run = self._prune(args, ["no"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(mock_run.call_count, 0, "--yes must not delete a forced-keep ts")
+
+    def test_no_forced_keep_no_confirm_deletes(self):
+        """No forced-keep marks: --yes deletes without any prompt."""
+        with patch("builtins.input") as mock_input, \
+             patch("bubtrsnap.run") as mock_run:
+            with tempfile.TemporaryDirectory() as td:
+                backup_dir = Path(td)
+                for ts in ("202601011200", "202601021200"):
+                    (backup_dir / f"testarchive.{ts}").mkdir()
+                cfg = {"verbose": 1, "dry_run": False, "local_sudo": False,
+                       "backup_dir": str(backup_dir)}
+                archive = {"name": "testarchive", "forced_keep": [],
+                           "snaps_only": False}
+                rc = bs._run_prune([archive], cfg, 1,
+                                   self._args(["202601011200"], yes=True))
+            self.assertEqual(rc, 0)
+            self.assertGreaterEqual(mock_run.call_count, 1)
+            self.assertEqual(mock_input.call_count, 0,
+                             "no forced-keep should need no confirmation")
+
+    def test_forced_keep_range_capture_confirms(self):
+        """A --ts range that captures a forced-keep ts triggers confirmation."""
+        args = self._args(["202601020000..202601030000"])
+        rc, mock_run = self._prune(args, ["no"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(mock_run.call_count, 0)
+
+    def test_forced_keep_shown_in_dry_run(self):
+        """dry-run preview must label the forced-keep timestamp."""
+        args = self._args(["202601021200"], dry_run=True)
+        rc, mock_run = self._prune(args, ["yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_run.call_count, 0, "dry-run deletes nothing")
+        import io, contextlib
+        with patch("builtins.input", side_effect=["yes"]), \
+             patch("bubtrsnap.run") as m, \
+             contextlib.redirect_stdout(io.StringIO()) as buf:
+            with tempfile.TemporaryDirectory() as td:
+                backup_dir = Path(td)
+                for ts in ("202601021200",):
+                    (backup_dir / f"testarchive.{ts}").mkdir()
+                cfg = {"verbose": 1, "dry_run": True, "local_sudo": False,
+                       "backup_dir": str(backup_dir)}
+                archive = {"name": "testarchive", "forced_keep": ["202601021200"]}
+                bs._run_prune([archive], cfg, 1, self._args(["202601021200"]))
+        self.assertIn("[forced-keep]", buf.getvalue())
 
 
 if __name__ == "__main__":
