@@ -506,10 +506,15 @@ def remove_stage_file(path: Path, cfg: dict) -> None:
         return
     try:
         if cfg.get("local_sudo"):
-            run(["sudo", "-n", "rm", "-f", str(path)],
-                dry_run=cfg.get("dry_run", False),
-                verbosity=cfg["verbose"],
-                capture_output=True, check=False)
+            result = run(["sudo", "-n", "rm", "-f", str(path)],
+                         dry_run=cfg.get("dry_run", False),
+                         verbosity=cfg["verbose"],
+                         capture_output=True, check=False)
+            if result is not None and result.returncode != 0:
+                err = (result.stderr or "").strip() or f"rm exited with code {result.returncode}"
+                print(f"Warning: could not remove staged stream '{path}': {err}",
+                      file=sys.stderr)
+                return
         else:
             path.unlink(missing_ok=True)
         log(f"Removed staged stream file: {path}", 1, cfg["verbose"])
