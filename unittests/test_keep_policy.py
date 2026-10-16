@@ -973,5 +973,37 @@ class TestPerArchiveWeekStartday(unittest.TestCase):
         self.assertNotEqual(self._kept("monday"), self._kept("sunday"))
 
 
+class TestReceiveAndPostGate(unittest.TestCase):
+    """Keep policy must apply even when receive was skipped ('already exists')."""
+
+    def _run(self, received, archive=None):
+        archive = archive or {"name": "corinne", "keep": {"daily": 3}}
+        hooks = []
+        policies = []
+        with patch.object(bs, "run_hook",
+                         lambda t, m, c: hooks.append(t)), \
+             patch.object(bs, "_apply_all_keep_policies",
+                         lambda *a, **k: policies.append(a)):
+            bs._receive_and_post(received, archive, "corinne", None,
+                                 Path("/backup"), None, None, None,
+                                 {"daily": 3}, {"verbose": 0, "dry_run": False})
+        return hooks, policies
+
+    def test_hook_skipped_when_nothing_received(self):
+        hooks, _ = self._run(None)
+        self.assertEqual(hooks, [])
+
+    def test_keep_policy_applied_when_nothing_received(self):
+        _, policies = self._run(None)
+        self.assertEqual(len(policies), 1)
+
+    def test_both_applied_when_received(self):
+        archive = {"name": "corinne", "keep": {"daily": 3},
+                   "post_backup_hook": "echo {backup}"}
+        hooks, policies = self._run("corinne.202610150423", archive)
+        self.assertEqual(hooks, ["echo {backup}"])
+        self.assertEqual(len(policies), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

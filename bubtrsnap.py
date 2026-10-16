@@ -2386,13 +2386,19 @@ def _receive_and_post(received: str | None, archive: dict, name: str, snap: Path
                       snap_dir: Path | None, keep: dict, cfg: dict,
                       remote_sudo: bool = False,
                       forced_keep: list[str] | None = None) -> None:
-    """After a receive, run post-backup hook and all keep policies."""
+    """After a receive, run post-backup hook and all keep policies.
+
+    The hook only runs when something was actually received (otherwise
+    {backup} would be empty).  Keep policies always run: pruning is
+    idempotent and must happen even when receive was skipped because
+    the subvolume already exists (e.g. --import-file re-runs).
+    """
     if received:
         run_hook(archive.get("post_backup_hook"),
                  _build_hook_context(name, snap, received, backup_dir, remote, remote_dir, cfg), cfg)
-        _apply_all_keep_policies(snap_dir or None, backup_dir, remote, remote_dir, remote_sudo,
-                                 name, keep, cfg, forced_keep,
-                                 week_startday=archive.get("week_startday"))
+    _apply_all_keep_policies(snap_dir or None, backup_dir, remote, remote_dir, remote_sudo,
+                             name, keep, cfg, forced_keep,
+                             week_startday=archive.get("week_startday"))
 
 
 def process_archive(archive: dict, cfg: dict) -> str | None:
