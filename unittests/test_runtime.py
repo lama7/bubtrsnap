@@ -2098,5 +2098,57 @@ class TestNoDuplicateReceiveWithAutoSSHDestination(unittest.TestCase):
                             f"Expected keep policy applied to backup_dir {backup_dir}: {output}")
 
 
+class TestPlainBackupBranch(unittest.TestCase):
+    """Archives with no export/import options take the plain send_backup path.
+
+    Regression guard for the dead `if (send_file or send_dir) and remote...`
+    branch inside the elif: the elif chain guarantees send_file/send_dir are
+    None there, so send_backup (which handles local, remote, or both) is the
+    only possible route.
+    """
+
+    def _run_process(self, archive, cfg):
+        with patch.object(bs, "chk_btrfs_subvolume"), \
+             patch.object(bs, "_validate_destinations"), \
+             patch.object(bs, "create_snapshot") as mock_snap, \
+             patch.object(bs, "run_hook"), \
+             patch.object(bs, "_size_of", return_value=100), \
+             patch.object(bs, "_space_check", return_value=True), \
+             patch.object(bs, "send_backup") as mock_sb, \
+             patch.object(bs, "send_backup_tofile") as mock_tofile, \
+             patch.object(bs, "_apply_all_keep_policies"):
+            mock_snap.return_value = Path("/fake/snapshots/testarchive.202601010000")
+            mock_sb.return_value = Path("testarchive.202601010000")
+            bs.process_archive(archive, cfg)
+        return mock_sb, mock_tofile
+
+    def test_local_and_remote_no_export_uses_send_backup(self):
+        archive = {"name": "testarchive", "subvolume": "/fake/subvol",
+                   "backup_dir": "/fake/backup", "keep": {},
+                   "remote_host": "user@host", "remote_path": "/remote/backups"}
+        cfg = {"verbose": 0, "dry_run": False, "snapshot_dir": "/fake/snapshots",
+               "backup_dir": "/fake/backup", "remote_sudo": False}
+        mock_sb, mock_tofile = self._run_process(archive, cfg)
+        self.assertEqual(mock_sb.call_count, 1,
+                         "send_backup must handle local+remote in one call")
+        # send_backup(snap, snap_dir, backup_dir, cfg, name, archive) — the
+        # archive dict carries the remote settings it will use.
+        self.assertEqual(mock_sb.call_args[0][5], archive)
+        self.assertEqual(mock_tofile.call_count, 0,
+                         "the dead tofile branch must not execute")
+
+    def test_remote_only_no_export_uses_send_backup(self):
+        # main() merges global remote_host/remote_path into each archive dict
+        # before process_archive runs (precedence: CLI > archive > global),
+        # so process_archive only ever reads archive-level remote settings.
+        archive = {"name": "testarchive", "subvolume": "/fake/subvol", "keep": {},
+                   "remote_host": "user@host", "remote_path": "/remote/backups"}
+        cfg = {"verbose": 0, "dry_run": False, "snapshot_dir": "/fake/snapshots",
+               "backup_dir": None, "remote_sudo": False}
+        mock_sb, mock_tofile = self._run_process(archive, cfg)
+        self.assertEqual(mock_sb.call_count, 1)
+        self.assertEqual(mock_tofile.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

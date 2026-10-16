@@ -2574,7 +2574,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         if backup_dir and not recv_file:
             if not interrupted_rsync:
                 _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
-        dest = backup_dir / snap.name if backup_dir else stream_path
     elif send_dir:
         chk_is_dir(send_dir, "export-dir" if not staged else "stage-dir")
         stream_path = Path(send_dir) / f"{post_hook_snap_name}.btrfs"
@@ -2587,7 +2586,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         if backup_dir and not recv_file and not recv_dir:
             if not interrupted_rsync:
                 _piped_send_to_local(snap, snap_dir, backup_dir, cfg, name)
-        dest = backup_dir / snap.name if backup_dir else stream_path
     elif not snaps_only and (backup_dir or (remote and remote_dir)):
         log("Starting backup...", 1, cfg["verbose"])
 
@@ -2598,13 +2596,9 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
             if not _space_check(backup_dir, needed, "backup", cfg):
                 raise SystemExit(1)
 
-        if (send_file or send_dir) and remote and remote_dir:
-            if not interrupted_rsync:
-                dest = send_backup_tofile(snap, snap_dir, backup_dir, stream_path, cfg, name, archive)
-            else:
-                dest = stream_path
-        else:
-            dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
+        # send_file/send_dir are guaranteed None here by the elif chain, so
+        # send_backup is the only route; it handles local, remote, or both.
+        dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
 
         run_hook(archive.get("post_backup_hook"),
                  _build_hook_context(name, snap, dest, backup_dir, remote, remote_dir, cfg), cfg)
@@ -2659,10 +2653,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         else:
             print("Should never get here...", file=sys.stderr)
             sys.exit(1)
-
-        # Non-staged: import_file may differ from export_file
-        if recv_file and send_file and not staged:
-            recv_path = Path(recv_file)
 
         # When both backup_dir AND remote are targets in a stage/import/export
         # flow (auto_ssh_receive is False), the single exported stream carries
