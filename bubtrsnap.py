@@ -1670,14 +1670,22 @@ def _check_interrupted_rsync(remote: str, archive_name: str, cfg: dict) -> bool:
     remote_partial_dir = f"/tmp/{_partial_dir_name(archive_name)}"
     check_cmd = ["ssh", remote, "test", "-d", remote_partial_dir]
 
-    result = run(check_cmd,
-                  dry_run=False,  # always execute — read-only check, should run even during dry-run
-                  verbosity=cfg["verbose"],
-                  capture_output=True, text=True, check=False)
+    try:
+        result = run(check_cmd,
+                     dry_run=False,  # always execute — read-only check, should run even during dry-run
+                     verbosity=cfg["verbose"],
+                     capture_output=True, text=True, check=False,
+                     timeout=10)
+    except subprocess.TimeoutExpired:
+        log(f"rsync recovery check on {remote} timed out; "
+            f"assuming no interrupted transfer", 1, cfg["verbose"])
+        return False
+    except OSError as e:
+        log(f"rsync recovery check on {remote} failed: {e}; "
+            f"assuming no interrupted transfer", 1, cfg["verbose"])
+        return False
 
-    if result is not None and result.returncode == 0:
-        return True
-    return False
+    return result is not None and result.returncode == 0
 
 
 def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
