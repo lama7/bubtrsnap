@@ -453,8 +453,9 @@ in *two* locations needs two runs. For example, an archive that only exists as
 a local snapshot gets its local backup restored on the first run and is only
 re-sent to the remote on the second; likewise an archive that only exists on the
 remote is recovered as a local snapshot on the first run and gets its local
-backup filled in on the second. Run `bubtrsnap list` to confirm all three
-locations line up before calling it done.
+backup filled in on the second.  An archive with no `backup_dir` has no local
+backup to restore, so its remote re-send happens in the same run. Run
+`bubtrsnap list` to confirm all three locations line up before calling it done.
 
 Examples:
 

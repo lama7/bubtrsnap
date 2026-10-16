@@ -3447,7 +3447,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                 "name": name, "ts": ts, "snap_dir": snap_d,
                 "remote": remote, "remote_dir": remote_dir, "remote_sudo": remote_sudo,
             }
-            if in_s and not in_b:
+            if in_s and not in_b and bak_d:
                 if snap_p and snap_p.exists():
                     needed += _size_of(snap_p)
                 base.update({"kind": "backup", "action": "restore local backup",

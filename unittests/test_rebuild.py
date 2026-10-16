@@ -12,7 +12,10 @@ Phase 4 execution that pipes an SSH send into a local receive.
 
 from __future__ import annotations
 
+import io
+import subprocess
 import unittest
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -102,6 +105,72 @@ class TestRebuildFromRemote(unittest.TestCase):
             self.assertIn("receive", recv_cmd)
             self.assertEqual(recv_cmd[-1], str(snap_dir))
             self.assertNotIn("ssh", recv_cmd)  # receive runs locally, not remote
+
+
+class TestRebuildWithoutBackupDir(unittest.TestCase):
+    """A snapshot-only archive (no backup_dir configured) has nothing to
+    restore locally.
+
+    The planner used to emit `restore local backup` rows with dest=None for
+    every snapshot, and the execution phase then raised AttributeError inside
+    _piped_send_to_local (glob on None), swallowed by the broad except and
+    reported as a restore failure.
+    """
+
+    @mock.patch.object(bs, "_piped_send_to_local")
+    @mock.patch.object(bs, "iter_archive_items_ssh")
+    def test_snapshot_only_plans_no_local_restore(self, m_iter_ssh, m_piped):
+        m_iter_ssh.return_value = []
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            for ts in ("202610011200", "202610021200"):
+                (snap_dir / f"root.{ts}").mkdir()
+            cfg = {
+                "verbose": 2, "dry_run": True, "local_sudo": False,
+                "snapshot_dir": str(snap_dir), "backup_dir": None,
+                "remote_host": None, "remote_path": None, "remote_sudo": False,
+            }
+            archive = {"name": "root", "subvolume": "/home", "backup_dir": None,
+                       "remote_host": None, "remote_path": None,
+                       "remote_sudo": False}
+            fake = subprocess.CompletedProcess([], 0, "", "")
+            out = io.StringIO()
+            with mock.patch.object(bs, "run", return_value=fake), redirect_stdout(out):
+                rc = bs._run_rebuild([archive], cfg, 2)
+            text = out.getvalue()
+            self.assertNotIn("restore local backup", text)
+            self.assertNotIn("NoneType", text)
+            self.assertNotIn("failed", text)
+            m_piped.assert_not_called()
+            self.assertEqual(rc, 0)
+
+    @mock.patch.object(bs, "_piped_send_to_local")
+    @mock.patch.object(bs, "iter_archive_items_ssh")
+    def test_snapshot_plus_remote_still_re_sends_to_remote(self, m_iter_ssh, m_piped):
+        """No backup_dir, but a remote that is missing the snapshot: the plan
+        must re-send from the snapshot, not attempt a local backup restore."""
+        m_iter_ssh.return_value = []
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            ts = "202610011200"
+            (snap_dir / f"root.{ts}").mkdir()
+            cfg = {
+                "verbose": 2, "dry_run": True, "local_sudo": False,
+                "snapshot_dir": str(snap_dir), "backup_dir": None,
+                "remote_host": "user@host", "remote_path": "/backup",
+                "remote_sudo": False,
+            }
+            archive = {"name": "root", "subvolume": "/home", "backup_dir": None,
+                       "remote_host": "user@host", "remote_path": "/backup",
+                       "remote_sudo": False}
+            fake = subprocess.CompletedProcess([], 0, "", "")
+            out = io.StringIO()
+            with mock.patch.object(bs, "run", return_value=fake), redirect_stdout(out):
+                bs._run_rebuild([archive], cfg, 2)
+            text = out.getvalue()
+            self.assertIn("re-send to remote (snapshot)", text)
+            self.assertNotIn("restore local backup", text)
+            m_piped.assert_not_called()
 
 
 if __name__ == "__main__":
