@@ -909,6 +909,47 @@ class TestPruneForcedKeep(unittest.TestCase):
         self.assertIn("[forced-keep]", buf.getvalue())
 
 
+class TestPruneActualCount(unittest.TestCase):
+    """'Prune complete: deleted N' must report ACTUAL deletions, not the
+    preview count.  The execution loop re-enumerates independently of the
+    preview, so items can disappear (or appear) between the two scans."""
+
+    def test_count_reflects_items_removed_between_scans(self):
+        import io, contextlib, shutil
+        with patch("bubtrsnap.run") as mock_run, \
+             contextlib.redirect_stdout(io.StringIO()) as buf:
+            with tempfile.TemporaryDirectory() as td:
+                backup_dir = Path(td)
+                (backup_dir / "alpha.202601011200").mkdir()
+                (backup_dir / "beta.202601011200").mkdir()
+                cfg = {"verbose": 1, "dry_run": False, "local_sudo": False,
+                       "backup_dir": str(backup_dir)}
+                archives = [{"name": "alpha", "forced_keep": []},
+                            {"name": "beta", "forced_keep": []}]
+
+                def fake_run(cmd, **kwargs):
+                    path = Path(cmd[-1])
+                    if path.name == "alpha.202601011200":
+                        # simulate a concurrent process removing beta's
+                        # subvolume between the preview and its deletion
+                        shutil.rmtree(backup_dir / "beta.202601011200",
+                                      ignore_errors=True)
+                    if not path.exists():
+                        raise subprocess.CalledProcessError(1, cmd)
+                    shutil.rmtree(path)
+                    return subprocess.CompletedProcess(cmd, 0)
+
+                mock_run.side_effect = fake_run
+                rc = bs._run_prune(archives, cfg, 1,
+                                   argparse.Namespace(
+                                       ts=["202601010000..202601020000"],
+                                       yes=True, dry_run=False))
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("Prune complete: deleted 1 subvolume(s).", out)
+        self.assertNotIn("deleted 2", out)
+
+
 class TestPerArchiveWeekStartday(unittest.TestCase):
     """README: weekly alignment "can be set globally or per-archive".
 

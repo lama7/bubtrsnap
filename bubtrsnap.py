@@ -3436,6 +3436,7 @@ def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.N
         if not _confirm(f"Delete {total_to_del} snapshot/backup subvolume(s)? [y/N]: "):
             return 1
 
+    deleted = 0
     for archive in archives:
         name = archive["name"]
         loc = _loc_of(archive, cfg)
@@ -3451,10 +3452,14 @@ def _run_prune(archives: list[dict], cfg: dict, verbosity: int, args: argparse.N
                 try:
                     run(cmd, dry_run=False, verbosity=cfg["verbose"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    deleted += 1
                 except subprocess.CalledProcessError as e:
                     print(f"Error pruning: {e}", file=sys.stderr)
                     return 1
-    log(f"Prune complete: deleted {total_to_del} subvolume(s).", 1, cfg["verbose"])
+    if deleted != total_to_del:
+        log(f"Note: preview found {total_to_del} item(s), but {deleted} were "
+            f"deleted (contents changed between scan and delete).", 1, cfg["verbose"])
+    log(f"Prune complete: deleted {deleted} subvolume(s).", 1, cfg["verbose"])
     return 0
 
 
