@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import io
+import subprocess
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from unittest.mock import patch
 from pathlib import Path
@@ -35,6 +38,13 @@ def _ns(**kwargs):
         import_dir=None,
         stage_dir=None,
         local_sudo=False,
+        remote_host=None,
+        remote_path=None,
+        remote_sudo=False,
+        rsync=False,
+        rsync_opts=None,
+        week_startday=None,
+        forced_keep=None,
         keep_hourly=None,
         keep_daily=None,
         keep_weekly=None,
@@ -75,6 +85,43 @@ class TestCLICombinations(unittest.TestCase):
         cli = _ns(stage_file="/tmp/s.btrfs", stage_dir="/tmp/streams", archives=["a"])
         with self.assertRaises(SystemExit):
             bs.load_and_resolve_archives(cli, None)
+
+    def test_stage_file_alone_is_accepted(self):
+        """--stage-file by itself is the documented staging shortcut, not a
+        conflict.  README: `bubtrsnap --stage-file /tmp/archive.btrfs archive=...`
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = _with_subvol_dirs(td_path, "a")["a"]
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f"""
+                snapshot_dir = "{td_path / 'snap'}"
+                backup_dir = "{td_path / 'backup'}"
+                [a]
+                subvolume = "{sub}"
+                """,
+            )
+            (td_path / "snap").mkdir()
+            (td_path / "backup").mkdir()
+            cli = _ns(
+                config=cfg,
+                stage_file=str(td_path / "stage.btrfs"),
+                archives=["a"],
+                dry_run=True,
+            )
+            fake = subprocess.CompletedProcess([], 0, "", "")
+            err, out = io.StringIO(), io.StringIO()
+            with patch.object(bs, "run", return_value=fake), \
+                 patch.object(bs, "get_subvol_uuids", return_value=(None, None)), \
+                 redirect_stderr(err), redirect_stdout(out):
+                rc = bs._run_backup(cli)
+            self.assertNotIn("mutually exclusive", err.getvalue())
+            self.assertEqual(rc, 0, f"stage-file-only run failed: {err.getvalue()}")
+            self.assertIn("btrfs send", out.getvalue())
+            self.assertIn("btrfs receive", out.getvalue())
+            self.assertIn("stage.btrfs", out.getvalue())
 
     def test_stage_dir_exclusive_with_export_dir(self):
         with tempfile.TemporaryDirectory() as td:

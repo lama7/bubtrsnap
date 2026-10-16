@@ -2914,7 +2914,7 @@ def _run_backup(args: argparse.Namespace) -> int:
         print("Error: cannot mix file options with directory options", file=sys.stderr)
         return 1
     if args.stage_file and (
-        args.export_file or args.import_file or args.stage_file
+        args.export_file or args.import_file
         or args.export_dir or args.import_dir or args.stage_dir
     ):
         print("Error: --stage-file is mutually exclusive with other send/receive/stage options",
