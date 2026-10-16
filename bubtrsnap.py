@@ -224,22 +224,37 @@ def piped_run(send_cmd: list[str],
     """
     Pipe the stdout of `send_cmd` into the stdin of `recv_cmd`.
 
-    Returns (returncode, stderr_text) of the receiver process.
-    Logs both commands at verbosity 2, honours dry-run by logging
-    and returning (0, "") without executing.
+    Returns (returncode, stderr_text). If either process fails, the
+    returncode is the exit code of the first failing process (sender
+    checked first) and stderr_text labels each side's error. Honours
+    dry-run by logging and returning (0, "") without executing.
     """
-    pretty = f"{' '.join(send_cmd)} | {' '.join(recv_cmd)}"
+    pretty = " | ".join(
+        " ".join(_quote_for_display(tok) for tok in cmd)
+        for cmd in (send_cmd, recv_cmd)
+    )
     if dry_run:
         log(f"[dry-run] {pretty}", 2, verbosity)
         return 0, ""
     log(pretty, 2, verbosity)
     try:
-        send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         recv_proc = subprocess.Popen(recv_cmd, stdin=send_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         send_proc.stdout.close()
-        _, stderr_data = recv_proc.communicate()
-        stderr_text = stderr_data.decode() if isinstance(stderr_data, bytes) else (stderr_data or "")
-        return recv_proc.returncode, stderr_text
+        recv_err_data = recv_proc.communicate()[1]
+        send_err_data = send_proc.communicate()[1]
+        rc_send = send_proc.returncode
+        rc_recv = recv_proc.returncode
+        send_err = send_err_data.decode() if isinstance(send_err_data, bytes) else (send_err_data or "")
+        recv_err = recv_err_data.decode() if isinstance(recv_err_data, bytes) else (recv_err_data or "")
+        rc = rc_send if rc_send else rc_recv
+        parts = []
+        if rc_send:
+            parts.append(f"send failed: {send_err.strip() or f'exit code {rc_send}'}")
+        if rc_recv:
+            parts.append(f"receive failed: {recv_err.strip() or f'exit code {rc_recv}'}")
+        stderr_text = "; ".join(parts) if parts else recv_err
+        return rc, stderr_text
     except FileNotFoundError as e:
         log(f"Pipe failed: {e}", 2, verbosity)
         return 1, str(e)
