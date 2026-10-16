@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
+import re
+import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch, Mock
@@ -903,6 +907,70 @@ class TestPruneForcedKeep(unittest.TestCase):
                 archive = {"name": "testarchive", "forced_keep": ["202601021200"]}
                 bs._run_prune([archive], cfg, 1, self._args(["202601021200"]))
         self.assertIn("[forced-keep]", buf.getvalue())
+
+
+class TestPerArchiveWeekStartday(unittest.TestCase):
+    """README: weekly alignment "can be set globally or per-archive".
+
+    The archive entry carries a resolved week_startday (archive overrides
+    global), but it must actually reach build_keep_set -- otherwise a
+    per-archive value is silently ignored.
+    """
+
+    TS = ["202610011200", "202610031200", "202610041200", "202610101200",
+          "202610111200", "202610171200", "202610181200"]
+
+    def _kept(self, archive_week_startday: str | None) -> list[str]:
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            for ts in self.TS:
+                (snap_dir / f"root.{ts}").mkdir()
+            cfg = {
+                "verbose": 2,
+                "dry_run": True,
+                "local_sudo": False,
+                "snapshot_dir": str(snap_dir),
+                "backup_dir": None,
+                "remote_host": None,
+                "remote_path": None,
+                "week_startday": "sunday",
+            }
+            archive = {
+                "name": "root",
+                "subvolume": str(snap_dir),
+                "keep": {"keep_hourly": 0, "keep_daily": 0, "keep_weekly": 3,
+                         "keep_monthly": 0, "keep_yearly": 0},
+                "week_startday": archive_week_startday,
+                "backup_dir": None, "remote_host": None, "remote_path": None,
+                "remote_sudo": False, "snaps_only": True, "forced_keep": [],
+                "rsync": False, "rsync_opts": None,
+                "export_file": None, "import_file": None, "stage_file": None,
+                "export_dir": None, "import_dir": None, "stage_dir": None,
+                "pre_snapshot_hook": None, "post_snapshot_hook": None,
+                "post_backup_hook": None,
+            }
+            fake = subprocess.CompletedProcess([], 0, "", "")
+            out = io.StringIO()
+            with patch.object(bs, "run", return_value=fake), \
+                 patch.object(bs, "get_subvol_uuids", return_value=(None, None)), \
+                 redirect_stdout(out):
+                bs.process_archive(archive, cfg)
+            return sorted(m.group(1) for m in
+                          re.finditer(r"Keeping root\.(\d{12})", out.getvalue()))
+
+    def test_archive_level_week_startday_is_honoured(self):
+        # Monday-start weeks end on Sunday: the Sunday snapshots are the
+        # newest in each bucket.
+        self.assertEqual(self._kept("monday"),
+                         ["202610041200", "202610111200", "202610181200"])
+
+    def test_global_week_startday_used_when_archive_omits_it(self):
+        # Sunday-start weeks end on Saturday: the Saturday snapshots win.
+        self.assertEqual(self._kept(None),
+                         ["202610101200", "202610171200", "202610181200"])
+
+    def test_archive_and_global_values_can_differ(self):
+        self.assertNotEqual(self._kept("monday"), self._kept("sunday"))
 
 
 if __name__ == "__main__":
