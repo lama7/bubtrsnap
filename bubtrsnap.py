@@ -3168,14 +3168,16 @@ def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = Fa
     try:
         sudo = ["sudo", "-n"] if remote_sudo else []
         cmd = ["ssh", remote] + sudo + ["df", "-P", "-B", "1", str(remote_dir)]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        proc = run(cmd, dry_run=cfg.get("dry_run", False), read_only=True,
+                   verbosity=cfg["verbose"], capture_output=True, text=True,
+                   check=False, timeout=10)
     except subprocess.TimeoutExpired:
         log(f"[space] remote df timed out on {remote}", 1, cfg["verbose"])
         return None
     except Exception as e:
         log(f"[space] could not query remote free space on {remote}: {e}", 1, cfg["verbose"])
         return None
-    if proc.returncode != 0:
+    if proc is None or proc.returncode != 0:
         return None
     # df -P -B 1 header: Filesystem  1-blocks  Used  Available  Use%  Mounted on
     # With -B 1 the columns are raw bytes (no unit suffix).  Avail/Available
@@ -3205,14 +3207,16 @@ def _remote_size_of(remote: str, subvol_path: str, cfg: dict,
     try:
         sudo = ["sudo", "-n"] if remote_sudo else []
         cmd = ["ssh", remote] + sudo + ["du", "-sb", subvol_path]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        proc = run(cmd, dry_run=cfg.get("dry_run", False), read_only=True,
+                   verbosity=cfg["verbose"], capture_output=True, text=True,
+                   check=False, timeout=15)
     except subprocess.TimeoutExpired:
         log(f"[space] remote du timed out on {remote}", 1, cfg["verbose"])
         return None
     except Exception as e:
         log(f"[space] could not measure remote subvolume size on {remote}: {e}", 1, cfg["verbose"])
         return None
-    if proc.returncode != 0:
+    if proc is None or proc.returncode != 0:
         return None
     for line in proc.stdout.splitlines():
         parts = line.split()
