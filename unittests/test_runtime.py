@@ -1348,7 +1348,7 @@ class TestReceiveStreamDualDestination(unittest.TestCase):
         mock_local.assert_called_once_with(stream_file, backup_dir, cfg)
         mock_remote.assert_called_once_with(
             stream_file, "user@host", "/btrfs/backups", cfg, False,
-            False, None
+            False, None, archive_name=""
         )
         # Local result takes precedence
         self.assertEqual(result, "archive.202501010000")
@@ -1370,7 +1370,7 @@ class TestReceiveStreamDualDestination(unittest.TestCase):
         mock_local.assert_not_called()
         mock_remote.assert_called_once_with(
             stream_file, "user@host", "/btrfs/backups", cfg, True,
-            False, None
+            False, None, archive_name=""
         )
         self.assertEqual(result, "archive.remote.202501010000")
 

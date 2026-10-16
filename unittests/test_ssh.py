@@ -970,7 +970,7 @@ class TestRsyncAndReceive(unittest.TestCase):
                 break
         self.assertIsNotNone(rsync_cmd, "rsync command not found in calls")
         self.assertIn("--partial-dir", rsync_cmd)
-        self.assertIn(".bubtrsnap-partial", rsync_cmd)
+        self.assertIn(".bubtrsnap-partial-test", rsync_cmd)
 
     @patch("bubtrsnap.run")
     def test_rsync_transfer_failure(self, mock_run):
@@ -1074,7 +1074,7 @@ class TestReceiveRemoteRsyncRouting(unittest.TestCase):
                                      remote_sudo=False, use_rsync=True, rsync_opts="--compress")
 
         mock_rsync.assert_called_once_with(stream, "user@host", "/remote/backup", cfg,
-                                           False, "--compress")
+                                           False, "--compress", archive_name="")
         mock_scp.assert_not_called()
         self.assertEqual(result, "test_subvol")
 
@@ -1243,7 +1243,7 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=0)
 
         cfg = {"verbose": 0, "dry_run": False, "local_sudo": False}
-        result = bs._check_interrupted_rsync("user@host", cfg)
+        result = bs._check_interrupted_rsync("user@host", "testarchive", cfg)
         self.assertTrue(result)
 
     @patch("bubtrsnap.run")
@@ -1252,7 +1252,7 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=1)
 
         cfg = {"verbose": 0, "dry_run": False, "local_sudo": False}
-        result = bs._check_interrupted_rsync("user@host", cfg)
+        result = bs._check_interrupted_rsync("user@host", "testarchive", cfg)
         self.assertFalse(result)
 
     @patch("bubtrsnap.run")
@@ -1262,7 +1262,7 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=1)
 
         cfg = {"verbose": 2, "dry_run": True, "local_sudo": False}
-        result = bs._check_interrupted_rsync("user@host", cfg)
+        result = bs._check_interrupted_rsync("user@host", "testarchive", cfg)
         self.assertFalse(result)
         # Verify run() was called with dry_run=False (always execute, not cfg dry_run)
         call_kwargs = mock_run.call_args.kwargs
@@ -1275,7 +1275,7 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=0)
 
         cfg = {"verbose": 2, "dry_run": True, "local_sudo": False}
-        result = bs._check_interrupted_rsync("user@host", cfg)
+        result = bs._check_interrupted_rsync("user@host", "testarchive", cfg)
         self.assertTrue(result)
 
     @patch("bubtrsnap.run")
@@ -1288,11 +1288,11 @@ class TestInterruptedRsyncResumption(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=1)
 
         cfg = {"verbose": 0, "dry_run": False, "local_sudo": True}
-        result = bs._check_interrupted_rsync("user@host", cfg)
+        result = bs._check_interrupted_rsync("user@host", "testarchive", cfg)
         self.assertFalse(result)
 
         cmd = mock_run.call_args.args[0]
-        self.assertEqual(cmd, ["ssh", "user@host", "test", "-d", "/tmp/.bubtrsnap-partial"])
+        self.assertEqual(cmd, ["ssh", "user@host", "test", "-d", "/tmp/.bubtrsnap-partial-testarchive"])
         self.assertNotIn("sudo", cmd)
 
 

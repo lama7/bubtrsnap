@@ -1633,12 +1633,19 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
     log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
     return subvol_name
 
-def _check_interrupted_rsync(remote: str, cfg: dict) -> bool:
+def _partial_dir_name(archive_name: str) -> str:
+    """Per-archive rsync partial-dir name, sanitized for path safety."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", archive_name)
+    return f".bubtrsnap-partial-{safe}"
+
+
+def _check_interrupted_rsync(remote: str, archive_name: str, cfg: dict) -> bool:
     """
-    Check if a previous rsync transfer was interrupted by looking for
-    the --partial-dir on the remote.
+    Check if a previous rsync transfer for THIS archive was interrupted by
+    looking for its partial-dir on the remote.  The dir is per-archive so a
+    stale partial from another archive cannot falsely flag this one.
     """
-    remote_partial_dir = "/tmp/.bubtrsnap-partial"
+    remote_partial_dir = f"/tmp/{_partial_dir_name(archive_name)}"
     check_cmd = ["ssh", remote, "test", "-d", remote_partial_dir]
 
     result = run(check_cmd,
@@ -1652,7 +1659,8 @@ def _check_interrupted_rsync(remote: str, cfg: dict) -> bool:
 
 
 def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
-                       remote_sudo: bool = False, rsync_opts: str | None = None) -> str | None:
+                       remote_sudo: bool = False, rsync_opts: str | None = None,
+                       archive_name: str = "") -> str | None:
     """
     Copy stream file to remote via rsync (with --partial-dir for recovery),
     then receive locally on remote via SSH.
@@ -1666,8 +1674,10 @@ def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
     """
     # The remote temp file that rsync will place (same as SCP path for consistency)
     remote_tmp = f"/tmp/bubtrsnap-{stream.name}"
-    partial_dir_name = ".bubtrsnap-partial"
-    remote_partial_dir = f"/tmp/{partial_dir_name}"
+    # Per-archive partial-dir so another archive's stale partial can't
+    # falsely flag this transfer as interrupted (see _check_interrupted_rsync).
+    partial_dir_name = _partial_dir_name(
+        archive_name or archive_name_from_received(stream.stem))
 
     # Build the rsync command
     rsync_cmd = ["rsync", "-a", "--partial-dir", partial_dir_name]
@@ -1783,7 +1793,8 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
 
 def _receive_remote(stream: Path, remote: str, remote_dir: str, cfg: dict,
                     remote_sudo: bool = False,
-                    use_rsync: bool = False, rsync_opts: str | None = None) -> str | None:
+                    use_rsync: bool = False, rsync_opts: str | None = None,
+                    archive_name: str = "") -> str | None:
     """
     Copy stream file to remote, then receive locally on remote.
 
@@ -1793,14 +1804,16 @@ def _receive_remote(stream: Path, remote: str, remote_dir: str, cfg: dict,
     Aborts the whole program on any other error.
     """
     if use_rsync:
-        return _rsync_and_receive(stream, remote, remote_dir, cfg, remote_sudo, rsync_opts)
+        return _rsync_and_receive(stream, remote, remote_dir, cfg, remote_sudo,
+                                  rsync_opts, archive_name=archive_name)
     return _scp_and_receive(stream, remote, remote_dir, cfg, remote_sudo)
 
 
 def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict,
                    remote: str | None = None, remote_dir: str | None = None,
                    remote_sudo: bool = False,
-                   use_rsync: bool = False, rsync_opts: str | None = None) -> str | None:
+                   use_rsync: bool = False, rsync_opts: str | None = None,
+                   archive_name: str = "") -> str | None:
     """
     Dispatch to `_receive_local` and/or `_receive_remote` based on which
     destinations are configured.  When both are set, both are invoked.
@@ -1812,7 +1825,7 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict,
         received = _receive_local(stream, backup_dir, cfg)
     if remote and remote_dir:
         remote_received = _receive_remote(stream, remote, remote_dir, cfg, remote_sudo,
-                                          use_rsync, rsync_opts)
+                                          use_rsync, rsync_opts, archive_name=archive_name)
         # Prefer the local result if it succeeded, else use remote result
         if not received:
             received = remote_received
@@ -2468,7 +2481,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
             print(f"Error: '{p}' is not a valid btrfs stream file", file=sys.stderr)
             sys.exit(1)
         received = receive_stream(p, backup_dir, cfg, remote, remote_dir, remote_sudo,
-                                  use_rsync, archive_rsync_opts)
+                                  use_rsync, archive_rsync_opts, archive_name=name)
         _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
                           snap_dir, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
@@ -2486,7 +2499,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
             return
         log(f"Using stream {stream} for archive {name}", 1, cfg["verbose"])
         received = receive_stream(stream, backup_dir, cfg, remote, remote_dir, remote_sudo,
-                                  use_rsync, archive_rsync_opts)
+                                  use_rsync, archive_rsync_opts, archive_name=name)
         _receive_and_post(received, archive, name, None, backup_dir, remote, remote_dir,
                           snap_dir, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
@@ -2504,7 +2517,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     interrupted_stream: Path | None = None
     if use_rsync and remote and remote_dir:
         log(f"Checking for interrupted rsync transfer to {remote}...", 1, cfg["verbose"])
-        interrupted_rsync = _check_interrupted_rsync(remote, cfg)
+        interrupted_rsync = _check_interrupted_rsync(remote, name, cfg)
         if interrupted_rsync:
             # Determine which stream file was being transferred
             if send_file:
@@ -2665,7 +2678,7 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
             # populates backup_dir, so it must receive locally.
             recv_dest_dir = None if auto_ssh_receive else backup_dir
         received = receive_stream(recv_path, recv_dest_dir, cfg, remote, remote_dir, remote_sudo,
-                                  use_rsync, archive_rsync_opts)
+                                  use_rsync, archive_rsync_opts, archive_name=name)
         # snap_dir keep policy is handled by the final apply_keep_policy call
         _receive_and_post(received, archive, name, snap, backup_dir, remote, remote_dir,
                           None, keep, cfg, remote_sudo, forced_keep=forced_keep_list)
