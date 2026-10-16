@@ -1550,6 +1550,18 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
 
     return stream_file
 
+def _parse_at_subvol(text: str | None) -> str | None:
+    """Extract the subvolume name from 'At subvol <name>' output lines."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if "At subvol" in line or "Receiving subvol" in line:
+            parts = line.split()
+            for i, tok in enumerate(parts):
+                if tok in ("subvol", "subvolume") and i + 1 < len(parts):
+                    return parts[i + 1].strip("'\"")
+    return None
+
+
 def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False) -> str | None:
     """Copy stream file to remote via SCP, then receive locally on remote."""
     # SCP the stream file to a temporary location on remote
@@ -1606,19 +1618,15 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
         print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
         sys.exit(1)
     
-    # Extract subvolume name reported by btrfs
-    subvol_name = None
-    for line in stderr.splitlines():
-        line = line.strip()
-        if "At subvol" in line or "Receiving subvol" in line:
-            parts = line.split()
-            for i, tok in enumerate(parts):
-                if tok in ("subvol", "subvolume") and i + 1 < len(parts):
-                    subvol_name = parts[i + 1].strip("'\"")
-                    break
-            if subvol_name:
-                break
+    # Extract subvolume name reported by btrfs (stdout or stderr)
+    subvol_name = _parse_at_subvol(stderr) or _parse_at_subvol(
+        (ssh_result.stdout if ssh_result else "") or ""
+    )
     
+    if not subvol_name and ssh_result is not None:
+        print(f"Warning: could not determine received subvolume name from remote "
+              f"btrfs output; assuming '{stream.stem}'", file=sys.stderr)
+        subvol_name = stream.stem
     if not subvol_name:
         subvol_name = stream.stem
     
@@ -1725,19 +1733,15 @@ def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
         print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # Extract subvolume name reported by btrfs
-    subvol_name = None
-    for line in stderr.splitlines():
-        line = line.strip()
-        if "At subvol" in line or "Receiving subvol" in line:
-            parts = line.split()
-            for i, tok in enumerate(parts):
-                if tok in ("subvol", "subvolume") and i + 1 < len(parts):
-                    subvol_name = parts[i + 1].strip("'\"")
-                    break
-            if subvol_name:
-                break
+    # Extract subvolume name reported by btrfs (stdout or stderr)
+    subvol_name = _parse_at_subvol(stderr) or _parse_at_subvol(
+        (ssh_result.stdout if ssh_result else "") or ""
+    )
 
+    if not subvol_name and ssh_result is not None:
+        print(f"Warning: could not determine received subvolume name from remote "
+              f"btrfs output; assuming '{stream.stem}'", file=sys.stderr)
+        subvol_name = stream.stem
     if not subvol_name:
         subvol_name = stream.stem
 
@@ -1756,6 +1760,7 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
                         capture_output=True, text=True, check=False)
 
     if result is None:
+        # dry-run: nothing executed, stem is the preview name
         return stream.stem
 
     stderr = (result.stderr or "").strip()
@@ -1768,7 +1773,12 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
         print(f"Error receiving '{stream}' locally:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
-    return stream.stem
+    name = _parse_at_subvol(result.stdout) or _parse_at_subvol(result.stderr)
+    if not name:
+        print(f"Warning: could not determine received subvolume name from btrfs "
+              f"output; assuming '{stream.stem}'", file=sys.stderr)
+        name = stream.stem
+    return name
 
 
 def _receive_remote(stream: Path, remote: str, remote_dir: str, cfg: dict,
@@ -1810,6 +1820,12 @@ def receive_stream(stream: Path, backup_dir: Path | None, cfg: dict,
         print("Error: receive_stream called without backup_dir or remote/remote_dir",
               file=sys.stderr)
         sys.exit(1)
+    if received:
+        expected_archive = archive_name_from_received(stream.stem)
+        got_archive = archive_name_from_received(received)
+        if got_archive != expected_archive:
+            print(f"Warning: received subvolume '{received}' does not match archive "
+                  f"'{expected_archive}' from stream '{stream.name}'", file=sys.stderr)
     return received
 
 def archive_name_from_received(name: str) -> str:
