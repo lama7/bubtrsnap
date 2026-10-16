@@ -193,8 +193,8 @@ def run(cmd: list[str] | str,
         read_only: If True AND dry_run is True, still executes the command
                    (read-only operations like list/show/validate should run
                    during dry-run to give the user a realistic preview).
-                   Returns None so callers that check for None don't proceed
-                   with write operations.
+                   Returns the CompletedProcess from the executed command,
+                   not None — callers may inspect returncode/stdout.
     """
     pretty = cmd if isinstance(cmd, str) else " ".join(_quote_for_display(c) for c in cmd)
 
@@ -1569,6 +1569,57 @@ def _parse_at_subvol(text: str | None) -> str | None:
     return None
 
 
+def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
+                       remote_tmp: str, stream: Path, cfg: dict,
+                       remote_sudo: bool, seq_start: datetime,
+                       label: str) -> str | None:
+    """Shared tail of the SCP and rsync flows.
+
+    Run btrfs receive on the remote via SSH, clean up the remote temp file,
+    and return the received subvolume basename (None if it already exists).
+    Aborts the whole program on any other error.
+    """
+    start = datetime.now()
+    ssh_result = run(recv_cmd, dry_run=cfg.get("dry_run", False),
+                     verbosity=cfg["verbose"],
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    elapsed = (datetime.now() - start).total_seconds()
+    if ssh_result is not None:
+        log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
+    seq_elapsed = (datetime.now() - seq_start).total_seconds()
+    log(f"{label} + receive sequence completed in {format_duration(seq_elapsed)}", 1, cfg["verbose"])
+    stderr = (ssh_result.stderr if ssh_result else "") or ""
+    stderr = stderr.strip()
+
+    # Clean up remote temp file
+    cleanup_cmd = build_ssh_cmd(remote, ["rm", "-f", remote_tmp], remote_sudo)
+    run(cleanup_cmd, dry_run=cfg.get("dry_run", False),
+        verbosity=cfg["verbose"],
+        capture_output=True, check=False)
+
+    if ssh_result is not None and ssh_result.returncode != 0:
+        if "already exists" in stderr.lower():
+            print(f"Warning: subvolume from '{stream.name}' already exists in "
+                  f"{remote_dir} – skipping", file=sys.stderr)
+            return None
+        print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract subvolume name reported by btrfs (stdout or stderr)
+    subvol_name = _parse_at_subvol(stderr) or _parse_at_subvol(
+        (ssh_result.stdout if ssh_result else "") or ""
+    )
+    if not subvol_name and ssh_result is not None:
+        print(f"Warning: could not determine received subvolume name from remote "
+              f"btrfs output; assuming '{stream.stem}'", file=sys.stderr)
+        subvol_name = stream.stem
+    if not subvol_name:
+        subvol_name = stream.stem
+
+    log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
+    return subvol_name
+
+
 def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False) -> str | None:
     """Copy stream file to remote via SCP, then receive locally on remote."""
     # SCP the stream file to a temporary location on remote
@@ -1596,49 +1647,8 @@ def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remo
         print(f"Error copying stream to remote via SCP:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # Now receive on remote using the copied file
-    start = datetime.now()
-
-    ssh_result = run(recv_cmd, dry_run=cfg.get("dry_run", False),
-                     verbosity=cfg["verbose"],
-                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    
-    elapsed = (datetime.now() - start).total_seconds()
-    if ssh_result is not None:
-        log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-    seq_elapsed = (datetime.now() - seq_start).total_seconds()
-    log(f"SCP + receive sequence completed in {format_duration(seq_elapsed)}", 1, cfg["verbose"])
-    stderr = (ssh_result.stderr if ssh_result else "") or ""
-    stderr = stderr.strip()
-
-    # Clean up remote temp file
-    cleanup_cmd = build_ssh_cmd(remote, ["rm", "-f", remote_tmp], remote_sudo)
-    run(cleanup_cmd, dry_run=cfg.get("dry_run", False),
-        verbosity=cfg["verbose"],
-        capture_output=True, check=False)
-
-    if ssh_result is not None and ssh_result.returncode != 0:
-        if "already exists" in stderr.lower():
-            print(f"Warning: subvolume from '{stream.name}' already exists in "
-                  f"{remote_dir} – skipping", file=sys.stderr)
-            return None
-        print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
-        sys.exit(1)
-    
-    # Extract subvolume name reported by btrfs (stdout or stderr)
-    subvol_name = _parse_at_subvol(stderr) or _parse_at_subvol(
-        (ssh_result.stdout if ssh_result else "") or ""
-    )
-    
-    if not subvol_name and ssh_result is not None:
-        print(f"Warning: could not determine received subvolume name from remote "
-              f"btrfs output; assuming '{stream.stem}'", file=sys.stderr)
-        subvol_name = stream.stem
-    if not subvol_name:
-        subvol_name = stream.stem
-    
-    log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
-    return subvol_name
+    return _receive_on_remote(recv_cmd, remote, remote_dir, remote_tmp, stream,
+                              cfg, remote_sudo, seq_start, "SCP")
 
 def _partial_dir_name(archive_name: str) -> str:
     """Per-archive rsync partial-dir name, sanitized for path safety."""
@@ -1723,47 +1733,8 @@ def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
         print(f"Error copying stream to remote via rsync:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # Now receive on remote using the transferred file
-    start = datetime.now()
-    ssh_result = run(recv_cmd, dry_run=cfg.get("dry_run", False),
-                     verbosity=cfg["verbose"],
-                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    elapsed = (datetime.now() - start).total_seconds()
-    if ssh_result is not None:
-        log(f"btrfs receive via SSH completed in {format_duration(elapsed)}", 1, cfg["verbose"])
-    seq_elapsed = (datetime.now() - seq_start).total_seconds()
-    log(f"rsync + receive sequence completed in {format_duration(seq_elapsed)}", 1, cfg["verbose"])
-    stderr = (ssh_result.stderr if ssh_result else "") or ""
-    stderr = stderr.strip()
-
-    # Clean up remote temp file
-    cleanup_cmd = build_ssh_cmd(remote, ["rm", "-f", remote_tmp], remote_sudo)
-    run(cleanup_cmd, dry_run=cfg.get("dry_run", False),
-        verbosity=cfg["verbose"],
-        capture_output=True, check=False)
-
-    if ssh_result is not None and ssh_result.returncode != 0:
-        if "already exists" in stderr.lower():
-            print(f"Warning: subvolume from '{stream.name}' already exists in "
-                  f"{remote_dir} – skipping", file=sys.stderr)
-            return None
-        print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
-        sys.exit(1)
-
-    # Extract subvolume name reported by btrfs (stdout or stderr)
-    subvol_name = _parse_at_subvol(stderr) or _parse_at_subvol(
-        (ssh_result.stdout if ssh_result else "") or ""
-    )
-
-    if not subvol_name and ssh_result is not None:
-        print(f"Warning: could not determine received subvolume name from remote "
-              f"btrfs output; assuming '{stream.stem}'", file=sys.stderr)
-        subvol_name = stream.stem
-    if not subvol_name:
-        subvol_name = stream.stem
-
-    log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
-    return subvol_name
+    return _receive_on_remote(recv_cmd, remote, remote_dir, remote_tmp, stream,
+                              cfg, remote_sudo, seq_start, "rsync")
 
 
 def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
