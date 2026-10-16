@@ -3030,14 +3030,20 @@ def _run_backup(args: argparse.Namespace) -> int:
 
     # Process each archive fully
     recovered_archives = []
+    failed_archives = []
     for archive in archives:
         try:
             result = process_archive(archive, global_cfg)
             if result == "RECOVERED":
                 recovered_archives.append(archive)
+        except SystemExit as e:
+            code = e.code if e.code is not None else 1
+            log(f"Error processing {archive['name']}: aborted with exit code {code}",
+                1, global_cfg["verbose"])
+            failed_archives.append(archive["name"])
         except Exception as e:
             log(f"Error processing {archive['name']}: {e}", 1, global_cfg["verbose"])
-            return 1
+            failed_archives.append(archive["name"])
 
     # Re-process archives that were recovered from interrupted rsync transfers.
     if recovered_archives:
@@ -3045,9 +3051,19 @@ def _run_backup(args: argparse.Namespace) -> int:
         for archive in recovered_archives:
             try:
                 process_archive(archive, global_cfg)
+            except SystemExit as e:
+                code = e.code if e.code is not None else 1
+                log(f"Error re-processing {archive['name']}: aborted with exit code {code}",
+                    1, global_cfg["verbose"])
+                failed_archives.append(archive["name"])
             except Exception as e:
                 log(f"Error re-processing {archive['name']}: {e}", 1, global_cfg["verbose"])
-                return 1
+                failed_archives.append(archive["name"])
+
+    if failed_archives:
+        print(f"Error: {len(failed_archives)} archive(s) failed: "
+              f"{', '.join(failed_archives)}", file=sys.stderr)
+        return 1
 
     log("All archives processed.", 1, global_cfg["verbose"])
     return 0
