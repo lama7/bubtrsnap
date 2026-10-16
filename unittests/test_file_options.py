@@ -541,5 +541,126 @@ class TestSingleArchiveRequirement(unittest.TestCase):
                 bs.load_and_resolve_archives(cli, cfg)
 
 
+class TestFileDirMixing(unittest.TestCase):
+    """An archive must not mix file options with directory options.
+
+    The CLI blanket-blocks any file+dir combination ("cannot mix file
+    options with directory options on the CLI"); the archive-level config
+    must enforce the same rule rather than silently discarding the dir
+    side.  Global dir options still do not leak into a file-opt archive
+    (precedence, not mixing).
+    """
+
+    def setUp(self):
+        patcher = patch("bubtrsnap.chk_btrfs_subvolume")
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def _cfg_with(self, td_path: Path, archive_body: str) -> Path:
+        cfg = td_path / "c.toml"
+        _write_config(cfg, f"""
+        snapshot_dir = "{td_path}"
+        {archive_body}
+        """)
+        return cfg
+
+    def test_export_file_plus_export_dir_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = _with_subvol_dirs(td_path, "a")["a"]
+            streams = td_path / "streams"
+            streams.mkdir()
+            cfg = self._cfg_with(td_path, f"""
+            [a]
+            subvolume = "{sub}"
+            export_file = "{td_path}/a.btrfs"
+            export_dir = "{streams}"
+            """)
+            with self.assertRaises(SystemExit):
+                bs.load_and_resolve_archives(_ns(), cfg)
+
+    def test_import_file_plus_import_dir_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = _with_subvol_dirs(td_path, "a")["a"]
+            streams = td_path / "streams"
+            streams.mkdir()
+            cfg = self._cfg_with(td_path, f"""
+            [a]
+            subvolume = "{sub}"
+            import_file = "{td_path}/a.btrfs"
+            import_dir = "{streams}"
+            """)
+            with self.assertRaises(SystemExit):
+                bs.load_and_resolve_archives(_ns(), cfg)
+
+    def test_stage_file_plus_stage_dir_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = _with_subvol_dirs(td_path, "a")["a"]
+            streams = td_path / "streams"
+            streams.mkdir()
+            cfg = self._cfg_with(td_path, f"""
+            [a]
+            subvolume = "{sub}"
+            stage_file = "{td_path}/a.btrfs"
+            stage_dir = "{streams}"
+            """)
+            with self.assertRaises(SystemExit):
+                bs.load_and_resolve_archives(_ns(), cfg)
+
+    def test_cross_role_mix_errors(self):
+        """export_file + import_dir is still file+dir mixing -> error."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = _with_subvol_dirs(td_path, "a")["a"]
+            streams = td_path / "streams"
+            streams.mkdir()
+            cfg = self._cfg_with(td_path, f"""
+            [a]
+            subvolume = "{sub}"
+            export_file = "{td_path}/a.btrfs"
+            import_dir = "{streams}"
+            """)
+            with self.assertRaises(SystemExit):
+                bs.load_and_resolve_archives(_ns(), cfg)
+
+    def test_dir_only_archive_is_valid(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            sub = _with_subvol_dirs(td_path, "a")["a"]
+            streams = td_path / "streams"
+            streams.mkdir()
+            cfg = self._cfg_with(td_path, f"""
+            [a]
+            subvolume = "{sub}"
+            export_dir = "{streams}"
+            """)
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            self.assertEqual(archives[0]["export_dir"], str(streams))
+
+    def test_file_archive_ignores_global_dir_without_error(self):
+        """Archive file opts + global export_dir: precedence, not mixing."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a", "b")
+            streams = td_path / "streams"
+            streams.mkdir()
+            cfg = td_path / "c.toml"
+            _write_config(cfg, f"""
+            snapshot_dir = "{td_path}"
+            export_dir = "{streams}"
+            [a]
+            subvolume = "{subs['a']}"
+            export_file = "{td_path}/a.btrfs"
+            [b]
+            subvolume = "{subs['b']}"
+            """)
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            by_name = {x["name"]: x for x in archives}
+            self.assertIsNone(by_name["a"]["export_dir"])
+            self.assertEqual(by_name["b"]["export_dir"], str(streams))
+
+
 if __name__ == "__main__":
     unittest.main()

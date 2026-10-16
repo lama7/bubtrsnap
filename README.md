@@ -482,6 +482,11 @@ bubtrsnap rebuild home
 `subvolume` (required), `export_file`, `import_file`, `stage_file`,
 `pre_snapshot_hook`, `post_snapshot_hook`, `post_backup_hook`, `forced_keep`
 
+An archive may not mix file options (`export_file`/`import_file`/`stage_file`)
+with directory options (`export_dir`/`import_dir`/`stage_dir`) — the same
+blanket rule the CLI enforces.  Global directory options apply to an archive
+only when that archive has no file options of its own.
+
 ### Keep-policy precedence (archive-specific keeps)
 
 If an archive defines **any** `keep_*` value, it fully controls its own keep

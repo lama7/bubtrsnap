@@ -1015,17 +1015,24 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             # stage_dir/export_dir/import_dir were set from raw above.
             send_dir = None
             recv_dir = None
-            
-            # Only file options (send_file, recv_file, stage_file) count as "file opts"
-            # export_dir/import_dir/stage_dir are directory options that should be preserved
+
             archive_has_file_opts = bool(send_file or recv_file or stage_file)
+            archive_has_dir_opts = bool(export_dir or import_dir or stage_dir)
+            if archive_has_file_opts and archive_has_dir_opts:
+                # Mirror the CLI blanket rule: an archive may not mix file
+                # options with directory options.  Previously the dir side
+                # was silently discarded; now it is an explicit config error.
+                print(
+                    f"Error in archive '{name}': cannot mix file options with "
+                    f"directory options (same rule as the CLI)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             if archive_has_file_opts:
                 # Rule 2: archive-specific only — no global dirs
+                # (archive's own dir opts are None here; mixing errored above)
                 send_dir = None
                 recv_dir = None
-                stage_dir = None
-                export_dir = None
-                import_dir = None
             else:
                 # Rule 3: globals apply only when archive has no file opts
                 send_dir = None
