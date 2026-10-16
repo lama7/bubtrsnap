@@ -433,6 +433,70 @@ class TestPrecedence(unittest.TestCase):
             self.assertEqual(by_name["a"]["stage_dir"], str(stage_a))
             self.assertEqual(by_name["b"]["stage_dir"], str(stage_global))
 
+    def test_cli_week_startday_beats_archive_value(self):
+        """CLI --week-startday must override per-archive week_startday."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a", "b")
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f'''
+                snapshot_dir = "{td_path}"
+                week_startday = "sunday"
+                [a]
+                subvolume = "{subs["a"]}"
+                week_startday = "wednesday"
+                [b]
+                subvolume = "{subs["b"]}"
+                ''',
+            )
+            cli = _ns(week_startday="monday", archives=["a", "b"])
+            _global, archives = bs.load_and_resolve_archives(cli, cfg)
+            by_name = {x["name"]: x for x in archives}
+            self.assertEqual(by_name["a"]["week_startday"], "monday")
+            self.assertEqual(by_name["b"]["week_startday"], "monday")
+
+    def test_archive_week_startday_beats_global(self):
+        """Without CLI, per-archive week_startday beats the global value."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a", "b")
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f'''
+                snapshot_dir = "{td_path}"
+                week_startday = "sunday"
+                [a]
+                subvolume = "{subs["a"]}"
+                week_startday = "wednesday"
+                [b]
+                subvolume = "{subs["b"]}"
+                ''',
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            by_name = {x["name"]: x for x in archives}
+            self.assertEqual(by_name["a"]["week_startday"], "wednesday")
+            self.assertEqual(by_name["b"]["week_startday"], "sunday")
+
+    def test_week_startday_defaults_to_sunday(self):
+        """No CLI, no global, no archive value -> default 'sunday'."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            subs = _with_subvol_dirs(td_path, "a")
+            cfg = td_path / "c.toml"
+            _write_config(
+                cfg,
+                f'''
+                snapshot_dir = "{td_path}"
+                [a]
+                subvolume = "{subs["a"]}"
+                ''',
+            )
+            _global, archives = bs.load_and_resolve_archives(_ns(), cfg)
+            self.assertEqual(archives[0]["week_startday"], "sunday")
+
 
 class TestSingleArchiveRequirement(unittest.TestCase):
     def test_export_file_two_cli_archives(self):

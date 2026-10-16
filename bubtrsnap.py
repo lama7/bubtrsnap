@@ -725,12 +725,14 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
         global_cfg["local_sudo"] = True
     if getattr(cli, "snaps_only", False):
         global_cfg["snaps_only"] = True
+    cli_week_startday = None
     if getattr(cli, "week_startday", None):
         ws = cli.week_startday.lower()
         if ws not in _DAY_TO_WEEKDAY:
             print(f"Error: --week-startday must be one of: monday, tuesday, wednesday, thursday, friday, saturday, sunday",
                   file=sys.stderr)
             sys.exit(1)
+        cli_week_startday = ws
         global_cfg["week_startday"] = ws
 
     # Track if CLI explicitly set remote/remote_path/remote_sudo (for precedence over archive-specific config)
@@ -1101,7 +1103,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                     "post_snapshot_hook": raw.get("post_snapshot_hook"),
                     "post_backup_hook": raw.get("post_backup_hook"),
                     "keep": resolve_keep_policy(raw, global_cfg, cli_keeps),
-                    "week_startday": raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
+                    "week_startday": cli_week_startday or raw.get("week_startday", global_cfg.get("week_startday", "sunday")),
                     "forced_keep": _merge_keep(raw.get("forced_keep"), getattr(cli, "forced_keep", None)),
                     "rsync": archive_rsync,
                     "rsync_opts": archive_rsync_opts,
