@@ -2642,12 +2642,15 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
 MAINTENANCE_SUBCOMMANDS = ("backup", "list", "prune", "rebuild")
 
 # Options that consume the following token as a VALUE when scanning argv.
+# Boolean (store_true) flags such as --snaps-only, --local-sudo, --remote-sudo
+# and --rsync must NOT be listed here: they take no value, and treating them as
+# value-takers makes the scanner skip the subcommand token that follows them.
 _MAINT_VALUE_TAKERS = {
-    "--config", "--snapshot-dir", "--backup-dir", "--snaps-only",
+    "--config", "--snapshot-dir", "--backup-dir",
     "--export-file", "--import-file", "--export-dir", "--import-dir",
     "--stage-file", "--stage-dir",
-    "--remote-host", "--remote-path", "--remote-sudo", "--local-sudo",
-    "--rsync", "--rsync-opts",
+    "--remote-host", "--remote-path",
+    "--rsync-opts",
     "--keep-hourly", "--keep-daily", "--keep-weekly",
     "--keep-monthly", "--keep-yearly", "--week-startday",
     "--forced-keep", "--ts",
