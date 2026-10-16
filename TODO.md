@@ -58,8 +58,8 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
    reassignment removed; dead `dest =` stores in the export branches dropped.
    Guarded by TestPlainBackupBranch in unittests/test_runtime.py (2).
 
-9. run() docstring says read_only dry-run "Returns None" (196-197) but the
-   code returns the CompletedProcess (206).
+9. DONE: run() docstring now states read_only dry-run returns the
+   CompletedProcess (matches the code).
 
 ## REMAINING — validation / precedence gaps
 
@@ -127,10 +127,12 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 22. find_parents / find_parents_ssh spawn one `btrfs subvolume show` (or SSH)
     per candidate; `btrfs subvolume list -u <dir>` gets all UUIDs in one call.
 
-23. _scp_and_receive and _rsync_and_receive are ~90% identical.
-
-24. Dead code: crc32c (archive_name_from_received is not dead — it's the
-    fix for item 2).
+23. DONE: _scp_and_receive and _rsync_and_receive now share a single
+    _receive_on_remote() tail (SSH receive, temp cleanup, error handling,
+    name extraction); only the transfer command and log label differ.
+24. FALSE POSITIVE: crc32c is live — _parse_stream_prefix validates the
+    stream CRC via it (bubtrsnap.py:440), reached by is_btrfs_stream and
+    stream_snapshot_name.
 
 25. --config only accepted before the subcommand (bubtrsnap list --config x
     fails).
