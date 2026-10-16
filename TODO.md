@@ -108,15 +108,16 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 ## REMAINING — convention violations
 
-18. Direct subprocess.run outside run(): 3122 (_remote_disk_free), 3159
-    (_remote_size_of) — no [dry-run] prefix, no level-2 logging; should be
-    run(cmd, read_only=True).
+18. DONE (6c00a80, unpushed): _remote_disk_free/_remote_size_of now use
+    run(read_only=True) instead of raw subprocess.run — probes are logged at
+    level 2, honour dry-run, and inherit any future run() central changes.
 
-19. remove_stage_file (494-500): rm runs check=False, returncode never
-    checked, yet "Removed staged stream file" logged unconditionally.
+19. DONE (cd19b4d, unpushed): remove_stage_file now checks the sudo rm
+    returncode; a non-zero exit warns to stderr instead of logging success.
 
-20. No timeout on the ssh `test -d` in _check_interrupted_rsync (1617-1622):
-    unreachable remote hangs the recovery check indefinitely.
+20. DONE (538cb6e, unpushed): the ssh `test -d` recovery check in
+    _check_interrupted_rsync now has a 10s timeout; timeout/OSError means
+    "no interruption detected" rather than an indefinite hang.
 
 ## REMAINING — improvements (not bugs)
 
