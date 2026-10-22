@@ -12,7 +12,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (tip 4cf896f, VERSION 0.4.2.dev0). All DONE
+- `maintain` — working branch (tip 62a710a, VERSION 0.4.2.dev0). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
   `bubtrsnap --version` now also prints the branch/commit it was built from,
@@ -168,11 +168,40 @@ still deferred by decision)
     _check_interrupted_rsync now has a 10s timeout; timeout/OSError means
     "no interruption detected" rather than an indefinite hang.
 
-## Improvements (not bugs) — 21, 31 open
+## Improvements (not bugs) — 31 open
 
-21. _size_of walks the whole snapshot summing logical sizes, then compares
-    against free space before an INCREMENTAL send -> false "insufficient
-    space" aborts. Also used by rebuild to report required memory.
+21. DONE (62a710a): the fit check now runs only for FULL sends. btrfs cannot
+    report an incremental stream's size in advance — verified empirically:
+    btrfs-progs 6.14 (stryder) and the 7.1 docs have no --dry-run/size flag,
+    `btrfs qgroup` 'excl' is ~16 KiB for a snapshot (the new extents are still
+    shared with the live subvolume) and the `rfer` delta missed a 50 MiB
+    in-place rewrite (38,952,960 B vs the 52,469,526 B stream), and `btrfs
+    filesystem du`'s Total delta under-reads (8.2 MiB vs 19.0 MiB actual).
+    Measured over-estimates on stryder: lama7Maildir 4,783,448,064 B snapshot
+    vs 19,038,629 B stream (251x), lama7 698,740,109,312 B vs 675,157,964 B
+    (1035x). Nothing is cached between runs, per the decision.
+
+    process_archive now discovers the local parents first (the list is passed
+    to send_backup via `local_parents=`, so the subvolume listing is not
+    repeated): parents exist -> incremental -> `_low_space_warning()` only,
+    which never aborts and fires when the destination has less than
+    LOW_SPACE_FRACTION (0.25, hard-coded module constant; promoting it to a
+    config key is a later nicety) of its capacity free. No parents -> full
+    send -> the existing `_space_check()` hard stop, unchanged. `_run_rebuild`
+    phase 3 applies the same rule to its local backup restores: the estimate
+    is only a hard stop when the restores would be full sends, otherwise it is
+    logged as an upper bound and the floor warning is applied.
+
+    Tests: unittests/test_space_check_incremental.py (15). Live A/B on a
+    loopback btrfs (received parent, 141.7 MiB free, 195.5 MiB snapshot): old
+    code aborted with "need 195.5 MiB but only 141.7 MiB free ... Aborting."
+    (exit 1, nothing written); new code warned "only 141.7 MiB free ... 14% of
+    1.0 GiB" and the incremental send succeeded (exit 0).
+
+    Still open in this area (deliberately not touched): the SSH remote has no
+    space guard at all in the main backup path (only rebuild's re-send uses
+    `_space_check_remote`, and rebuild's `remote_needed` still sums whole
+    snapshots even though those re-sends are incremental).
 
 22. DONE (8cb58ed): `find_parents()` / `find_parents_ssh()` now resolve UUIDs with
     a single `btrfs subvolume list -u -R -p -o <dir>` per directory instead of
@@ -300,7 +329,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (300 across 19 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
+- All tests pass (315 across 20 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
