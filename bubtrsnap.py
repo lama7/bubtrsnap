@@ -1475,24 +1475,9 @@ def _received_uuids_ssh(
         name = parts[parts.index("path") + 1].split("/")[-1]
         if not name.startswith(f"{archive}."):
             continue
-        show_cmd = build_ssh_cmd(
-            remote, btrfs_cmd(cfg, "subvolume", "show", f"{remote_dir}/{name}", sudo=False), remote_sudo
-        )
-        try:
-            show_result = run(show_cmd, dry_run=False, verbosity=cfg["verbose"],
-                              check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError:
-            log(f"Failed to show subvolume {name} on {remote}:{remote_dir}", 3, cfg["verbose"])
-            continue
-        if show_result is None:
-            continue
-        for show_line in show_result.stdout.splitlines():
-            show_line = show_line.strip()
-            if show_line.startswith("Received UUID:"):
-                val = show_line.split(":", 1)[1].strip()
-                if val and val != "-":
-                    received_uuids.add(val)
-                break
+        _, received_uuid = get_subvol_uuids_ssh(remote, f"{remote_dir}/{name}", cfg, remote_sudo)
+        if received_uuid:
+            received_uuids.add(received_uuid)
     return received_uuids
 
 
