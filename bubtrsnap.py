@@ -1304,25 +1304,139 @@ def get_subvol_uuids_ssh(remote: str, remote_path: str, cfg: dict, remote_sudo: 
         return None, None
 
 
-def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) -> list[Path]:
+# ---------------------------------------------------------------------------
+# Parent discovery helpers (TODO item 22)
+# ---------------------------------------------------------------------------
+# `btrfs subvolume list` can print the uuid (-u), the received uuid (-R) and
+# the parent id (-p), limited to the subvolumes below the search path (-o).
+# That collapses the old "one `subvolume show` per candidate" loop into a single
+# listing per directory. Verified on btrfs-progs 6.14 (stryder) and 7.1 (thorin);
+# a build that rejects the flags falls back to the per-subvolume loop.
+_CHILD_LIST_OPTS = ("-u", "-R", "-p", "-o")
+
+
+def _parse_subvolume_list(output: str, parent_id: str | None = None) -> dict[str, tuple[str | None, str | None]]:
+    """Parse `btrfs subvolume list -u -R -p -o <dir>` output.
+
+    Returns {subvolume name: (uuid, received_uuid)} for entries whose parent is
+    *parent_id* — i.e. the direct children of the searched directory. With
+    parent_id None every entry the listing returned is kept.
     """
-    Find previous snapshots in snapshot_dir that have already been
-    successfully received to backup_dir (matched by UUID ↔ Received UUID).
-    Returns them newest-first.
+    entries: dict[str, tuple[str | None, str | None]] = {}
+    for line in (output or "").splitlines():
+        parts = line.split()
+        if "path" not in parts or "uuid" not in parts:
+            continue
+        name = parts[parts.index("path") + 1].split("/")[-1]
+        if not name:
+            continue
+        if parent_id is not None:
+            if "parent" not in parts or parts[parts.index("parent") + 1] != str(parent_id):
+                continue
+        uuid = parts[parts.index("uuid") + 1]
+        received = None
+        if "received_uuid" in parts:
+            val = parts[parts.index("received_uuid") + 1]
+            received = None if val == "-" else val
+        entries[name] = (uuid, received)
+    return entries
+
+
+def _get_subvolume_id(
+    dir_path: Path | str,
+    cfg: dict,
+    *,
+    remote: str | None = None,
+    remote_sudo: bool = False,
+) -> str | None:
+    """Subvolume ID of *dir_path*, or None if it is not a btrfs subvolume."""
+    if remote:
+        cmd = build_ssh_cmd(
+            remote, btrfs_cmd(cfg, "subvolume", "show", str(dir_path), sudo=False), remote_sudo
+        )
+    else:
+        cmd = btrfs_cmd(cfg, "subvolume", "show", str(dir_path))
+    try:
+        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        return None
+    if result is None:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Subvolume ID:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _child_uuid_map(
+    dir_path: Path | str,
+    cfg: dict,
+    *,
+    remote: str | None = None,
+    remote_sudo: bool = False,
+) -> dict[str, tuple[str | None, str | None]] | None:
+    """Direct children of *dir_path* → (uuid, received_uuid), in one listing.
+
+    Returns None when the listing (or the directory's own ID lookup) fails, which
+    means this btrfs-progs build cannot do it and callers must fall back to the
+    per-subvolume `show` loop.
     """
-    log(f"Finding parent subvolumes for {archive}", 1, cfg["verbose"])
-    # Collect snapshots
+    if remote:
+        cmd = build_ssh_cmd(
+            remote,
+            btrfs_cmd(cfg, "subvolume", "list", *_CHILD_LIST_OPTS, str(dir_path), sudo=False),
+            remote_sudo,
+        )
+    else:
+        cmd = btrfs_cmd(cfg, "subvolume", "list", *_CHILD_LIST_OPTS, str(dir_path))
+
+    try:
+        # Read-only: always executed, even during a dry run.
+        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        log(f"subvolume list -u -R -p -o failed for {dir_path}, "
+            f"falling back to per-subvolume show", 3, cfg["verbose"])
+        return None
+    if result is None:
+        return None
+
+    parent_id = _get_subvolume_id(dir_path, cfg, remote=remote, remote_sudo=remote_sudo)
+    if parent_id is None:
+        log(f"Could not get subvolume ID of {dir_path}, "
+            f"falling back to per-subvolume show", 3, cfg["verbose"])
+        return None
+    return _parse_subvolume_list(result.stdout, parent_id)
+
+
+def _archive_snapshots(archive: str, snapshot_dir: Path, cfg: dict) -> list[tuple]:
+    """(timestamp, path, uuid) for snapshots of *archive* directly under snapshot_dir."""
+    mapping = _child_uuid_map(snapshot_dir, cfg)
     snapshots = []
     for p in snapshot_dir.glob(f"{archive}.*"):
         if not p.is_dir():
             continue
-        uuid, _ = get_subvol_uuids(p, cfg)
+        ts = parse_ts(p.name)
+        if not ts:
+            continue
+        if mapping is not None:
+            uuid, _ = mapping.get(p.name, (None, None))
+        else:
+            uuid, _ = get_subvol_uuids(p, cfg)
         if uuid:
-            ts = parse_ts(p.name)
-            if ts:
-                snapshots.append((ts, p, uuid))
+            snapshots.append((ts, p, uuid))
+    return snapshots
 
-    # Collect received UUIDs from backup side
+
+def _received_uuids_local(archive: str, backup_dir: Path, cfg: dict) -> set[str]:
+    """Received UUIDs of *archive*'s subvolumes already present in backup_dir."""
+    mapping = _child_uuid_map(backup_dir, cfg)
+    if mapping is not None:
+        return {received for name, (_, received) in mapping.items()
+                if received and name.startswith(f"{archive}.")}
+
     received_uuids = set()
     for p in backup_dir.glob(f"{archive}.*"):
         if not p.is_dir():
@@ -1330,23 +1444,88 @@ def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) 
         _, received_uuid = get_subvol_uuids(p, cfg)
         if received_uuid:
             received_uuids.add(received_uuid)
+    return received_uuids
 
-    # Match
+
+def _received_uuids_ssh(
+    archive: str, remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False
+) -> set[str]:
+    """Received UUIDs of *archive*'s subvolumes already present on the remote."""
+    mapping = _child_uuid_map(remote_dir, cfg, remote=remote, remote_sudo=remote_sudo)
+    if mapping is not None:
+        return {received for name, (_, received) in mapping.items()
+                if received and name.startswith(f"{archive}.")}
+
+    # Fallback for btrfs-progs without -u/-R/-p/-o: one ssh round trip per match.
+    received_uuids = set()
+    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir, sudo=False), remote_sudo)
+    try:
+        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        log(f"Failed to list subvolumes on {remote}:{remote_dir}", 3, cfg["verbose"])
+        return received_uuids
+    if result is None:
+        return received_uuids
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if "path" not in parts:
+            continue
+        name = parts[parts.index("path") + 1].split("/")[-1]
+        if not name.startswith(f"{archive}."):
+            continue
+        show_cmd = build_ssh_cmd(
+            remote, btrfs_cmd(cfg, "subvolume", "show", f"{remote_dir}/{name}", sudo=False), remote_sudo
+        )
+        try:
+            show_result = run(show_cmd, dry_run=False, verbosity=cfg["verbose"],
+                              check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError:
+            log(f"Failed to show subvolume {name} on {remote}:{remote_dir}", 3, cfg["verbose"])
+            continue
+        if show_result is None:
+            continue
+        for show_line in show_result.stdout.splitlines():
+            show_line = show_line.strip()
+            if show_line.startswith("Received UUID:"):
+                val = show_line.split(":", 1)[1].strip()
+                if val and val != "-":
+                    received_uuids.add(val)
+                break
+    return received_uuids
+
+
+def _match_parents(snapshots: list[tuple], received_uuids: set[str], cfg: dict,
+                   label: str = "Usable parent") -> list[Path]:
+    """Snapshots whose UUID was received on the backup side, newest-first."""
     parents = []
     for ts, path, uuid in snapshots:
         if uuid in received_uuids:
             parents.append((ts, path))
-            log(f"Usable parent: {path.name}", 3, cfg["verbose"])
+            log(f"{label}: {path.name}", 3, cfg["verbose"])
 
     parents.sort(key=lambda x: x[0], reverse=True)
     result = [path for _, path in parents]
 
     if result:
-        log(f"Found {len(result)} usable parent(s) for {archive}", 3, cfg["verbose"])
+        log(f"Found {len(result)} usable parent(s)", 3, cfg["verbose"])
     else:
         log("No usable parents found", 3, cfg["verbose"])
 
     return result
+
+
+def find_parents(archive: str, snapshot_dir: Path, backup_dir: Path, cfg: dict) -> list[Path]:
+    """
+    Find previous snapshots in snapshot_dir that have already been
+    successfully received to backup_dir (matched by UUID ↔ Received UUID).
+    Returns them newest-first.
+    """
+    log(f"Finding parent subvolumes for {archive}", 1, cfg["verbose"])
+    snapshots = _archive_snapshots(archive, snapshot_dir, cfg)
+    received_uuids = _received_uuids_local(archive, backup_dir, cfg)
+    return _match_parents(snapshots, received_uuids, cfg)
 
 
 def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False) -> list[Path]:
@@ -1356,81 +1535,9 @@ def find_parents_ssh(archive: str, snapshot_dir: Path, remote: str, remote_dir: 
     Returns them newest-first.
     """
     log(f"Finding parent subvolumes for {archive} on SSH remote {remote}:{remote_dir}", 1, cfg["verbose"])
-    # Collect snapshots
-    snapshots = []
-    for p in snapshot_dir.glob(f"{archive}.*"):
-        if not p.is_dir():
-            continue
-        uuid, _ = get_subvol_uuids(p, cfg)
-        if uuid:
-            ts = parse_ts(p.name)
-            if ts:
-                snapshots.append((ts, p, uuid))
-
-    # Collect received UUIDs from remote backup side
-    # Need to run `btrfs subvolume show` on each subvolume to get Received UUID
-    received_uuids = set()
-    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir, sudo=False), remote_sudo)
-    try:
-        # Always execute read-only listing during dry-run
-        result = run(cmd,
-                     dry_run=False,
-                     verbosity=cfg["verbose"],
-                     check=True, capture_output=True, text=True)
-        if result is None:
-            return []
-        for line in result.stdout.splitlines():
-            # Parse: ID 256 gen 1234 top level 5 path lama7.20260831...
-            # Extract the path (subvolume name)
-            parts = line.split()
-            path_idx = -1
-            for i, part in enumerate(parts):
-                if part == "path" and i + 1 < len(parts):
-                    path_idx = i + 1
-                    break
-            if path_idx >= 0:
-                remote_subvol = parts[path_idx]
-                # Only process subvolumes matching our archive pattern
-                if remote_subvol.startswith(f"{archive}."):
-                    # Run btrfs subvolume show on this specific subvolume to get Received UUID
-                    show_cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "show", f"{remote_dir}/{remote_subvol}", sudo=False), remote_sudo)
-                    try:
-                        # Always execute read-only show during dry-run
-                        show_result = run(show_cmd,
-                                          dry_run=False,
-                                          verbosity=cfg["verbose"],
-                                          check=True, capture_output=True, text=True)
-                        if show_result is None:
-                            continue
-                        # Parse output for Received UUID
-                        for show_line in show_result.stdout.splitlines():
-                            show_line = show_line.strip()
-                            if show_line.startswith("Received UUID:"):
-                                received_uuid = show_line.split(":", 1)[1].strip()
-                                if received_uuid and received_uuid != "-":
-                                    received_uuids.add(received_uuid)
-                                break
-                    except subprocess.CalledProcessError:
-                        log(f"Failed to show subvolume {remote_subvol} on {remote}:{remote_dir}", 3, cfg["verbose"])
-    except subprocess.CalledProcessError:
-        log(f"Failed to list subvolumes on {remote}:{remote_dir}", 3, cfg["verbose"])
-
-    # Match
-    parents = []
-    for ts, path, uuid in snapshots:
-        if uuid in received_uuids:
-            parents.append((ts, path))
-            log(f"Usable parent (SSH): {path.name}", 3, cfg["verbose"])
-
-    parents.sort(key=lambda x: x[0], reverse=True)
-    result = [path for _, path in parents]
-
-    if result:
-        log(f"Found {len(result)} usable parent(s) for {archive} on SSH remote", 3, cfg["verbose"])
-    else:
-        log("No usable parents found on SSH remote", 3, cfg["verbose"])
-
-    return result
+    snapshots = _archive_snapshots(archive, snapshot_dir, cfg)
+    received_uuids = _received_uuids_ssh(archive, remote, remote_dir, cfg, remote_sudo)
+    return _match_parents(snapshots, received_uuids, cfg, label="Usable parent (SSH)")
 
 
 # ---------------------------------------------------------------------------

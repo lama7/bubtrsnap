@@ -473,41 +473,34 @@ class TestFindParentsSSH(unittest.TestCase):
 
     @patch("bubtrsnap.run")
     def test_find_parents_ssh_matches_received_uuid(self, mock_run):
-        """Should match local UUID with remote Received UUID."""
-        # Track call count to return appropriate mock
-        call_count = {"list": 0, "show": 0, "local_show": 0}
+        """Should match local UUID with remote Received UUID, with one listing
+        per directory instead of one `subvolume show` per subvolume."""
+        snap_list = textwrap.dedent("""
+            ID 256 gen 0 parent 100 top level 100 received_uuid - uuid local-uuid-1 path snapshots/lama7.202608280230
+            ID 257 gen 0 parent 100 top level 100 received_uuid - uuid local-uuid-2 path snapshots/lama7.202608290230
+            ID 258 gen 0 parent 100 top level 100 received_uuid - uuid local-uuid-3 path snapshots/lama7.202608300230
+        """).strip()
+        remote_list = textwrap.dedent("""
+            ID 300 gen 0 parent 5 top level 5 received_uuid local-uuid-1 uuid r1 path lama7.202608280230
+            ID 301 gen 0 parent 5 top level 5 received_uuid local-uuid-2 uuid r2 path lama7.202608290230
+            ID 302 gen 0 parent 5 top level 5 received_uuid local-uuid-3 uuid r3 path lama7.202608300230
+            ID 303 gen 0 parent 5 top level 5 received_uuid - uuid r4 path other.202608300230
+        """).strip()
+
+        calls = []
 
         def run_mock(cmd, **kwargs):
             mock = MagicMock()
             mock.returncode = 0
+            calls.append(" ".join(cmd))
 
             cmd_str = " ".join(cmd)
             if "subvolume list" in cmd_str:
-                call_count["list"] += 1
-                mock.stdout = textwrap.dedent("""
-                    ID 256 gen 0 top level 5 path lama7.202608280230
-                    ID 257 gen 0 top level 5 path lama7.202608290230
-                    ID 258 gen 0 top level 5 path lama7.202608300230
-                """).strip()
+                mock.stdout = remote_list if "ssh" in cmd_str else snap_list
             elif "subvolume show" in cmd_str:
-                # Check if it's a remote show command
-                if "ssh" in cmd_str:
-                    call_count["show"] += 1
-                    if call_count["show"] == 1:
-                        mock.stdout = "UUID: remote-uuid-1\nReceived UUID: local-uuid-1\n"
-                    elif call_count["show"] == 2:
-                        mock.stdout = "UUID: remote-uuid-2\nReceived UUID: local-uuid-2\n"
-                    elif call_count["show"] == 3:
-                        mock.stdout = "UUID: remote-uuid-3\nReceived UUID: local-uuid-3\n"
-                    else:
-                        mock.stdout = "UUID: remote-uuid\n"
-                else:
-                    # Local btrfs subvolume show for local snapshots
-                    call_count["local_show"] += 1
-                    if call_count["local_show"] <= 3:
-                        mock.stdout = f"UUID: local-uuid-{call_count['local_show']}\n"
-                    else:
-                        mock.stdout = "UUID: local-uuid\n"
+                # Only the directories themselves are shown now, to learn their
+                # Subvolume ID (which identifies the direct children).
+                mock.stdout = "Subvolume ID: 5\n" if "ssh" in cmd_str else "Subvolume ID: 100\n"
             else:
                 mock.stdout = ""
             return mock
@@ -532,6 +525,12 @@ class TestFindParentsSSH(unittest.TestCase):
                 self.assertTrue(str(p).endswith("lama7.202608280230") or 
                                str(p).endswith("lama7.202608290230") or
                                str(p).endswith("lama7.202608300230"))
+
+            # One listing per directory (local snapshots + remote backup), and
+            # no SSH round trip per remote subvolume.
+            self.assertEqual(sum("subvolume list" in c for c in calls), 2)
+            self.assertEqual(sum("ssh" in c and "subvolume show" in c for c in calls), 1)
+            self.assertEqual(sum("ssh" in c and "subvolume list" in c for c in calls), 1)
 
 
 class TestSSHKeepPolicyIntegration(unittest.TestCase):
