@@ -152,10 +152,14 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     `_parse_subvolume_list()`, `_get_subvolume_id()`, `_child_uuid_map()`,
     `_archive_snapshots()`, `_received_uuids_local()`, `_received_uuids_ssh()`,
     `_match_parents()`. The maps are deliberately *not* cached: a receive during
-    the same run would make them stale. `TestFindParentsSSH` in
+    the same run would make them stale. Follow-up f5baa50: `_entry_name()` reads
+    the path column from the " path " marker rather than whitespace-splitting the
+    line, so a subvolume basename containing a space ("My Docs.202601010000") is
+    not truncated to "My" and silently dropped (which would have degraded an
+    incremental send into a full one). `TestFindParentsSSH` in
     unittests/test_ssh.py was rewritten with a realistic fake listing (the old
     mock was order-dependent and passed only by accident);
-    unittests/test_find_parents.py (12 tests) counts invocations so a regression
+    unittests/test_find_parents.py (15 tests) counts invocations so a regression
     back to the per-subvolume loop fails even when the parent list is still
     correct.
 
