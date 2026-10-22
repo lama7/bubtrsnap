@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Regression guard for TODO item 21: only a full send can be fit-checked.
+"""Regression guard for TODO item 21 and the abort-vs-warn policy around it.
+
+Policy: a send is hard-stopped only when we *know* it cannot fit.  That is only
+true for a full send (no usable parents), whose stream really is the whole
+subvolume.  Everything else is a warning and an admin decision.
 
 `_size_of()` sums the logical size of the *whole* snapshot, but an incremental
 send only writes the delta, which btrfs cannot report in advance (there is no
@@ -16,7 +20,10 @@ The guard now splits:
     destination has less than LOW_SPACE_FRACTION of its capacity free
 
 The parents discovered for the check are handed to send_backup so the listing
-is not repeated.
+is not repeated.  The same rule is now applied to the rebuild's re-send to the
+SSH remote: when the remote has received parents that re-send is incremental,
+so its size is only an upper bound and it can never be hard-skipped -- it gets
+the remote floor warning instead.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ import unittest
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 GB = 1024 ** 3
 MB = 1024 ** 2
@@ -245,6 +252,195 @@ class TestRebuildSpaceCheck(unittest.TestCase):
         self.assertEqual(m_space.call_count, 1, "a full restore must be fit-checked")
         self.assertEqual(m_send.call_count, 0, "the restore must be skipped")
         self.assertEqual(m_low.call_count, 0)
+
+
+class TestRemoteDiskUsage(unittest.TestCase):
+    """`_remote_disk_usage` is the probe; `_remote_disk_free` stays a thin
+    wrapper so the free-only callers (and their tests) keep working."""
+
+    DF = ("Filesystem      1-blocks  Used   Available  Use% Mounted on\n"
+          "/dev/sda1   34359738368 31600000000 2759738368 92% /backup\n")
+
+    def test_returns_free_and_total(self):
+        with patch("bubtrsnap.run",
+                   return_value=MagicMock(returncode=0, stdout=self.DF, stderr="")) as m_run:
+            usage = bs._remote_disk_usage("user@host", "/backup", {"verbose": 0, "dry_run": False})
+        self.assertEqual(usage, (2759738368, 34359738368))
+        self.assertEqual(m_run.call_count, 1, "one df probe per call")
+
+    def test_free_wrapper_still_returns_free(self):
+        with patch("bubtrsnap.run",
+                   return_value=MagicMock(returncode=0, stdout=self.DF, stderr="")):
+            self.assertEqual(bs._remote_disk_free("user@host", "/backup",
+                                                 {"verbose": 0, "dry_run": False}), 2759738368)
+
+    def test_probe_failure_returns_none(self):
+        with patch("bubtrsnap.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
+            self.assertIsNone(bs._remote_disk_usage("user@host", "/backup",
+                                                   {"verbose": 0, "dry_run": False}))
+
+    def test_unparseable_output_returns_none(self):
+        with patch("bubtrsnap.run",
+                   return_value=MagicMock(returncode=0,
+                                         stdout="Filesystem 1-blocks Used Available Use%\n",
+                                         stderr="")):
+            self.assertIsNone(bs._remote_disk_usage("user@host", "/backup",
+                                                   {"verbose": 0, "dry_run": False}))
+
+
+class TestLowSpaceWarningRemote(unittest.TestCase):
+    """The remote counterpart of _low_space_warning(): warn, never abort."""
+
+    def _run(self, usage) -> tuple[bool, str]:
+        out = io.StringIO()
+        cfg = {"verbose": 1, "dry_run": False}
+        with patch.object(bs, "_remote_disk_usage", return_value=usage), redirect_stdout(out):
+            ok = bs._low_space_warning_remote("user@host", "/backup", "remote backup", cfg)
+        return ok, out.getvalue()
+
+    def test_warns_below_the_floor(self):
+        ok, out = self._run((20 * GB, 100 * GB))
+        self.assertFalse(ok, "20% free is below the 25% floor")
+        self.assertIn("[space]", out)
+        self.assertIn("low space", out)
+        self.assertIn("20%", out)
+        self.assertIn("user@host", out)
+
+    def test_silent_above_the_floor(self):
+        ok, out = self._run((30 * GB, 100 * GB))
+        self.assertTrue(ok)
+        self.assertEqual(out.strip(), "", f"no warning expected, got: {out}")
+
+    def test_exactly_at_the_floor_is_not_low(self):
+        ok, out = self._run((25 * GB, 100 * GB))
+        self.assertTrue(ok)
+        self.assertEqual(out.strip(), "", f"no warning expected, got: {out}")
+
+    def test_zero_free_warns_but_does_not_abort(self):
+        ok, out = self._run((0, 100 * GB))
+        self.assertFalse(ok)
+        self.assertIn("no free space", out)
+
+    def test_unmeasurable_space_is_not_a_warning(self):
+        ok, _out = self._run(None)
+        self.assertTrue(ok, "unknown remote free space must not warn or block")
+
+
+class TestRebuildRemoteGuard(unittest.TestCase):
+    """The rebuild re-send to the remote is hard-skipped only when it would be a
+    full send.  With received parents on the remote it is incremental, so the
+    whole-snapshot estimate is an upper bound and the guard must not skip."""
+
+    def _run(self, ssh_parents, remote_check_ok, ts_list=("202601010000",)):
+        with tempfile.TemporaryDirectory() as td:
+            snap_d = Path(td) / "snapshots"
+            bak_d = Path(td) / "backup"
+            snap_d.mkdir()
+            bak_d.mkdir()
+            snap_items, bak_items = [], []
+            for ts in ts_list:
+                (snap_d / f"root.{ts}").mkdir()
+                (bak_d / f"root.{ts}").mkdir()
+                snap_items.append((ts, snap_d / f"root.{ts}"))
+                bak_items.append((ts, bak_d / f"root.{ts}"))
+            cfg = {"verbose": 0, "dry_run": True, "local_sudo": True,
+                   "snapshot_dir": str(snap_d), "backup_dir": str(bak_d),
+                   "remote_host": None, "remote_path": None, "remote_sudo": False}
+            archive = {"name": "root", "subvolume": str(snap_d / "root"),
+                       "remote_host": "user@host", "remote_path": "/remote/backup"}
+            with patch.object(bs, "iter_archive_items", side_effect=[snap_items, bak_items]), \
+                    patch.object(bs, "iter_archive_items_ssh", return_value=[]), \
+                    patch.object(bs, "_size_of", return_value=200 * GB), \
+                    patch.object(bs, "find_parents_ssh",
+                                 return_value=ssh_parents) as m_ssh, \
+                    patch.object(bs, "_remote_disk_usage", return_value=(10 * GB, 100 * GB)), \
+                    patch.object(bs, "_space_check_remote",
+                                 return_value=remote_check_ok) as m_check, \
+                    patch.object(bs, "_low_space_warning_remote",
+                                 return_value=False) as m_low, \
+                    patch.object(bs, "piped_run", return_value=(0, "")) as m_pipe:
+                rc = bs._run_rebuild([archive], cfg, verbosity=0)
+        return rc, m_ssh, m_check, m_low, m_pipe
+
+    def test_incremental_re_send_is_never_skipped(self):
+        parents = [Path("/remote/backup/root.202512310000")]
+        rc, m_ssh, m_check, m_low, m_pipe = self._run(parents, remote_check_ok=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(m_check.call_count, 0,
+                         "_space_check_remote is a full-send guard; it must not run "
+                         "when the remote has received parents")
+        self.assertEqual(m_low.call_count, 1, "the remote low-space floor warning must run")
+        self.assertEqual(m_pipe.call_count, 1, "the re-send must still be attempted")
+
+    def test_full_re_send_is_still_skipped(self):
+        rc, _ssh, m_check, m_low, m_pipe = self._run([], remote_check_ok=False)
+        self.assertEqual(rc, 0, "only the remote part is skipped, the run succeeds")
+        self.assertEqual(m_check.call_count, 1, "a full re-send must be fit-checked")
+        self.assertEqual(m_low.call_count, 0, "the floor warning is for incremental sends")
+        self.assertEqual(m_pipe.call_count, 0, "a re-send that won't fit must be skipped")
+
+    def test_ssh_parents_are_listed_once_per_archive(self):
+        parents = [Path("/remote/backup/root.202512310000")]
+        rc, m_ssh, _check, _low, m_pipe = self._run(
+            parents, True, ts_list=("202601010000", "202601020000", "202601030000"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(m_pipe.call_count, 3, "every timestamp must still be re-sent")
+        self.assertEqual(m_ssh.call_count, 1,
+                         "find_parents_ssh must run once per archive, not once per item")
+
+    def test_re_send_uses_the_cached_parents(self):
+        parents = [Path("/remote/backup/root.202512310000")]
+        _rc, _ssh, _check, _low, m_pipe = self._run(parents, True,
+                                                   ts_list=("202601010000", "202601020000"))
+        send_cmd = m_pipe.call_args_list[0][0][0]
+        self.assertEqual(send_cmd[send_cmd.index("-p") + 1], str(parents[0]),
+                         "the cached remote parents must be used for the re-send")
+
+
+class TestProcessArchiveRemoteWarning(unittest.TestCase):
+    """A remote destination gets the floor warning too: nothing about the remote
+    is ever hard-stopped, so silence is the only feedback an admin would get."""
+
+    def _run(self, remote: bool, low_ok: bool = True):
+        archive = {"name": "testarchive", "subvolume": "/fake/subvol",
+                   "backup_dir": "/fake/backup", "keep": {}}
+        if remote:
+            archive["remote_host"] = "user@host"
+            archive["remote_path"] = "/remote/backup"
+        cfg = {"verbose": 0, "dry_run": False, "snapshot_dir": "/fake/snapshots",
+               "backup_dir": "/fake/backup", "remote_sudo": False}
+        snap = Path("/fake/snapshots/testarchive.202601010000")
+        with patch.object(bs, "chk_btrfs_subvolume"), \
+                patch.object(bs, "_validate_destinations"), \
+                patch.object(bs, "create_snapshot", return_value=snap), \
+                patch.object(bs, "run_hook"), \
+                patch.object(bs, "find_parents", return_value=[Path("/fake/snapshots/x")]), \
+                patch.object(bs, "_low_space_warning", return_value=True), \
+                patch.object(bs, "_low_space_warning_remote",
+                             return_value=low_ok) as m_rem, \
+                patch.object(bs, "send_backup", return_value=snap.name), \
+                patch.object(bs, "send_backup_tofile"), \
+                patch.object(bs, "_apply_all_keep_policies"):
+            exit_code = None
+            try:
+                bs.process_archive(archive, cfg)
+            except SystemExit as e:
+                exit_code = e.code
+        return exit_code, m_rem
+
+    def test_remote_destination_is_warned_about(self):
+        exit_code, m_rem = self._run(remote=True)
+        self.assertIsNone(exit_code)
+        self.assertEqual(m_rem.call_count, 1, "the remote destination must get a floor check")
+
+    def test_a_low_remote_does_not_abort_the_archive(self):
+        exit_code, _m = self._run(remote=True, low_ok=False)
+        self.assertIsNone(exit_code, "a low-space warning never aborts an archive")
+
+    def test_no_remote_no_probe(self):
+        exit_code, m_rem = self._run(remote=False)
+        self.assertIsNone(exit_code)
+        self.assertEqual(m_rem.call_count, 0, "no remote destination, no SSH probe")
 
 
 if __name__ == "__main__":

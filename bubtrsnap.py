@@ -2896,6 +2896,14 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
                 if not _space_check(backup_dir, needed, "backup (full send)", cfg):
                     raise SystemExit(1)
 
+        # The SSH destination only ever gets the floor warning: its send is
+        # incremental whenever the remote has received parents (so its size is
+        # unknowable), and a remote that runs out of space must not cancel the
+        # local backup that already succeeded.  The admin decides.
+        if remote and remote_dir:
+            _low_space_warning_remote(remote, remote_dir, f"remote {remote}",
+                                      cfg, remote_sudo)
+
         # send_file/send_dir are guaranteed None here by the elif chain, so
         # send_backup is the only route; it handles local, remote, or both.
         dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive,
@@ -3469,10 +3477,12 @@ def _space_check(target: Path, needed: int, label: str, cfg: dict) -> bool:
     """Hard-stop (False) if `needed` won't fit in free space at `target`;
     otherwise warn when it would consume >=25% of free space; return True.
 
-    Only meaningful for a FULL send: an incremental send writes only the delta
-    between parent and child, and btrfs cannot report that size in advance
-    (no --dry-run, and `btrfs qgroup` 'excl' counts extents unique to a
-    subvolume, not the parent/child delta).  See _low_space_warning()."""
+    Policy: abort only when a FULL send is known not to fit; everything else is
+    a warning and an admin decision.  A fit check is only meaningful for a full
+    send: an incremental send writes only the delta between parent and child,
+    and btrfs cannot report that size in advance (no --dry-run, and
+    `btrfs qgroup` 'excl' counts extents unique to a subvolume, not the
+    parent/child delta).  See _low_space_warning()."""
     if needed <= 0:
         return True
     try:
@@ -3517,11 +3527,13 @@ def _low_space_warning(target: Path, label: str, cfg: dict) -> bool:
     return True
 
 
-def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = False) -> int | None:
-    """Free bytes on the filesystem backing `remote_dir` on the SSH `remote`
-    host, via 'df -P -B 1' (free space in bytes).  Returns None if the query
-    could not be run or parsed (ssh not reachable, no df, or it timed out).
-    Read-only."""
+def _remote_disk_usage(remote: str, remote_dir, cfg: dict,
+                       remote_sudo: bool = False) -> tuple[int, int] | None:
+    """(free, total) bytes on the filesystem backing `remote_dir` on the SSH
+    `remote` host, via 'df -P -B 1'.  Returns None if the query could not be
+    run or parsed (ssh not reachable, no df, or it timed out).  Read-only.
+    `total` is needed for the low-space floor warning; free space alone says
+    nothing about how much headroom a nearly full pool has left."""
     try:
         sudo = ["sudo", "-n"] if remote_sudo else []
         cmd = ["ssh", remote] + sudo + ["df", "-P", "-B", "1", str(remote_dir)]
@@ -3537,22 +3549,27 @@ def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = Fa
     if proc is None or proc.returncode != 0:
         return None
     # df -P -B 1 header: Filesystem  1-blocks  Used  Available  Use%  Mounted on
-    # With -B 1 the columns are raw bytes (no unit suffix).  Avail/Available
-    # is column 4 (index 3).
+    # With -B 1 the columns are raw bytes (no unit suffix).  1-blocks is column
+    # 2 (index 1) and Available is column 4 (index 3).
     for line in proc.stdout.splitlines():
         parts = line.split()
         if not parts or parts[0] == "Filesystem":
             continue
         if len(parts) >= 4:
-            avail = parts[3]
-            if avail.endswith("B"):
-                avail = avail[:-1]
             try:
-                return int(avail)
+                total = int(parts[1][:-1] if parts[1].endswith("B") else parts[1])
+                avail = int(parts[3][:-1] if parts[3].endswith("B") else parts[3])
             except ValueError:
                 continue
+            return avail, total
     return None
 
+
+def _remote_disk_free(remote: str, remote_dir, cfg: dict, remote_sudo: bool = False) -> int | None:
+    """Free bytes on the remote destination; thin wrapper over
+    _remote_disk_usage() for callers that only need the free number."""
+    usage = _remote_disk_usage(remote, remote_dir, cfg, remote_sudo)
+    return usage[0] if usage is not None else None
 
 
 def _remote_size_of(remote: str, subvol_path: str, cfg: dict,
@@ -3588,11 +3605,13 @@ def _remote_size_of(remote: str, subvol_path: str, cfg: dict,
 
 def _space_check_remote(remote, remote_dir, needed, label, cfg,
                         remote_sudo: bool = False, free: int | None = None) -> bool:
-    """Guard for remote re-sends: return False if `needed` won't fit on
-    `remote`, True otherwise (warning emitted when >=25% of free space would
-    be used).  `free` may be pre-fetched to avoid a second SSH query.
-    Returns True (proceed) if the remote's free space can't be measured,
-    since we can't know it won't fit."""
+    """Full-send guard for remote re-sends: return False if `needed` won't fit
+    on `remote`, True otherwise (warning emitted when >=25% of free space would
+    be used).  `free` may be pre-fetched to avoid a second SSH query.  Returns
+    True (proceed) if the remote's free space can't be measured, since we can't
+    know it won't fit.  Only call this when the re-send is a FULL send: an
+    incremental one writes an unknowable delta, so `needed` would be an upper
+    bound and the honest guard is _low_space_warning_remote()."""
     if needed <= 0:
         return True
     if free is None:
@@ -3615,6 +3634,37 @@ def _space_check_remote(remote, remote_dir, needed, label, cfg,
         log(f"[space] {label}: need {_human_size(needed)} of "
             f"{_human_size(free)} free ({needed / free * 100:.0f}%) — low "
             f"space, proceeding.", 1, cfg["verbose"])
+    return True
+
+
+def _low_space_warning_remote(remote: str, remote_dir, label: str, cfg: dict,
+                             remote_sudo: bool = False,
+                             usage: tuple[int, int] | None = None) -> bool:
+    """Warn (never abort) when the SSH destination has less than
+    LOW_SPACE_FRACTION of its capacity free.  Nothing about a remote send is
+    ever hard-stopped from here: the delta size is unknowable in advance, and a
+    remote that runs out of space must not cancel the local backup -- an admin
+    has to deal with that condition.  `usage` may be pre-fetched to avoid a
+    second SSH query.  Returns True when there is headroom, False when the
+    warning fired."""
+    if usage is None:
+        usage = _remote_disk_usage(remote, remote_dir, cfg, remote_sudo)
+    if usage is None:
+        log(f"[space] {label}: cannot measure free space on {remote}; "
+            f"proceeding.", 1, cfg["verbose"])
+        return True
+    free, total = usage
+    if total <= 0:
+        return True
+    if free <= 0:
+        log(f"[space] {label}: no free space on {remote} ({remote_dir}) — the "
+            f"send will fail if it does not fit.", 1, cfg["verbose"])
+        return False
+    if free / total < LOW_SPACE_FRACTION:
+        log(f"[space] {label}: only {_human_size(free)} free on {remote} "
+            f"({free / total * 100:.0f}% of {_human_size(total)}) — low space, "
+            f"a send may not fit.", 1, cfg["verbose"])
+        return False
     return True
 
 
@@ -3854,6 +3904,10 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
         needed = 0
         remote_needed = 0
         snap_needed = 0
+        # Remote parents are archive-wide, so they are listed once (lazily, only
+        # if this archive actually has something to re-send) and reused by both
+        # the space guard below and the phase-4 re-send.
+        ssh_parents: list[Path] | None = None
         for ts in all_ts:
             in_s, in_b, in_r = ts in snap_ts, ts in bak_ts, ts in rem_ts
             snap_p = snap_d / f"{name}.{ts}" if snap_d else None
@@ -3891,6 +3945,13 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                     snap_needed += _remote_size_of(remote, f"{remote_dir}/{name}.{ts}",
                                                     cfg, remote_sudo) or 0
             elif remote and remote_dir and not in_r:
+                if ssh_parents is None:
+                    # snap_dir may be unset (remote-only archive): then there are
+                    # no local candidates to match, so the re-send is a full send.
+                    ssh_parents = (find_parents_ssh(name, snap_d, remote, remote_dir,
+                                                   cfg, remote_sudo)
+                                   if snap_d and snap_d.is_dir() else [])
+                base["ssh_parents"] = ssh_parents
                 src = snap_p if (in_s and snap_p and snap_p.exists()) else (
                     bak_p if (bak_p and bak_p.exists()) else None)
                 if src is None:
@@ -3971,20 +4032,29 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         it["kind"] = "skip"
 
         # Report the remote requirement (if any) and guard the remote re-sends:
-        # if it won't fit we skip just the remote part, so local work still runs.
+        # hard-stop only when we know they cannot fit.  If the remote has
+        # received parents the re-send is incremental and `remote_needed` is
+        # only an upper bound, so it can never be skipped -- it gets the remote
+        # floor warning instead and the admin deals with the condition (TODO 21).
         if remote_needed > 0 and remote and remote_dir:
-            rem_free = _remote_disk_free(remote, remote_dir, cfg, remote_sudo)
-            if rem_free is None:
+            rem_usage = _remote_disk_usage(remote, remote_dir, cfg, remote_sudo)
+            if rem_usage is None:
                 log(f"    [space] cannot measure free space on {remote} — "
                     f"proceeding (remote size not checked).", 1, cfg["verbose"])
+            elif ssh_parents:
+                log(f"    remote data to re-send (upper bound): "
+                    f"{_human_size(remote_needed)} (free on {remote}: "
+                    f"{_human_size(rem_usage[0])})", 1, cfg["verbose"])
+                _low_space_warning_remote(remote, remote_dir, f"re-send for {name}",
+                                         cfg, remote_sudo, rem_usage)
             else:
                 log(f"    memory required (remote {remote}): "
                     f"{_human_size(remote_needed)} "
-                    f"(free on {remote}: {_human_size(rem_free)})",
+                    f"(free on {remote}: {_human_size(rem_usage[0])})",
                     1, cfg["verbose"])
                 if not _space_check_remote(remote, remote_dir, remote_needed,
-                                           f"re-send for {name}", cfg,
-                                           remote_sudo, rem_free):
+                                          f"re-send for {name}", cfg,
+                                          remote_sudo, rem_usage[0]):
                     for it in items:
                         if it["kind"] == "remote":
                             it["kind"] = "skip"
@@ -4019,10 +4089,9 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
             elif kind == "remote":
                 log(f"    {label}: re-sending to remote {remote}", 1, cfg["verbose"])
                 try:
-                    ssh_parents = find_parents_ssh(name, it["snap_dir"], remote,
-                                                   remote_dir, cfg, remote_sudo)
+                    parents = it.get("ssh_parents") or []
                     ssh_send = btrfs_cmd(cfg, "send")
-                    for i, pp in enumerate(ssh_parents):
+                    for i, pp in enumerate(parents):
                         ssh_send += ["-p" if i == 0 else "-c", str(pp)]
                     ssh_send.append(str(it["source"]))
                     rc, stderr = piped_run(ssh_send,
