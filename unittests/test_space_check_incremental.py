@@ -442,6 +442,28 @@ class TestProcessArchiveRemoteWarning(unittest.TestCase):
         self.assertIsNone(exit_code)
         self.assertEqual(m_rem.call_count, 0, "no remote destination, no SSH probe")
 
+    def test_file_transfer_to_the_remote_is_warned_about_too(self):
+        """export_file + remote goes through rsync/scp, not the piped branch, so
+        the floor warning must be emitted before the send, not inside it."""
+        archive = {"name": "testarchive", "subvolume": "/fake/subvol",
+                   "export_file": "/fake/stage.btrfs", "keep": {},
+                   "remote_host": "user@host", "remote_path": "/remote/backup"}
+        cfg = {"verbose": 0, "dry_run": False, "snapshot_dir": "/fake/snapshots",
+               "backup_dir": None, "remote_sudo": False}
+        snap = Path("/fake/snapshots/testarchive.202601010000")
+        with patch.object(bs, "chk_btrfs_subvolume"), \
+                patch.object(bs, "_validate_destinations"), \
+                patch.object(bs, "create_snapshot", return_value=snap), \
+                patch.object(bs, "run_hook"), \
+                patch.object(bs, "_check_interrupted_rsync", return_value=False), \
+                patch.object(bs, "receive_stream", return_value=None), \
+                patch.object(bs, "_low_space_warning_remote") as m_rem, \
+                patch.object(bs, "send_backup_tofile"), \
+                patch.object(bs, "_apply_all_keep_policies"):
+            bs.process_archive(archive, cfg)
+        self.assertEqual(m_rem.call_count, 1,
+                         "a remote destination is checked however it is written to")
+
 
 if __name__ == "__main__":
     unittest.main()

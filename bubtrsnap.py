@@ -2856,6 +2856,16 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     dest: Path | None = None
     received: str | None = None
 
+    # Every destination reached over SSH gets the floor warning before anything
+    # is sent, whichever route (piped send, scp, rsync) writes it.  A remote is
+    # never hard-stopped: its incremental delta is unknowable, and a remote that
+    # runs out of space must not cancel a local backup that already succeeded.
+    # This is the only signal, so it is warning-only and the admin decides
+    # (TODO 21).
+    if remote and remote_dir:
+        _low_space_warning_remote(remote, remote_dir, f"remote {remote}",
+                                  cfg, remote_sudo)
+
     if send_file:
         stream_path = Path(send_file)
         if not interrupted_rsync:
@@ -2895,14 +2905,6 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
                 needed = _size_of(snap)
                 if not _space_check(backup_dir, needed, "backup (full send)", cfg):
                     raise SystemExit(1)
-
-        # The SSH destination only ever gets the floor warning: its send is
-        # incremental whenever the remote has received parents (so its size is
-        # unknowable), and a remote that runs out of space must not cancel the
-        # local backup that already succeeded.  The admin decides.
-        if remote and remote_dir:
-            _low_space_warning_remote(remote, remote_dir, f"remote {remote}",
-                                      cfg, remote_sudo)
 
         # send_file/send_dir are guaranteed None here by the elif chain, so
         # send_backup is the only route; it handles local, remote, or both.
@@ -3522,7 +3524,7 @@ def _low_space_warning(target: Path, label: str, cfg: dict) -> bool:
     if free / total < LOW_SPACE_FRACTION:
         log(f"[space] {label}: only {_human_size(free)} free at {target} "
             f"({free / total * 100:.0f}% of {_human_size(total)}) — low space, "
-            f"an incremental send may not fit.", 1, cfg["verbose"])
+            f"a send may not fit.", 1, cfg["verbose"])
         return False
     return True
 
