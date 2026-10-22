@@ -1315,6 +1315,18 @@ def get_subvol_uuids_ssh(remote: str, remote_path: str, cfg: dict, remote_sudo: 
 _CHILD_LIST_OPTS = ("-u", "-R", "-p", "-o")
 
 
+def _entry_name(line: str) -> str | None:
+    """Basename of the subvolume in a `subvolume list` line.
+
+    The path column is last and a subvolume name may contain spaces, so take
+    everything after the column marker instead of whitespace-splitting the line.
+    """
+    marker = " path "
+    if marker not in line:
+        return None
+    return line.rsplit(marker, 1)[1].strip().split("/")[-1] or None
+
+
 def _parse_subvolume_list(output: str, parent_id: str | None = None) -> dict[str, tuple[str | None, str | None]]:
     """Parse `btrfs subvolume list -u -R -p -o <dir>` output.
 
@@ -1325,9 +1337,9 @@ def _parse_subvolume_list(output: str, parent_id: str | None = None) -> dict[str
     entries: dict[str, tuple[str | None, str | None]] = {}
     for line in (output or "").splitlines():
         parts = line.split()
-        if "path" not in parts or "uuid" not in parts:
+        if "uuid" not in parts:
             continue
-        name = parts[parts.index("path") + 1].split("/")[-1]
+        name = _entry_name(line)
         if not name:
             continue
         if parent_id is not None:
@@ -1469,11 +1481,8 @@ def _received_uuids_ssh(
         return received_uuids
 
     for line in result.stdout.splitlines():
-        parts = line.split()
-        if "path" not in parts:
-            continue
-        name = parts[parts.index("path") + 1].split("/")[-1]
-        if not name.startswith(f"{archive}."):
+        name = _entry_name(line)
+        if not name or not name.startswith(f"{archive}."):
             continue
         _, received_uuid = get_subvol_uuids_ssh(remote, f"{remote_dir}/{name}", cfg, remote_sudo)
         if received_uuid:

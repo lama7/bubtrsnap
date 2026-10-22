@@ -133,6 +133,19 @@ class TestParseSubvolumeList(unittest.TestCase):
         self.assertEqual(bs._parse_subvolume_list(""), {})
         self.assertEqual(bs._parse_subvolume_list("ID 1 gen 2 path"), {})
 
+    def test_names_with_spaces(self):
+        line = ("ID 400 gen 1 parent 100 top level 100 received_uuid - "
+                "uuid 6666 path snapshots/My Docs.202601010000")
+        self.assertEqual(bs._parse_subvolume_list(line),
+                         {"My Docs.202601010000": ("6666", None)})
+
+    def test_nested_path_with_spaces_is_filtered_by_parent(self):
+        line = ("ID 401 gen 1 parent 200 top level 100 received_uuid - "
+                "uuid 7777 path snapshots/My Docs.202601010000/inner sub")
+        self.assertEqual(bs._parse_subvolume_list(line, parent_id="100"), {})
+        self.assertEqual(bs._parse_subvolume_list(line, parent_id="200"),
+                         {"inner sub": ("7777", None)})
+
 
 class TestFindParentsLocal(unittest.TestCase):
     """find_parents() against a fake btrfs: two listings, no per-subvolume show."""
@@ -203,6 +216,35 @@ class TestFindParentsLocal(unittest.TestCase):
         with patch.object(bs, "run", fake.run):
             parents = bs.find_parents("lama7", snap, backup, cfg)
         self.assertEqual([p.name for p in parents], [f"lama7.{T1}"])
+
+    def test_archive_name_containing_a_space(self):
+        """A subvolume basename with a space must still be matched end to end."""
+        fake = FakeBtrfs(
+            snap_list="\n".join([
+                f"ID 200 gen 5 parent 100 top level 100 received_uuid - uuid 1111 path snapshots/My Docs.{T1}",
+                f"ID 201 gen 6 parent 100 top level 100 received_uuid - uuid 2222 path snapshots/My Docs.{T2}",
+            ]),
+            backup_list="\n".join([
+                f"ID 300 gen 10 parent 5 top level 5 received_uuid 1111 uuid a000 path My Docs.{T1}",
+                f"ID 301 gen 11 parent 5 top level 5 received_uuid 2222 uuid b000 path My Docs.{T2}",
+            ]),
+        )
+        fake.uuids = {f"My Docs.{T1}": "1111", f"My Docs.{T2}": "2222"}
+        fake.received = {f"My Docs.{T1}": "1111", f"My Docs.{T2}": "2222"}
+
+        root = Path(tempfile.mkdtemp())
+        snap = root / "snapshots"
+        backup = root / "backup"
+        snap.mkdir()
+        backup.mkdir()
+        for name in (f"My Docs.{T1}", f"My Docs.{T2}"):
+            (snap / name).mkdir()
+            (backup / name).mkdir()
+
+        cfg = {"local_sudo": False, "verbose": 0, "dry_run": False}
+        with patch.object(bs, "run", fake.run):
+            parents = bs.find_parents("My Docs", snap, backup, cfg)
+        self.assertEqual([p.name for p in parents], [f"My Docs.{T2}", f"My Docs.{T1}"])
 
 
 class TestFindParentsSSH(unittest.TestCase):
