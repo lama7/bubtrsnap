@@ -12,7 +12,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (tip d78d51f, VERSION 0.4.2.dev0). All DONE
+- `maintain` — working branch (tip 4cf896f, VERSION 0.4.2.dev0). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
   `bubtrsnap --version` now also prints the branch/commit it was built from,
@@ -103,7 +103,8 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     item 14 (`-e` and `--config` are not blocked at all — verified,
     `--rsync-opts '-e "ssh -oProxyCommand=id" --config=/tmp/x'` passes through).
 
-## REMAINING — security hardening (12, 13, 14, 15, 16 deferred by decision, 2026-10-22)
+## REMAINING — security hardening (15 and 16 fixed on 2026-10-22; 12, 13, 14
+still deferred by decision)
 
 12. Untrusted remote output into shell: 'At subvol' parsed via
     _parse_at_subvol() from remote stdout/stderr enters the hook mapping
@@ -126,29 +127,30 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     '-e "ssh -oProxyCommand=id" --config=...' passes. Add -e/--config or
     switch to an allow-list.
 
-15. Predictable temp file /tmp/bubtrsnap-<name> on the remote — symlink/TOCTOU
-    exposure on multi-user hosts, then unconditional rm -f. `remote_tmp` is
-    built from the stream name, so the path is fully predictable from the
-    config. Three exposures: a remote user can pre-create the path as a
-    symlink (scp writes through it, `rm -f` then deletes only the link) or as a
-    directory (transfer fails, run exits 1); the stream sits in /tmp at the
-    remote's default mode (usually 0644) between transfer and receive, and a
-    btrfs send stream is a full copy of the snapshot's bytes; two archives with
-    the same stream basename collide. Fix shape: unpredictable name
-    (`secrets.token_hex(8)` suffix), `chmod 600` on the remote file, cleanup
-    unchanged. Deferred pending the security phase.
+15. DONE (4cf896f): the remote stream temp file is no longer predictable.
+    `_remote_tmp_path()` builds `/tmp/bubtrsnap-<sanitized stream name>-<16 hex>`
+    from `secrets.token_hex(8)`, so a remote user cannot pre-create the path as a
+    symlink (scp wrote through it and `rm -f` removed only the link) or as a
+    directory, and two archives whose streams share a basename no longer collide.
+    `_receive_on_remote()` now runs `chmod 600` on the remote temp file before
+    `btrfs receive` — scp inherits the remote's default mode and rsync copies the
+    local file's — and a chmod failure only warns rather than aborting. Residual
+    window: the file is still at the remote's default mode *during* the transfer;
+    the unpredictable name is what makes it unguessable. A run killed between
+    transfer and receive leaves one orphan file per run in /tmp rather than
+    reusing the same name. Tests: unittests/test_remote_tmp.py (11); the existing
+    SCP/rsync tests in test_ssh.py now count the four-call sequence
+    (transfer, chmod, receive, cleanup), and rsynctestbed mirrors the naming.
 
-16. Archive names unsanitized in filesystem paths and globs:
-    snap_dir / f'{archive}.{ts}' escapes snapshot_dir for names with '/' or
-    '..'; glob(f'{archive}.*') treats metacharacters as pattern syntax
-    (verified: archive `foo[0-9]` matches `foo1.202601010000` and
-    `foo9.202601010000`, so parent discovery can pick another archive's
-    snapshot as an incremental parent). Note `iter_archive_items()` is already
-    safe (regex + exact compare); only the glob-based paths — `find_parents()`,
-    `_archive_snapshots()`, `_received_uuids_local()` — are exposed. Fix shape:
-    validate archive names once at load (`[A-Za-z0-9_-]`, reject '/', glob
-    metacharacters, leading '.' or '-', empty), which kills both halves at the
-    boundary. Deferred pending the security phase.
+16. DONE (bc692e9): archive names are validated where they are read.
+    `_validate_archive_name()` requires `[A-Za-z0-9][A-Za-z0-9_-]*` for every TOML
+    archive section and every `ARCHIVE[=SUBVOLUME]` CLI argument, killing the
+    path-escape (`/`, `..`) and glob-metacharacter exposures at the boundary;
+    `_archive_snapshots()` and the `_received_uuids_local()` fallback now compare
+    names literally through `_archive_items()` instead of `glob(f"{archive}.*")`,
+    so a name carrying metacharacters matches nothing even if validation were
+    bypassed. README documents the rule. Tests: unittests/test_archive_names.py
+    (16).
 
 17. Hooks run with check=False in run_hook(): a failing pre-snapshot hook
     (e.g. DB quiesce) is silently ignored and the snapshot is taken anyway.
@@ -298,7 +300,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (273 across 17 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
+- All tests pass (300 across 19 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
@@ -313,9 +315,9 @@ only because ts are 12-digit padded.
 ## Suggested sequencing (open items only)
 
 Done 2026-10-22: 10, 11, 32 (plus 25 verified already fixed and 26's build
-identity).
+identity), then the two easy security items 15 and 16.
 
-Phase 1 (security, deferred by decision on 2026-10-22): 13, 12, 14, 15, 16
+Phase 1 (security, deferred by decision on 2026-10-22): 13, 12, 14
 Phase 2 (improvements): 21, 31
 
 Each item = one commit, test written first and proven red.
