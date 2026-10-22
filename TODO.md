@@ -153,6 +153,49 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 26. SKILL.md version field tracks the latest release; keep in sync at each
     ship (currently 0.4.1).
 
+## Receive-output parsing (verified 2026-10-21 empirically; both fixed)
+
+27. DONE (09bc88a): `_received_subvol_name()` now takes the name from the
+    CRC-validated stream header via `stream_snapshot_name()` (which already
+    handles both SUBVOL and SNAPSHOT commands) and uses the receive banner only
+    as a cross-check, warning "received-name mismatch" when the two disagree.
+    `_parse_at_subvol()` also accepts `At snapshot`. Context: btrfs-progs prints
+    `At subvol <name>` on stderr for a FULL send and `At snapshot <name>` on
+    stdout for an incremental (parent-bearing) send — confirmed on thorin v7.1
+    and stryder v6.14 with real bubtrsnap streams. The old stem fallback was
+    cosmetic only because `{archive}.{ts}.btrfs` mirrors the snapshot name; it
+    silently reported the wrong name for renamed streams (`export_file =
+    "~/lama7Maildir.btrfs"`) and staged streams, which then fed the `{snapshot}`
+    hook mapping (item 12 — the header is local, so this also shrinks the
+    remote-output injection surface). `"Receiving subvol"` in the parser is still
+    a dead pattern (verbose btrfs-progs prints lowercase); left in place as
+    tolerance. Tests: synthetic SUBVOL/SNAPSHOT stream fixtures in
+    unittests/test_receive_names.py.
+
+28. DONE (09bc88a): `_is_duplicate_receive()` now matches btrfs-progs' actual
+    wording — `ERROR: creating snapshot/subvolume ... failed: File exists` —
+    as well as the legacy "already exists", so a repeat receive warns and skips
+    instead of exiting 1. Verified against a real duplicate receive (rc=1,
+    "File exists").
+
+## REMAINING — docs/testbed staleness (no code change needed to fix behaviour)
+
+29. README "When `--rsync` is enabled" bullet still says `--partial-dir
+    .bubtrsnap-partial` is always added; `_partial_dir_name()` now produces the
+    per-archive `.bubtrsnap-partial-{sanitized archive}`. rsynctestbed/test_rsync_interrupted.py
+    hardcodes `/tmp/.bubtrsnap-partial` (its rsync invocation and its recovery
+    assertion), so it exercises a directory the current code never creates.
+
+30. `_validate_subvol_path()` never raises: it calls `run(cmd, dry_run=False, ...)`
+    without `check=True`, so the `except subprocess.CalledProcessError` block is
+    unreachable and a failing `btrfs subvolume show` is logged as success and
+    cached in `cfg["_validated_paths"]`. Verified:
+    `chk_btrfs_subvolume(Path('/nonexistent-path-xyz'), cfg)` returns silently.
+    Fix: pass `check=True` (or test `result.returncode`).
+
+31. Housekeeping outside the repo: `~/.hermes/skills/.usage.json` still lists the
+    deleted `btrfs-ssh-backup` skill.
+
 ## Keep-algorithm audit notes (no changes made, per instruction)
 
 Correct across 7 scenarios. Observations only: total kept can be less than
@@ -171,12 +214,13 @@ only because ts are 12-digit padded.
 - Prune safety nets sound: _confirm fail-safes on EOF/Ctrl-C, forced-keep
   targets require explicit confirmation even with --yes, no partial deletes.
 - Staged dual-destination guard is correct (false positive in review).
-- 'At subvol' stderr parsing is correct (btrfs-progs prints to stderr).
+- 'At subvol' does go to stderr — but only for FULL sends; incremental sends
+  print 'At snapshot' on stdout. See item 27 (this bullet was a false positive).
 
 ## Suggested sequencing (open items only)
 
 Phase 1 (security): 13, 12, 14, 15+16
-Phase 2 (validation/consistency): 10 (probe first), 11
-Phase 3 (improvements): 21, 22, 25, 26
+Phase 2 (validation/consistency): 10 (probe first), 11, 30
+Phase 3 (improvements): 21, 22, 25, 26, 29, 31
 
 Each item = one commit, test written first and proven red.
