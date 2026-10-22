@@ -26,7 +26,7 @@ export_dir = "/pool/streams"
 # rsync transport
 rsync    = true
 rsync_opts = '-e "ssh -p 2222"'   # optional: non-standard SSH port / key
-# Note: --partial-dir .bubtrsnap-partial and -a are always added; dangerous
+# Note: --partial-dir .bubtrsnap-partial-<archive name> and -a are always added; dangerous
 # rsync options (e.g. --delete, --dry-run) are blocked with a warning.
 
 # Archive ---------------------------------------------------------------------

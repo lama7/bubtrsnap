@@ -22,6 +22,7 @@ Usage:
 """
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import time
@@ -32,6 +33,17 @@ REMOTE_PORT = 2222
 REMOTE_USER = "testuser"
 REMOTE_PASS = "testpass"
 REMOTE_BASE = "/btrfs_mount"
+
+# Mirrors bubtrsnap's per-archive partial-dir convention (_partial_dir_name in
+# bubtrsnap.py): ".bubtrsnap-partial-<sanitized archive name>", so an
+# interrupted transfer for one archive cannot be mistaken for another.
+ARCHIVE_NAME = "testarchive"
+
+
+def partial_dir_name(archive_name):
+    """Same sanitisation as bubtrsnap._partial_dir_name()."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", archive_name)
+    return f".bubtrsnap-partial-{safe}"
 
 
 def ssh_connect():
@@ -70,7 +82,7 @@ def remote_md5(client, path):
 def rsync_cmd(stream_path, remote_dst, ssh_key_path):
     """Build rsync command with key-based SSH auth."""
     return [
-        "rsync", "-a", "--partial-dir", ".bubtrsnap-partial",
+        "rsync", "-a", "--partial-dir", partial_dir_name(ARCHIVE_NAME),
         stream_path, f"{REMOTE_USER}@{REMOTE_HOST}:{remote_dst}"
     ]
 
@@ -134,7 +146,7 @@ def main():
         print(f"Local file MD5: {local_hash}")
 
         remote_tmp = f"/tmp/bubtrsnap-{os.path.basename(stream_path)}"
-        partial_dir = "/tmp/.bubtrsnap-partial"
+        partial_dir = f"/tmp/{partial_dir_name(ARCHIVE_NAME)}"
         env = rsync_env(ssh_key_path)
 
         # 1. Run rsync normally (complete transfer)
@@ -177,6 +189,13 @@ def main():
         _, _, exit_code = run_ssh(client, f"test -d {partial_dir}")
         print(f"Partial-dir exists on remote: {exit_code == 0}")
         assert exit_code == 0, "Partial-dir was not created on remote!"
+
+        # The recovery check is per archive: a different archive's partial dir
+        # must not exist, or archive B would be flagged as interrupted.
+        other_dir = f"/tmp/{partial_dir_name('otherarchive')}"
+        _, _, other_code = run_ssh(client, f"test -d {other_dir}")
+        print(f"Unrelated archive partial-dir present: {other_code == 0}")
+        assert other_code != 0, "unrelated archive partial-dir unexpectedly present"
 
         # Check that a partial file exists
         out, _, _ = run_ssh(client, f"ls -la {partial_dir}/")

@@ -174,8 +174,9 @@ bubtrsnap --snapshot-dir=/pool/snapshots \
 
 When `--rsync` is enabled:
 
-- The rsync options `-a` (archive mode) and `--partial-dir .bubtrsnap-partial`
-    are always added
+- The rsync options `-a` (archive mode) and `--partial-dir .bubtrsnap-partial-<archive>`
+    are always added — the partial-dir is per archive, so a stale partial from
+    one archive never makes another archive look interrupted
 - Additional options come from `--rsync-opts` (config: `rsync_opts`)
 - Dangerous options (`--delete`, `--partial-dir`, `-v`, `--progress`,
   `--dry-run`, `--daemon`, `--rsh`, `--exclude`, etc.) are blocked and reported
