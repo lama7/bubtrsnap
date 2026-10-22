@@ -130,14 +130,34 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     _check_interrupted_rsync now has a 10s timeout; timeout/OSError means
     "no interruption detected" rather than an indefinite hang.
 
-## REMAINING — improvements (not bugs)
+## Improvements (not bugs) — 21, 25, 26, 31 open
 
 21. _size_of walks the whole snapshot summing logical sizes, then compares
     against free space before an INCREMENTAL send -> false "insufficient
     space" aborts. Also used by rebuild to report required memory.
 
-22. find_parents / find_parents_ssh spawn one `btrfs subvolume show` (or SSH)
-    per candidate; `btrfs subvolume list -u <dir>` gets all UUIDs in one call.
+22. DONE (8cb58ed): `find_parents()` / `find_parents_ssh()` now resolve UUIDs with
+    a single `btrfs subvolume list -u -R -p -o <dir>` per directory instead of
+    one `btrfs subvolume show` per candidate. `-u` prints the uuid, `-R` the
+    received uuid, `-p` the parent ID, `-o` restricts the listing to subvolumes
+    below the search path; the directory's own `Subvolume ID` (one extra
+    `subvolume show`) is the parent ID that identifies its *direct* children, so
+    a nested subvolume that happens to match `{archive}.*` is not mistaken for a
+    snapshot. Verified on btrfs-progs 6.14 (stryder) and 7.1 (thorin); if the
+    listing or the ID lookup fails the code falls back to the old per-subvolume
+    `show` loop, so older builds keep working. Measured on stryder with the live
+    config (lama7Maildir): local parents 18 subprocess spawns → 4, SSH parents
+    19 spawns / 10 SSH round trips → 4 spawns / 2 round trips, with identical
+    parent lists and ordering (9 local parents, 8 SSH parents). Helpers:
+    `_parse_subvolume_list()`, `_get_subvolume_id()`, `_child_uuid_map()`,
+    `_archive_snapshots()`, `_received_uuids_local()`, `_received_uuids_ssh()`,
+    `_match_parents()`. The maps are deliberately *not* cached: a receive during
+    the same run would make them stale. `TestFindParentsSSH` in
+    unittests/test_ssh.py was rewritten with a realistic fake listing (the old
+    mock was order-dependent and passed only by accident);
+    unittests/test_find_parents.py (12 tests) counts invocations so a regression
+    back to the per-subvolume loop fails even when the parent list is still
+    correct.
 
 23. DONE (4afd32a): _scp_and_receive and _rsync_and_receive now share a
     single _receive_on_remote() tail (SSH receive, temp cleanup, error
@@ -240,6 +260,6 @@ only because ts are 12-digit padded.
 
 Phase 1 (security): 13, 12, 14, 15+16
 Phase 2 (validation/consistency): 10 (probe first), 11
-Phase 3 (improvements): 21, 22, 25, 26, 31
+Phase 3 (improvements): 21, 25, 26, 31
 
 Each item = one commit, test written first and proven red.
