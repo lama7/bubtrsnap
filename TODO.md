@@ -178,7 +178,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     instead of exiting 1. Verified against a real duplicate receive (rc=1,
     "File exists").
 
-## Docs/testbed staleness (docs-only; 29 fixed)
+## Docs/testbed staleness and validation gaps (29, 30 fixed)
 
 29. DONE (8fbf984): README's "When `--rsync` is enabled" bullet and
     `examples/single-rsync.toml` now document the per-archive
@@ -195,12 +195,22 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     `python3 rsynctestbed/test_rsync_interrupted.py` in an environment with the
     `bubtrsnap-test` container to confirm end to end.
 
-30. `_validate_subvol_path()` never raises: it calls `run(cmd, dry_run=False, ...)`
-    without `check=True`, so the `except subprocess.CalledProcessError` block is
-    unreachable and a failing `btrfs subvolume show` is logged as success and
-    cached in `cfg["_validated_paths"]`. Verified:
-    `chk_btrfs_subvolume(Path('/nonexistent-path-xyz'), cfg)` returns silently.
-    Fix: pass `check=True` (or test `result.returncode`).
+30. DONE (84afd70): `_validate_subvol_path()` now calls
+    `run(..., check=True)`, so the `except subprocess.CalledProcessError` branch
+    is reachable and a failing `btrfs subvolume show` prints
+    "Error: '<path>' is not a btrfs subvolume" and exits 1 instead of logging
+    success and caching the path as validated. Verified empirically on thorin:
+    `chk_btrfs_subvolume(Path('/run/media/gerry/backup/_no_such_dir'), cfg)`
+    used to return silently, now exits 1. Safe for real configs — `btrfs
+    subvolume show` on a plain directory exits 1 and `btrfs subvolume snapshot`
+    into that same directory fails too ("Could not create subvolume: Invalid
+    cross-device link"), so nothing that previously worked is now rejected.
+    Tests: unittests/test_validate_subvol_path.py (8 tests; the fake
+    `subprocess.run` honours `check=`, which is what makes the old false-green
+    style of test impossible). Note the older
+    `TestSSHValidation.test_chk_btrfs_subvolume_ssh_failure` in
+    unittests/test_ssh.py only passed because its mock raised the exception by
+    hand — it now reflects real behaviour.
 
 31. Housekeeping outside the repo: `~/.hermes/skills/.usage.json` still lists the
     deleted `btrfs-ssh-backup` skill.
@@ -229,7 +239,7 @@ only because ts are 12-digit padded.
 ## Suggested sequencing (open items only)
 
 Phase 1 (security): 13, 12, 14, 15+16
-Phase 2 (validation/consistency): 10 (probe first), 11, 30
+Phase 2 (validation/consistency): 10 (probe first), 11
 Phase 3 (improvements): 21, 22, 25, 26, 31
 
 Each item = one commit, test written first and proven red.
