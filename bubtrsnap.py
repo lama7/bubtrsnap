@@ -633,6 +633,8 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "rsync_opts": str,
 }
 
+_KEEP_COUNT_KEYS = ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly")
+
 def _is_valid_forced_keep(ts: str) -> bool:
     """A forced-keep timestamp is exactly 12 digits: YYYYMMDDhhmm."""
     return len(ts) == 12 and ts.isdigit()
@@ -647,6 +649,13 @@ def _validate_forced_keep(name: str, value: str, context: str) -> list[str]:
                   f"timestamps in YYYYMMDDhhmm format (got '{ts}')", file=sys.stderr)
             sys.exit(1)
     return timestamps
+
+
+def _validate_keep_count(name: str, value: int, context: str) -> None:
+    """Keep counts are counts: a negative one is meaningless (it behaves as 0)."""
+    if value < 0:
+        print(f"Error: '{name}' in {context} must be 0 or greater, got {value}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
@@ -670,6 +679,8 @@ def _check_type(name: str, value: Any, expected_type: type, context: str) -> Non
             print(f"Error: '{name}' in {context} must be an integer, got {type(value).__name__}",
                   file=sys.stderr)
             sys.exit(1)
+        if name in _KEEP_COUNT_KEYS:
+            _validate_keep_count(name, value, context)
     elif expected_type is bool:
         if not isinstance(value, bool):
             print(f"Error: '{name}' in {context} must be a boolean (true/false), got {type(value).__name__}",
@@ -735,7 +746,7 @@ def resolve_keep_policy(archive_cfg: dict, global_cfg: dict, cli_keeps: dict) ->
     2. Archive-specific keeps → missing ones become 0
     3. Global keeps
     """
-    keep_keys = ["keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"]
+    keep_keys = list(_KEEP_COUNT_KEYS)
 
     # 1. CLI takes full control if any keep was given
     if cli_keeps:
@@ -941,9 +952,10 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
 
     # CLI keep options
     cli_keeps = {}
-    for key in ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"):
+    for key in _KEEP_COUNT_KEYS:
         val = getattr(cli, key, None)
         if val is not None:
+            _validate_keep_count(key, val, "command line")
             cli_keeps[key] = val
 
     # CLI forced-keep options (--forced-keep) - requires exactly one archive total

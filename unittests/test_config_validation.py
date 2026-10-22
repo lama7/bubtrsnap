@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Unit tests for CLI --forced-keep timestamp validation.
+"""Unit tests for keep-policy count and forced-keep timestamp validation.
 
-TODO item 11: config forced_keep values were format-checked, but CLI values
-reached the keep policy unvalidated and were silently warn-and-ignored.
+Covers TODO items 10 (negative keep_* counts accepted) and 11 (CLI
+--forced-keep values never format-validated).
 """
+
+from __future__ import annotations
+
 import argparse
 import io
 import tempfile
@@ -74,6 +77,46 @@ def _run(fn, *args, **kwargs):
     except SystemExit as exc:
         err = exc
     return err, buf.getvalue()
+
+
+class TestKeepCountValidation(unittest.TestCase):
+    """TODO 10: negative keep_* counts must be rejected at validation time."""
+
+    def test_global_negative_keep_rejected(self):
+        exc, err = _run(bs.validate_config, {"keep_daily": -5})
+        self.assertIsInstance(exc, SystemExit, "negative global keep_daily was accepted")
+        self.assertIn("keep_daily", err)
+        self.assertIn("0", err)
+
+    def test_archive_negative_keep_rejected(self):
+        cfg = {"arch": {"subvolume": "/var/lib", "keep_hourly": -1}}
+        exc, err = _run(bs.validate_config, cfg)
+        self.assertIsInstance(exc, SystemExit, "negative archive keep_hourly was accepted")
+        self.assertIn("keep_hourly", err)
+
+    def test_every_keep_key_is_checked(self):
+        for key in ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"):
+            exc, _ = _run(bs.validate_config, {key: -1})
+            self.assertIsInstance(exc, SystemExit, f"{key}={-1} was accepted")
+
+    def test_zero_and_positive_counts_still_accepted(self):
+        bs.validate_config({"keep_daily": 0, "keep_yearly": 3})
+        bs.validate_config({"arch": {"subvolume": "/var/lib", "keep_daily": 0}})
+
+    def test_cli_negative_keep_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            (td_path / "sub").mkdir()
+            (td_path / "snap").mkdir()
+            cli = _ns(
+                snapshot_dir=str(td_path / "snap"),
+                keep_daily=-5,
+                archives=[f"a={td_path / 'sub'}"],
+            )
+            with patch("bubtrsnap.chk_btrfs_subvolume"):
+                exc, err = _run(bs.load_and_resolve_archives, cli, None)
+            self.assertIsInstance(exc, SystemExit, "CLI --keep-daily -5 was accepted")
+            self.assertIn("keep-daily", err.replace("_", "-"))
 
 
 class TestForcedKeepValidation(unittest.TestCase):
