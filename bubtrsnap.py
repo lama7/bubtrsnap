@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -1859,16 +1860,42 @@ def _received_subvol_name(stream: Path, result, cfg: dict, source: str) -> str:
     return stream.stem
 
 
+def _remote_tmp_path(stream: Path) -> str:
+    """Remote temp path for a stream transfer.
+
+    The random suffix makes the path unguessable from the config: a user on the
+    remote cannot pre-create it as a symlink (scp writes through it and the
+    `rm -f` cleanup then removes only the link) or as a directory, and two
+    archives whose streams share a basename never collide.  The stream name is
+    kept in the path so a leftover file can still be attributed to an archive.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", stream.name)
+    return f"/tmp/bubtrsnap-{safe}-{secrets.token_hex(8)}"
+
+
 def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
                        remote_tmp: str, stream: Path, cfg: dict,
                        remote_sudo: bool, seq_start: datetime,
                        label: str) -> str | None:
     """Shared tail of the SCP and rsync flows.
 
-    Run btrfs receive on the remote via SSH, clean up the remote temp file,
-    and return the received subvolume basename (None if it already exists).
+    Restrict the transferred stream to owner-only on the remote, run btrfs
+    receive there, clean up the remote temp file, and return the received
+    subvolume basename (None if it already exists).
     Aborts the whole program on any other error.
     """
+    # A btrfs send stream is a byte-for-byte copy of the snapshot's contents:
+    # scp inherits the remote's default mode and rsync copies the local file's,
+    # so make it readable by the remote's owner only before receiving it.
+    chmod_cmd = build_ssh_cmd(remote, ["chmod", "600", remote_tmp], remote_sudo)
+    chmod_result = run(chmod_cmd, dry_run=cfg.get("dry_run", False),
+                       verbosity=cfg["verbose"],
+                       capture_output=True, text=True, check=False)
+    if chmod_result is not None and chmod_result.returncode != 0:
+        print(f"Warning: could not restrict permissions on the remote temp file "
+              f"{remote_tmp} on {remote}: {(chmod_result.stderr or '').strip()}",
+              file=sys.stderr)
+
     start = datetime.now()
     ssh_result = run(recv_cmd, dry_run=cfg.get("dry_run", False),
                      verbosity=cfg["verbose"],
@@ -1905,7 +1932,7 @@ def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
 def _scp_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict, remote_sudo: bool = False) -> str | None:
     """Copy stream file to remote via SCP, then receive locally on remote."""
     # SCP the stream file to a temporary location on remote
-    remote_tmp = f"/tmp/bubtrsnap-{stream.name}"
+    remote_tmp = _remote_tmp_path(stream)
     
     scp_cmd = ["scp", str(stream), f"{remote}:{remote_tmp}"]
     if cfg.get("local_sudo"):
@@ -1979,8 +2006,9 @@ def _rsync_and_receive(stream: Path, remote: str, remote_dir: str, cfg: dict,
     Returns the received subvolume basename on success, None on 'already exists'.
     Aborts the whole program on any other error.
     """
-    # The remote temp file that rsync will place (same as SCP path for consistency)
-    remote_tmp = f"/tmp/bubtrsnap-{stream.name}"
+    # The remote temp file that rsync will place (same shape as the SCP path,
+    # unpredictable per run — see _remote_tmp_path)
+    remote_tmp = _remote_tmp_path(stream)
     # Per-archive partial-dir so another archive's stale partial can't
     # falsely flag this transfer as interrupted (see _check_interrupted_rsync).
     partial_dir_name = _partial_dir_name(

@@ -23,6 +23,7 @@ Usage:
 import hashlib
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -44,6 +45,13 @@ def partial_dir_name(archive_name):
     """Same sanitisation as bubtrsnap._partial_dir_name()."""
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", archive_name)
     return f".bubtrsnap-partial-{safe}"
+
+
+def remote_tmp_path(stream_path):
+    """Same naming as bubtrsnap._remote_tmp_path(): sanitized stream name plus a
+    random suffix, so the remote temp file is not predictable from the config."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(stream_path))
+    return f"/tmp/bubtrsnap-{safe}-{secrets.token_hex(8)}"
 
 
 def ssh_connect():
@@ -145,7 +153,7 @@ def main():
         local_hash = file_md5(stream_path)
         print(f"Local file MD5: {local_hash}")
 
-        remote_tmp = f"/tmp/bubtrsnap-{os.path.basename(stream_path)}"
+        remote_tmp = remote_tmp_path(stream_path)
         partial_dir = f"/tmp/{partial_dir_name(ARCHIVE_NAME)}"
         env = rsync_env(ssh_key_path)
 

@@ -563,8 +563,8 @@ class TestSCPReceive(unittest.TestCase):
         result = bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
 
         self.assertEqual(result, "test.202608280230")
-        # Verify run() was called 3 times (SCP, SSH receive, cleanup)
-        self.assertEqual(mock_run.call_count, 3)
+        # Verify run() was called 4 times (SCP, remote chmod, SSH receive, cleanup)
+        self.assertEqual(mock_run.call_count, 4)
         # Verify the return value is the stream stem
         self.assertEqual(result, stream.stem)
 
@@ -593,9 +593,10 @@ class TestSCPReceive(unittest.TestCase):
         stream = Path("/tmp/test.202608280230.btrfs")
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False}
         
-        # SCP succeeds, SSH receive fails, cleanup succeeds
+        # SCP succeeds, chmod succeeds, SSH receive fails, cleanup succeeds
         mock_run.side_effect = [
             subprocess.CompletedProcess(args=["scp"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "chmod"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="error: no space left"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
         ]
@@ -619,10 +620,14 @@ class TestSCPReceive(unittest.TestCase):
 
         bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg, remote_sudo=True)
 
-        # The last run() call is the cleanup command
+        # The last run() call is the cleanup command, and it must remove the
+        # same unpredictable temp path that SCP wrote.
+        scp_dest = mock_run.call_args_list[0].args[0][-1].split(":", 1)[1]
+        self.assertTrue(scp_dest.startswith("/tmp/bubtrsnap-test.202608280230.btrfs-"),
+                        f"remote temp path {scp_dest!r} is not per-run")
         cleanup_cmd = mock_run.call_args_list[-1].args[0]
         self.assertEqual(cleanup_cmd,
-                         ["ssh", "user@host", "sudo", "-n", "rm", "-f", "/tmp/bubtrsnap-test.202608280230.btrfs"])
+                         ["ssh", "user@host", "sudo", "-n", "rm", "-f", scp_dest])
 
 
 class TestSendBackupToFile(unittest.TestCase):
@@ -989,7 +994,11 @@ class TestRsyncAndReceive(unittest.TestCase):
         self.assertIn("-a", rsync_cmd)
         self.assertIn("--partial-dir", rsync_cmd)
         self.assertIn("--compress", rsync_cmd)
-        self.assertIn("user@host:/tmp/bubtrsnap-test.202608280230.btrfs", rsync_cmd)
+        dest = rsync_cmd[-1]
+        self.assertTrue(
+            dest.startswith("user@host:/tmp/bubtrsnap-test.202608280230.btrfs-"),
+            f"rsync destination {dest!r} is predictable from the stream name",
+        )
 
     @patch("bubtrsnap.run")
     def test_rsync_partial_dir_detection(self, mock_run):
@@ -1000,8 +1009,8 @@ class TestRsyncAndReceive(unittest.TestCase):
         cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False,
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
-        # All calls return None for dry-run (rsync, receive, cleanup)
-        mock_run.side_effect = [None, None, None]
+        # All calls return None for dry-run (rsync, chmod, receive, cleanup)
+        mock_run.side_effect = [None, None, None, None]
 
         result = bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
         self.assertEqual(result, "test.202608280230")
@@ -1046,9 +1055,10 @@ class TestRsyncAndReceive(unittest.TestCase):
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False,
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
-        # First call (rsync) succeeds, second call (receive) fails
+        # First call (rsync) succeeds, chmod succeeds, then the receive fails
         mock_run.side_effect = [
             subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "chmod"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="no space left"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
         ]
@@ -1068,6 +1078,7 @@ class TestRsyncAndReceive(unittest.TestCase):
 
         mock_run.side_effect = [
             subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "chmod"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="subvolume already exists"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
         ]
