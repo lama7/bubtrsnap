@@ -178,13 +178,22 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     instead of exiting 1. Verified against a real duplicate receive (rc=1,
     "File exists").
 
-## REMAINING — docs/testbed staleness (no code change needed to fix behaviour)
+## Docs/testbed staleness (docs-only; 29 fixed)
 
-29. README "When `--rsync` is enabled" bullet still says `--partial-dir
-    .bubtrsnap-partial` is always added; `_partial_dir_name()` now produces the
-    per-archive `.bubtrsnap-partial-{sanitized archive}`. rsynctestbed/test_rsync_interrupted.py
-    hardcodes `/tmp/.bubtrsnap-partial` (its rsync invocation and its recovery
-    assertion), so it exercises a directory the current code never creates.
+29. DONE (8fbf984): README's "When `--rsync` is enabled" bullet and
+    `examples/single-rsync.toml` now document the per-archive
+    `--partial-dir .bubtrsnap-partial-{sanitized archive}` that
+    `_partial_dir_name()` actually emits. `rsynctestbed/test_rsync_interrupted.py`
+    hardcoded the old shared `/tmp/.bubtrsnap-partial` in both its rsync
+    invocation and its recovery assertion, so it exercised a directory the
+    current code never creates; it now mirrors `_partial_dir_name()` and also
+    asserts an unrelated archive's partial dir is absent after an interruption.
+    Not executed here — the Docker socket is not reachable from this shell
+    (`permission denied` on `/var/run/docker.sock`); the change is verified by
+    `py_compile` and by comparing `partial_dir_name()` against
+    `_partial_dir_name()` for several archive names. Run
+    `python3 rsynctestbed/test_rsync_interrupted.py` in an environment with the
+    `bubtrsnap-test` container to confirm end to end.
 
 30. `_validate_subvol_path()` never raises: it calls `run(cmd, dry_run=False, ...)`
     without `check=True`, so the `except subprocess.CalledProcessError` block is
@@ -221,6 +230,6 @@ only because ts are 12-digit padded.
 
 Phase 1 (security): 13, 12, 14, 15+16
 Phase 2 (validation/consistency): 10 (probe first), 11, 30
-Phase 3 (improvements): 21, 22, 25, 26, 29, 31
+Phase 3 (improvements): 21, 22, 25, 26, 31
 
 Each item = one commit, test written first and proven red.
