@@ -688,6 +688,24 @@ def _validate_keep_count(name: str, value: int, context: str) -> None:
         sys.exit(1)
 
 
+# An archive name becomes a subvolume/file name ('{archive}.{ts}'), a remote
+# temp path and a glob root, so it is restricted to a safe character set where
+# it is read: no path separators, no glob metacharacters, no leading '.' or '-'.
+_ARCHIVE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def _validate_archive_name(name: str, context: str) -> None:
+    """Archive names must be usable as a single, literal path component."""
+    if not name:
+        print(f"Error: archive name in {context} cannot be empty", file=sys.stderr)
+        sys.exit(1)
+    if not _ARCHIVE_NAME_RE.fullmatch(name):
+        print(f"Error: archive name '{name}' in {context} may contain only letters, "
+              f"digits, '_' and '-', and must start with a letter or digit "
+              f"(it becomes a snapshot/subvolume name)", file=sys.stderr)
+        sys.exit(1)
+
+
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
     """Helper to check a single value's type."""
     if expected_type is str:
@@ -727,6 +745,8 @@ def validate_config(file_cfg: dict) -> None:
             # ----- Archive section -----
             archive_name = key
             context = f"archive section [{archive_name}]"
+
+            _validate_archive_name(archive_name, "configuration file")
 
             for opt, opt_value in value.items():
                 if opt not in ALLOWED_ARCHIVE_OPTIONS:
@@ -815,11 +835,13 @@ def parse_cli_archives(raw_args: list[str]) -> dict[str, str | None]:
             if not name:
                 print(f"Invalid archive specification: {item}", file=sys.stderr)
                 sys.exit(1)
+            _validate_archive_name(name, "command line")
             result[name] = path
         else:
             if not item:
                 print("Invalid empty archive name", file=sys.stderr)
                 sys.exit(1)
+            _validate_archive_name(item, "command line")
             result[item] = None
     return result
 
@@ -1534,16 +1556,26 @@ def _child_uuid_map(
     return _parse_subvolume_list(result.stdout, parent_id)
 
 
+def _archive_items(directory: Path, archive: str) -> list[Path]:
+    """Direct children of *directory* named exactly '{archive}.<timestamp>'.
+
+    A literal compare instead of glob(f"{archive}.*"): '[', ']' and '*' in a
+    name are glob pattern syntax, so a name carrying them silently matches
+    other archives' snapshots.
+    """
+    if not directory.is_dir():
+        return []
+    prefix = f"{archive}."
+    return [p for p in directory.iterdir()
+            if p.name.startswith(prefix) and p.is_dir() and parse_ts(p.name)]
+
+
 def _archive_snapshots(archive: str, snapshot_dir: Path, cfg: dict) -> list[tuple]:
     """(timestamp, path, uuid) for snapshots of *archive* directly under snapshot_dir."""
     mapping = _child_uuid_map(snapshot_dir, cfg)
     snapshots = []
-    for p in snapshot_dir.glob(f"{archive}.*"):
-        if not p.is_dir():
-            continue
+    for p in _archive_items(snapshot_dir, archive):
         ts = parse_ts(p.name)
-        if not ts:
-            continue
         if mapping is not None:
             uuid, _ = mapping.get(p.name, (None, None))
         else:
@@ -1561,9 +1593,7 @@ def _received_uuids_local(archive: str, backup_dir: Path, cfg: dict) -> set[str]
                 if received and name.startswith(f"{archive}.")}
 
     received_uuids = set()
-    for p in backup_dir.glob(f"{archive}.*"):
-        if not p.is_dir():
-            continue
+    for p in _archive_items(backup_dir, archive):
         _, received_uuid = get_subvol_uuids(p, cfg)
         if received_uuid:
             received_uuids.add(received_uuid)

@@ -78,6 +78,11 @@ CLI options map to configuration keys by replacing `-` with `_` (so
 `--snapshot-dir` becomes `snapshot_dir`).  Precedence is **CLI > archive >
 global** — the CLI always wins, then archive-specific settings, then global.
 
+An archive name (the TOML section name, or the `ARCHIVE` in
+`bubtrsnap ARCHIVE=/path`) is used directly as a snapshot and subvolume name,
+so it may contain only letters, digits, `_` and `-` and must start with a
+letter or digit.
+
 ```bash
 bubtrsnap --keep-daily 3            # override keep policy for one run only
 bubtrsnap archive1                # process only archive1
