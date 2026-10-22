@@ -12,7 +12,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (tip 5b8fa1a, VERSION 0.4.2.dev0). All DONE
+- `maintain` — working branch (tip 29ed2cf, VERSION 0.4.2.dev0). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
   `bubtrsnap --version` now also prints the branch/commit it was built from,
@@ -170,7 +170,7 @@ still deferred by decision)
 
 ## Improvements (not bugs) — 31 and 33 open
 
-21. DONE (62a710a, 5b8fa1a): the fit check now runs only for FULL sends. btrfs cannot
+21. DONE (62a710a, 5b8fa1a, 29ed2cf): the fit check now runs only for FULL sends. btrfs cannot
     report an incremental stream's size in advance — verified empirically:
     btrfs-progs 6.14 (stryder) and the 7.1 docs have no --dry-run/size flag,
     `btrfs qgroup` 'excl' is ~16 KiB for a snapshot (the new extents are still
@@ -210,8 +210,11 @@ still deferred by decision)
     can be judged against its capacity; `_remote_disk_free()` is now a thin
     wrapper. Main-path remote destinations get `_low_space_warning_remote()`
     too — nothing about a remote is ever hard-stopped, because a remote that
-    fills up must not cancel a local backup that already succeeded. Tests: 16
-    more in the same file (31 there, 331 total).
+    fills up must not cancel a local backup that already succeeded. 29ed2cf
+    moves that warning up front so it fires for every route to the remote
+    (piped send, scp, rsync), not just the piped one, and the local floor
+    message no longer says "incremental" since the floor applies to any send.
+    Tests: 17 more in the same file (32 there, 332 total).
 
 22. DONE (8cb58ed): `find_parents()` / `find_parents_ssh()` now resolve UUIDs with
     a single `btrfs subvolume list -u -R -p -o <dir>` per directory instead of
@@ -351,7 +354,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (331 across 20 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
+- All tests pass (332 across 20 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
