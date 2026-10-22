@@ -1176,7 +1176,10 @@ def _validate_subvol_path(
     log(f"Checking {location} is a valid btrfs subvolume...", 1, verbose)
 
     try:
-        run(cmd, dry_run=False, verbosity=verbose, timeout=timeout, **kwargs)
+        # check=True is what makes the CalledProcessError branch reachable:
+        # without it a non-zero `btrfs subvolume show` was logged as success.
+        run(cmd, dry_run=False, verbosity=verbose, timeout=timeout,
+            check=True, **kwargs)
         log(success_msg, 2, verbose)
         validated.add(cache_key)
     except subprocess.CalledProcessError as exc:
