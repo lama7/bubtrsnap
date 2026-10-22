@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Unit tests for CLI --forced-keep timestamp validation.
+
+TODO item 11: config forced_keep values were format-checked, but CLI values
+reached the keep policy unvalidated and were silently warn-and-ignored.
+"""
+import argparse
+import io
+import tempfile
+import textwrap
+import unittest
+from contextlib import redirect_stderr
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from unittest.mock import patch
+
+
+def _load():
+    path = Path(__file__).resolve().parent.parent / "bubtrsnap.py"
+    if not path.is_file():
+        raise FileNotFoundError(f"Cannot find bubtrsnap.py at {path}")
+    return SourceFileLoader("bubtrsnap", str(path)).load_module()
+
+
+bs = _load()
+
+
+def _ns(**kwargs):
+    """Build an argparse.Namespace with defaults matching bubtrsnap CLI."""
+    defaults = dict(
+        config=None,
+        snapshot_dir=None,
+        backup_dir=None,
+        snaps_only=False,
+        export_file=None,
+        import_file=None,
+        stage_file=None,
+        export_dir=None,
+        import_dir=None,
+        stage_dir=None,
+        local_sudo=False,
+        remote_host=None,
+        remote_path=None,
+        remote_sudo=False,
+        rsync=False,
+        rsync_opts=None,
+        week_startday=None,
+        forced_keep=None,
+        keep_hourly=None,
+        keep_daily=None,
+        keep_weekly=None,
+        keep_monthly=None,
+        keep_yearly=None,
+        verbose=0,
+        debug=False,
+        dry_run=False,
+        archives=[],
+    )
+    defaults.update(kwargs)
+    return argparse.Namespace(**defaults)
+
+
+def _write_config(path: Path, body: str) -> None:
+    path.write_text(textwrap.dedent(body).lstrip())
+
+
+def _run(fn, *args, **kwargs):
+    """Call fn, capturing stderr; returns (exception_or_None, stderr_text)."""
+    err = None
+    buf = io.StringIO()
+    try:
+        with redirect_stderr(buf):
+            fn(*args, **kwargs)
+    except SystemExit as exc:
+        err = exc
+    return err, buf.getvalue()
+
+
+class TestForcedKeepValidation(unittest.TestCase):
+    """TODO 11: CLI --forced-keep values must be format-validated like config ones."""
+
+    def test_merge_rejects_malformed_cli_timestamp(self):
+        exc, err = _run(bs._merge_keep, None, ["garbage"])
+        self.assertIsInstance(exc, SystemExit, "malformed CLI forced-keep was accepted")
+        self.assertIn("forced-keep", err.replace("_", "-"))
+        self.assertIn("YYYYMMDDhhmm", err)
+
+    def test_merge_rejects_short_and_long_timestamps(self):
+        for bad in ("2026", "2026010112000", "2026-01-01", "20260101120a"):
+            exc, _ = _run(bs._merge_keep, None, [bad])
+            self.assertIsInstance(exc, SystemExit, f"{bad!r} was accepted")
+
+    def test_merge_accepts_valid_timestamps(self):
+        self.assertEqual(
+            bs._merge_keep("202601011200", ["202601021200", "202601031200,202601041200"]),
+            ["202601011200", "202601021200", "202601031200", "202601041200"],
+        )
+
+    def test_config_forced_keep_still_validated(self):
+        exc, err = _run(bs.validate_config, {"arch": {"subvolume": "/var/lib", "forced_keep": "nope"}})
+        self.assertIsInstance(exc, SystemExit)
+        self.assertIn("forced_keep", err)
+
+    def test_cli_forced_keep_bad_value_end_to_end(self):
+        """The value must be rejected during resolution, not warn-and-ignored later."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            (td_path / "sub").mkdir()
+            cli = _ns(
+                subvolume=None,
+                forced_keep=["2026garbage"],
+                archives=[f"a={td_path / 'sub'}"],
+            )
+            with patch("bubtrsnap.chk_btrfs_subvolume"):
+                exc, err = _run(bs.load_and_resolve_archives, cli, None)
+            self.assertIsInstance(exc, SystemExit, "malformed --forced-keep reached the keep policy")
+            self.assertIn("forced-keep", err.replace("_", "-"))
+
+    def test_cli_forced_keep_good_value_survives_resolution(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            (td_path / "sub").mkdir()
+            cli = _ns(
+                forced_keep=["202601011200"],
+                archives=[f"a={td_path / 'sub'}"],
+            )
+            with patch("bubtrsnap.chk_btrfs_subvolume"):
+                _, archives = bs.load_and_resolve_archives(cli, None)
+            self.assertEqual(archives[0]["forced_keep"], ["202601011200"])
+
+
+if __name__ == "__main__":
+    unittest.main()

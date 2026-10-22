@@ -327,9 +327,12 @@ def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M")
 
 def _merge_keep(config_val: str | None, cli_val: list[str] | None) -> list[str]:
-    """Merge keep from config (comma-separated string) and CLI (list of strings).
-    
-    Returns a list of timestamp strings (12-digit format).
+    """Merge forced_keep from config (comma-separated string) and CLI (list of strings).
+
+    Returns a list of timestamp strings (12-digit format). Every timestamp is
+    format-validated here — config values are already checked by validate_config,
+    but CLI values reach this function unvalidated, so a malformed --forced-keep
+    is a hard error rather than a silent warn-and-ignore in the keep policy.
     """
     result = []
     # Config value: comma-separated string
@@ -347,6 +350,12 @@ def _merge_keep(config_val: str | None, cli_val: list[str] | None) -> list[str]:
                     ts = ts.strip()
                     if ts:
                         result.append(ts)
+
+    for ts in result:
+        if not _is_valid_forced_keep(ts):
+            print(f"Error: 'forced_keep' must be a comma-separated list of timestamps in "
+                  f"YYYYMMDDhhmm format (got '{ts}')", file=sys.stderr)
+            sys.exit(1)
     return result
 
 def parse_ts(name: str) -> datetime | None:
@@ -624,6 +633,22 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "rsync_opts": str,
 }
 
+def _is_valid_forced_keep(ts: str) -> bool:
+    """A forced-keep timestamp is exactly 12 digits: YYYYMMDDhhmm."""
+    return len(ts) == 12 and ts.isdigit()
+
+
+def _validate_forced_keep(name: str, value: str, context: str) -> list[str]:
+    """Split a comma-separated forced_keep string and validate every timestamp."""
+    timestamps = [t.strip() for t in value.split(",")]
+    for ts in timestamps:
+        if not _is_valid_forced_keep(ts):
+            print(f"Error: '{name}' in {context} must be a comma-separated list of "
+                  f"timestamps in YYYYMMDDhhmm format (got '{ts}')", file=sys.stderr)
+            sys.exit(1)
+    return timestamps
+
+
 def _check_type(name: str, value: Any, expected_type: type, context: str) -> None:
     """Helper to check a single value's type."""
     if expected_type is str:
@@ -639,13 +664,7 @@ def _check_type(name: str, value: Any, expected_type: type, context: str) -> Non
                 sys.exit(1)
         # Special validation for forced_keep (timestamp format YYYYMMDDhhmm)
         if name == "forced_keep":
-            # Split by comma and validate each timestamp
-            timestamps = [t.strip() for t in value.split(",")]
-            for ts in timestamps:
-                if len(ts) != 12 or not ts.isdigit():
-                    print(f"Error: '{name}' in {context} must be a comma-separated list of timestamps in YYYYMMDDhhmm format",
-                          file=sys.stderr)
-                    sys.exit(1)
+            _validate_forced_keep(name, value, context)
     elif expected_type is int:
         if not isinstance(value, int) or isinstance(value, bool):  # bool is subclass of int
             print(f"Error: '{name}' in {context} must be an integer, got {type(value).__name__}",
