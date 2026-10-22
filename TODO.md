@@ -12,9 +12,11 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (tip 216bb60, VERSION 0.4.2.dev0). All DONE
+- `maintain` — working branch (tip d78d51f, VERSION 0.4.2.dev0). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
+  `bubtrsnap --version` now also prints the branch/commit it was built from,
+  so a dogfooded build identifies itself (see item 26).
 - Nothing reaches GitHub until a release is declared.
 
 ## SHIPPED in v0.4.1 (tag pushed, GitHub release + PyPI published)
@@ -70,21 +72,38 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 9. DONE (4afd32a): run() docstring now states read_only dry-run returns the
    CompletedProcess (matches the code).
 
-## REMAINING — validation / precedence gaps
+## REMAINING — validation / precedence gaps (10, 11 fixed)
 
-10. Negative keep counts pass validation: validate_config only type-checks
-    keep_* values as int, so -5 is accepted. CONFLICT to resolve with one
-    probe first: FINDINGS says they distort build_keep_set accounting and
-    over-prune; the keep-algorithm audit says negatives are treated as 0.
-    Validation fix only — do not touch the keep algorithm itself (needs
-    explicit approval).
+10. DONE (97e934a): negative keep counts rejected. Probe first, as requested:
+    `build_keep_set` treats a negative count exactly like 0 (30 daily
+    snapshots, `keep_daily: -5` vs `keep_daily: 0` produce identical keep and
+    prune sets), so the FINDINGS "over-prune" claim does not hold and the keep
+    algorithm was left untouched. `_validate_keep_count` now refuses negatives
+    in global config, archive sections, and CLI `--keep-*`; `_KEEP_COUNT_KEYS`
+    is the single list of the five keys. Tests:
+    unittests/test_config_validation.py `TestKeepCountValidation` (5).
 
-11. CLI --forced-keep values never format-validated: only config values get
-    the 12-digit check (validate_config); _merge_keep accepts any string;
-    malformed CLI timestamps are silently warned-and-ignored in
-    _apply_keep_policy_core.
+11. DONE (307b4cf): CLI --forced-keep values are format-validated. Config
+    values were checked by validate_config, but `_merge_keep` accepted any
+    string and malformed CLI timestamps were warn-and-ignored in
+    `_apply_keep_policy_core`. Shared `_is_valid_forced_keep()` /
+    `_validate_forced_keep()` now check every timestamp from either source, so
+    a bad `--forced-keep` is a hard error naming the offending value. Tests:
+    unittests/test_config_validation.py `TestForcedKeepValidation` (6).
 
-## REMAINING — security hardening
+32. DONE (d78d51f): a blocked rsync option left its argument orphaned.
+    `_filter_rsync_opts` stripped `--exclude` but kept the following token, and
+    rsync read it as a positional source:
+    `rsync -a --partial-dir .p /orphan_token …` →
+    `link_stat "/orphan_token" failed`. `_RSYNC_OPTS_WITH_VALUE` lists the
+    blocked long options that take a separate argument, and the filter now
+    consumes the value too (the `--opt=value` form is self-contained, and a
+    value that is itself an option is not swallowed). Tests: 7 added to
+    `TestRsyncOptionsFilter` in unittests/test_ssh.py. Related but still open:
+    item 14 (`-e` and `--config` are not blocked at all — verified,
+    `--rsync-opts '-e "ssh -oProxyCommand=id" --config=/tmp/x'` passes through).
+
+## REMAINING — security hardening (12, 13, 14, 15, 16 deferred by decision, 2026-10-22)
 
 12. Untrusted remote output into shell: 'At subvol' parsed via
     _parse_at_subvol() from remote stdout/stderr enters the hook mapping
@@ -108,11 +127,28 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     switch to an allow-list.
 
 15. Predictable temp file /tmp/bubtrsnap-<name> on the remote — symlink/TOCTOU
-    exposure on multi-user hosts, then unconditional rm -f.
+    exposure on multi-user hosts, then unconditional rm -f. `remote_tmp` is
+    built from the stream name, so the path is fully predictable from the
+    config. Three exposures: a remote user can pre-create the path as a
+    symlink (scp writes through it, `rm -f` then deletes only the link) or as a
+    directory (transfer fails, run exits 1); the stream sits in /tmp at the
+    remote's default mode (usually 0644) between transfer and receive, and a
+    btrfs send stream is a full copy of the snapshot's bytes; two archives with
+    the same stream basename collide. Fix shape: unpredictable name
+    (`secrets.token_hex(8)` suffix), `chmod 600` on the remote file, cleanup
+    unchanged. Deferred pending the security phase.
 
 16. Archive names unsanitized in filesystem paths and globs:
     snap_dir / f'{archive}.{ts}' escapes snapshot_dir for names with '/' or
-    '..'; glob(f'{archive}.*') treats metacharacters as pattern syntax.
+    '..'; glob(f'{archive}.*') treats metacharacters as pattern syntax
+    (verified: archive `foo[0-9]` matches `foo1.202601010000` and
+    `foo9.202601010000`, so parent discovery can pick another archive's
+    snapshot as an incremental parent). Note `iter_archive_items()` is already
+    safe (regex + exact compare); only the glob-based paths — `find_parents()`,
+    `_archive_snapshots()`, `_received_uuids_local()` — are exposed. Fix shape:
+    validate archive names once at load (`[A-Za-z0-9_-]`, reject '/', glob
+    metacharacters, leading '.' or '-', empty), which kills both halves at the
+    boundary. Deferred pending the security phase.
 
 17. Hooks run with check=False in run_hook(): a failing pre-snapshot hook
     (e.g. DB quiesce) is silently ignored and the snapshot is taken anyway.
@@ -130,7 +166,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
     _check_interrupted_rsync now has a 10s timeout; timeout/OSError means
     "no interruption detected" rather than an indefinite hang.
 
-## Improvements (not bugs) — 21, 25, 26, 31 open
+## Improvements (not bugs) — 21, 31 open
 
 21. _size_of walks the whole snapshot summing logical sizes, then compares
     against free space before an INCREMENTAL send -> false "insufficient
@@ -171,11 +207,25 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 24. FALSE POSITIVE: crc32c is live — _parse_stream_prefix validates the
     stream CRC via it, reached by is_btrfs_stream and stream_snapshot_name.
 
-25. --config only accepted before the subcommand (top-level parser only;
-    `bubtrsnap list --config x` fails).
+25. DONE (59c7d16): `--config` is accepted after a subcommand — the
+    maintenance sub-parsers share the global option set. Re-verified
+    2026-10-22: `bubtrsnap list --config examples/basic.toml` parses the
+    config (it only fails on this machine's non-btrfs `/var/lib`). The
+    original note was stale.
 
-26. SKILL.md version field tracks the latest release; keep in sync at each
-    ship (currently 0.4.1).
+26. DONE (56ad416) for the dev-build identification half: `build_identity()`
+    reads branch, short commit and dirty state from the git checkout the script
+    lives in, cached once per process, and `version_string()` renders
+    `bubtrsnap 0.4.2.dev0 (maintain 28c32ba)` — printed by `--version` and
+    logged at verbosity 2 at the start of every backup or maintenance run, so a
+    dogfooded build names itself in bug reports. The hash is deliberately kept
+    out of VERSION: PEP 440 rejects `0.4.2.dev28c32ba`, and pyproject.toml reads
+    VERSION as the project version. An installed wheel has no git metadata and
+    falls back to VERSION alone. Tests: unittests/test_build_identity.py (10).
+    Still open as housekeeping: the `version:` field in
+    ~/.hermes/skills/software-development/bubtrsnap/SKILL.md needs a policy — it
+    reads 0.4.2.dev0 (the dev tip) rather than the latest release; settle it at
+    ship time.
 
 ## Receive-output parsing (verified 2026-10-21 empirically; both fixed)
 
@@ -248,7 +298,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (211 across 13 files); no secrets, eval/exec, pickle; stderr
+- All tests pass (273 across 17 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
@@ -262,8 +312,10 @@ only because ts are 12-digit padded.
 
 ## Suggested sequencing (open items only)
 
-Phase 1 (security): 13, 12, 14, 15+16
-Phase 2 (validation/consistency): 10 (probe first), 11
-Phase 3 (improvements): 21, 25, 26, 31
+Done 2026-10-22: 10, 11, 32 (plus 25 verified already fixed and 26's build
+identity).
+
+Phase 1 (security, deferred by decision on 2026-10-22): 13, 12, 14, 15, 16
+Phase 2 (improvements): 21, 31
 
 Each item = one commit, test written first and proven red.
