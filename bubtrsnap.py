@@ -1691,7 +1691,14 @@ def build_ssh_receive_cmd(remote: str, remote_dir: str, cfg: dict, remote_sudo: 
     return build_ssh_cmd(remote, recv_cmd, remote_sudo)
 
 
-def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: dict, archive: str, archive_cfg: dict | None = None) -> Path:
+def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: dict, archive: str, archive_cfg: dict | None = None,
+                local_parents: list[Path] | None = None) -> Path:
+    """Send the snapshot to the local backup_dir and/or the SSH remote.
+
+    local_parents: parents already discovered by the caller (the space guard
+    needs them to tell a full send from an incremental one).  When omitted they
+    are looked up here.
+    """
     # Check if SSH remote is configured
     remote = archive_cfg.get("remote_host") if archive_cfg else cfg.get("remote_host")
     remote_dir = archive_cfg.get("remote_path") if archive_cfg else cfg.get("remote_path")
@@ -1708,7 +1715,8 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
 
     if has_local:
         start_time = datetime.now()
-        local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
+        if local_parents is None:
+            local_parents = find_parents(archive, snapshot_dir, backup_dir, cfg)
         log(f"Found {len(local_parents)} local parent(s) for {archive}", 1, cfg["verbose"])
 
         local_send_cmd = btrfs_cmd(cfg, "send")
@@ -2874,15 +2882,24 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
         log("Starting backup...", 1, cfg["verbose"])
 
         # Space check before writing the backup (portable du/df-style).
-        # Hard-stop (non-zero exit) if the estimate won't fit; warn when tight.
+        # Only a full send can be fit-checked: an incremental send writes just
+        # the parent/child delta, which btrfs cannot report in advance, so for
+        # it the whole-snapshot estimate is meaningless and we fall back to a
+        # low-space warning that never aborts (TODO 21).
+        local_parents: list[Path] = []
         if backup_dir:
-            needed = _size_of(snap)
-            if not _space_check(backup_dir, needed, "backup", cfg):
-                raise SystemExit(1)
+            local_parents = find_parents(name, snap_dir, backup_dir, cfg)
+            if local_parents:
+                _low_space_warning(backup_dir, "backup (incremental send)", cfg)
+            else:
+                needed = _size_of(snap)
+                if not _space_check(backup_dir, needed, "backup (full send)", cfg):
+                    raise SystemExit(1)
 
         # send_file/send_dir are guaranteed None here by the elif chain, so
         # send_backup is the only route; it handles local, remote, or both.
-        dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive)
+        dest = send_backup(snap, snap_dir, backup_dir, cfg, name, archive,
+                           local_parents=local_parents)
 
         run_hook(archive.get("post_backup_hook"),
                  _build_hook_context(name, snap, dest, backup_dir, remote, remote_dir, cfg), cfg)
@@ -3410,6 +3427,14 @@ def _run_maintenance(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Space estimation (portable du/df-style)
 
+# An incremental send only writes the delta between parent and child, which
+# btrfs cannot report in advance.  The whole-snapshot estimate is therefore
+# only usable for a full send; for an incremental send the guard degenerates
+# to this free-space floor (TODO 21).  Hard-coded for now; promoting it to a
+# config key is a later improvement.
+LOW_SPACE_FRACTION = 0.25
+
+
 def _disk_free(path: Path) -> int:
     """Free bytes on the filesystem containing `path` (df-style)."""
     return shutil.disk_usage(str(path)).free
@@ -3442,7 +3467,12 @@ def _human_size(nbytes: int) -> str:
 
 def _space_check(target: Path, needed: int, label: str, cfg: dict) -> bool:
     """Hard-stop (False) if `needed` won't fit in free space at `target`;
-    otherwise warn when it would consume >=25% of free space; return True."""
+    otherwise warn when it would consume >=25% of free space; return True.
+
+    Only meaningful for a FULL send: an incremental send writes only the delta
+    between parent and child, and btrfs cannot report that size in advance
+    (no --dry-run, and `btrfs qgroup` 'excl' counts extents unique to a
+    subvolume, not the parent/child delta).  See _low_space_warning()."""
     if needed <= 0:
         return True
     try:
@@ -3459,6 +3489,31 @@ def _space_check(target: Path, needed: int, label: str, cfg: dict) -> bool:
     if needed / free >= 0.25:
         log(f"[space] {label}: need {_human_size(needed)} of {_human_size(free)} free "
             f"({needed / free * 100:.0f}%) — low space, proceeding.", 1, cfg["verbose"])
+    return True
+
+
+def _low_space_warning(target: Path, label: str, cfg: dict) -> bool:
+    """Warn (never abort) when `target` has less than LOW_SPACE_FRACTION of its
+    capacity free.  Used for incremental sends, whose true size btrfs cannot
+    report in advance: there is nothing to fit-check, so the only guard is this
+    floor.  Returns True when there is headroom, False when the warning fired."""
+    try:
+        usage = shutil.disk_usage(str(target))
+    except OSError:
+        log(f"[space] cannot measure free space at {target}", 1, cfg["verbose"])
+        return True
+    free, total = usage.free, usage.total
+    if total <= 0:
+        return True
+    if free <= 0:
+        log(f"[space] {label}: no free space at {target} — the send will fail "
+            f"if the delta does not fit.", 1, cfg["verbose"])
+        return False
+    if free / total < LOW_SPACE_FRACTION:
+        log(f"[space] {label}: only {_human_size(free)} free at {target} "
+            f"({free / total * 100:.0f}% of {_human_size(total)}) — low space, "
+            f"an incremental send may not fit.", 1, cfg["verbose"])
+        return False
     return True
 
 
@@ -3874,18 +3929,26 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                 arrow = "-"
             log(f"    {ts:<20} {it['action']:<38} {arrow}", 1, cfg["verbose"])
 
-        # Phase 3: report the memory/space requirement, then hard-stop if it
-        # won't fit (warning emitted by _space_check when >=25% of free is used).
+        # Phase 3: report the space requirement, then hard-stop only when the
+        # restores would be full sends.  A restore that has a usable parent is
+        # incremental, and btrfs cannot report the delta size in advance, so
+        # there `needed` is only an upper bound and the guard drops to the
+        # low-space floor warning (TODO 21).
         if needed > 0:
             target = bak_d or (snap_d or Path("."))
-            try:
-                free = _disk_free(target)
-            except OSError:
-                free = 0
-            log(f"    memory required: {_human_size(needed)} "
-                f"(free at {target.name or target}: {_human_size(free)})", 1, cfg["verbose"])
-            if not _space_check(target, needed, f"backup for {name}", cfg):
-                continue  # _space_check already logged the reason; preview above is shown
+            if bak_d and snap_d and snap_d.is_dir() and find_parents(name, snap_d, bak_d, cfg):
+                log(f"    backup data to restore (upper bound): {_human_size(needed)}",
+                    1, cfg["verbose"])
+                _low_space_warning(target, f"backup for {name}", cfg)
+            else:
+                try:
+                    free = _disk_free(target)
+                except OSError:
+                    free = 0
+                log(f"    memory required: {_human_size(needed)} "
+                    f"(free at {target.name or target}: {_human_size(free)})", 1, cfg["verbose"])
+                if not _space_check(target, needed, f"backup for {name}", cfg):
+                    continue  # _space_check already logged the reason; preview above is shown
 
         # Snapshot-space guard: restoring a lost snapshot from the remote writes
         # a full subvolume into snapshot_dir (a different filesystem from
