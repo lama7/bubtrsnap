@@ -22,6 +22,56 @@ from typing import Any
 
 VERSION = "0.4.2.dev0"
 
+_BUILD_IDENTITY: str | None = None
+
+
+def _git(repo: Path, *args: str) -> str | None:
+    """Run a git command in *repo*; return stripped stdout, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo)] + list(args),
+            capture_output=True, text=True, timeout=5, check=True
+        )
+        return result.stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
+def build_identity() -> str:
+    """Human-readable build stamp: '<branch> <commit>', plus 'uncommitted' if dirty.
+
+    Taken from the git checkout this file lives in, so a dogfooded dev build
+    identifies itself in --version and in the run log. Returns "" when git is
+    unavailable (installed wheel, copied script) — callers then show VERSION
+    alone. The commit hash is deliberately kept OUT of VERSION: PEP 440 rejects
+    '0.4.2.dev28c32ba', and setuptools reads VERSION as the project version.
+    """
+    global _BUILD_IDENTITY
+    if _BUILD_IDENTITY is not None:
+        return _BUILD_IDENTITY
+
+    repo = Path(__file__).resolve().parent
+    commit = _git(repo, "rev-parse", "--short", "HEAD")
+    if commit:
+        branch = _git(repo, "branch", "--show-current") or "detached HEAD"
+        try:
+            dirty = subprocess.run(
+                ["git", "-C", str(repo), "diff", "--quiet"],
+                capture_output=True, timeout=5
+            ).returncode != 0
+        except (subprocess.SubprocessError, OSError):
+            dirty = False
+        _BUILD_IDENTITY = f"{branch} {commit}" + (" uncommitted" if dirty else "")
+    else:
+        _BUILD_IDENTITY = ""
+    return _BUILD_IDENTITY
+
+
+def version_string() -> str:
+    """Full version line, e.g. 'bubtrsnap 0.4.2.dev0 (maintain 28c32ba)'."""
+    identity = build_identity()
+    return f"bubtrsnap {VERSION} ({identity})" if identity else f"bubtrsnap {VERSION}"
+
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -2889,7 +2939,7 @@ def _maint_first_positional(tokens) -> int | None:
 def _add_maint_global_options(p: argparse.ArgumentParser) -> None:
     """Register the options shared by every sub-parser.  These mirror the
     legacy main() definitions verbatim (types, metavar, help, defaults)."""
-    p.add_argument("--version", action="version", version=f"bubtrsnap {VERSION}")
+    p.add_argument("--version", action="version", version=version_string())
     p.add_argument("--config", type=Path,
         help="Path to TOML configuration file (default: ~/.config/bubtrsnap.toml)")
     p.add_argument("--snapshot-dir", type=str,
@@ -3138,6 +3188,7 @@ def _run_backup(args: argparse.Namespace) -> int:
 
     global_cfg["verbose"] = verbosity
     global_cfg["dry_run"] = args.dry_run
+    log(version_string(), 2, verbosity)
 
     # see if we're doing a recv only operation....
     receive_only = all(
@@ -3221,6 +3272,7 @@ def _run_maintenance(args: argparse.Namespace) -> int:
 
     global_cfg["verbose"] = verbosity
     global_cfg["dry_run"] = args.dry_run
+    log(version_string(), 2, verbosity)
     if not archives:
         print("No archives to process.", file=sys.stderr)
         return 1
