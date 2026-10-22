@@ -153,19 +153,41 @@ _BLOCKED_RSYNC_OPTS = frozenset({
     "--no-whole-file", "--old-dirs",
 })
 
+# Blocked options that consume the NEXT token as their argument. When one of
+# these is stripped, its argument must be stripped too, otherwise the orphan
+# value becomes a positional rsync source (rsync then tries to transfer it).
+_RSYNC_OPTS_WITH_VALUE = frozenset({
+    "--partial-dir", "--backup-dir", "--suffix", "--out-format", "--info",
+    "--files-from", "--files-from0", "--files-from-dir",
+    "--bwlimit", "--port", "--address", "--bind-address", "--contimeout",
+    "--timeout", "--rsh", "--rsync-path", "--password-file",
+    "--filter", "--filter-from", "--exclude", "--exclude-from",
+    "--include", "--include-from", "--link-dest",
+    "--chmod", "--chown", "--checksum-seed",
+    "--time-dir", "--stop-at",
+    "--read-batch", "--write-batch", "--only-write-batch",
+})
+
 
 def _filter_rsync_opts(user_opts: str | None) -> list[str]:
     """
     Parse user-supplied rsync options string, filter out blocked options,
     and return a list of individual option tokens.
     Blocked options are reported via stderr to the user.
+
+    A blocked long option that takes its value as a separate token (e.g.
+    ``--exclude /tmp/foo``) also drops that value: leaving it behind would turn
+    it into a positional rsync source and rsync would try to transfer it.
     """
     if not user_opts:
         return []
     import shlex
     tokens = shlex.split(user_opts)
     filtered: list[str] = []
-    for tok in tokens:
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        i += 1
         # Strip '--option=value' to just '--option' for comparison
         opt_base = tok.split("=", 1)[0]
         # Expand combined short options: -avz → -a, -v, -z
@@ -190,6 +212,14 @@ def _filter_rsync_opts(user_opts: str | None) -> list[str]:
         if opt_base in _BLOCKED_RSYNC_OPTS:
             print(f"Warning: blocking unsafe rsync option {opt_base} from --rsync-opts",
                   file=sys.stderr)
+            # '--opt value' form: consume the value too so it is not left orphaned.
+            # Only when the value is a separate token ('=' form is self-contained)
+            # and the next token is not itself an option.
+            if "=" not in tok and opt_base in _RSYNC_OPTS_WITH_VALUE:
+                if i < len(tokens) and not tokens[i].startswith("-"):
+                    print(f"Warning: dropping argument '{tokens[i]}' of blocked "
+                          f"rsync option {opt_base}", file=sys.stderr)
+                    i += 1
             continue
         filtered.append(tok)
     return filtered

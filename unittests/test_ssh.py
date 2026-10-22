@@ -887,6 +887,53 @@ class TestRsyncOptionsFilter(unittest.TestCase):
         result = bs._filter_rsync_opts(opts)
         self.assertEqual(len(result), 0)
 
+    def test_blocked_option_value_not_left_orphaned(self):
+        """A blocked option that takes a separate argument must also drop its
+        value, otherwise the orphan token becomes a positional rsync source."""
+        opts = "--exclude /tmp/stream.btrfs --compress"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(result, ["--compress"])
+
+    def test_partial_dir_with_separate_value_dropped(self):
+        opts = "--partial-dir /tmp/whatever --compress"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(result, ["--compress"])
+
+    def test_valueless_blocked_option_keeps_next_token(self):
+        """--delete takes no argument; the next token must survive."""
+        opts = "--delete --compress"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(result, ["--compress"])
+
+    def test_option_followed_by_option_keeps_next_token(self):
+        opts = "--filter --compress"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(result, ["--compress"])
+
+    def test_multiple_blocked_value_options(self):
+        opts = "--exclude foo --exclude bar --bwlimit 100 --compress"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(result, ["--compress"])
+
+    def test_orphan_value_drop_is_reported_on_stderr(self):
+        opts = "--exclude /tmp/secret"
+        from io import StringIO
+        import sys as _sys
+        old_stderr = _sys.stderr
+        _sys.stderr = StringIO()
+        try:
+            bs._filter_rsync_opts(opts)
+            output = _sys.stderr.getvalue()
+        finally:
+            _sys.stderr = old_stderr
+        self.assertIn("exclude", output)
+        self.assertIn("/tmp/secret", output)
+
+    def test_last_blocked_option_with_value_is_dropped(self):
+        opts = "--exclude foo"
+        result = bs._filter_rsync_opts(opts)
+        self.assertEqual(result, [])
+
 
 class TestRsyncAndReceive(unittest.TestCase):
     """Test _rsync_and_receive function."""
