@@ -1563,15 +1563,55 @@ def send_backup_tofile(snap: Path, snapshot_dir: Path, backup_dir: Path | None,
     return stream_file
 
 def _parse_at_subvol(text: str | None) -> str | None:
-    """Extract the subvolume name from 'At subvol <name>' output lines."""
+    """Extract the subvolume name from a btrfs receive banner line.
+
+    A full send prints 'At subvol <name>' (stderr); an incremental
+    (parent-bearing) send prints 'At snapshot <name>' (stdout).
+    """
     for line in (text or "").splitlines():
         line = line.strip()
-        if "At subvol" in line or "Receiving subvol" in line:
+        if "At subvol" in line or "At snapshot" in line or "Receiving subvol" in line:
             parts = line.split()
             for i, tok in enumerate(parts):
-                if tok in ("subvol", "subvolume") and i + 1 < len(parts):
+                if tok in ("subvol", "subvolume", "snapshot") and i + 1 < len(parts):
                     return parts[i + 1].strip("'\"")
     return None
+
+
+def _is_duplicate_receive(stderr: str | None) -> bool:
+    """True when btrfs receive failed because the target already exists.
+
+    btrfs-progs reports this as 'creating subvolume/snapshot ... failed: File
+    exists' — the older 'already exists' wording is kept for compatibility.
+    """
+    low = (stderr or "").lower()
+    return "already exists" in low or "file exists" in low
+
+
+def _received_subvol_name(stream: Path, result, cfg: dict, source: str) -> str:
+    """Name of the subvolume btrfs receive just created.
+
+    The stream header is authoritative: it carries the exact path receive used,
+    while the filename stem only mirrors it by convention (a renamed
+    export_file or a staged stream breaks the stem). The banner line is used as
+    a cross-check and as the fallback when the header cannot be read.
+    """
+    header = stream_snapshot_name(stream, cfg)
+    reported = (_parse_at_subvol((result.stdout if result else "") or "")
+                or _parse_at_subvol((result.stderr if result else "") or ""))
+
+    if header:
+        if reported and reported != header:
+            print(f"Warning: received-name mismatch: {source} says '{reported}' "
+                  f"but the stream header says '{header}'; using the header",
+                  file=sys.stderr)
+        return header
+    if reported:
+        return reported
+    if result is not None:
+        print(f"Warning: could not determine received subvolume name from "
+              f"{source}; assuming '{stream.stem}'", file=sys.stderr)
+    return stream.stem
 
 
 def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
@@ -1603,23 +1643,15 @@ def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
         capture_output=True, check=False)
 
     if ssh_result is not None and ssh_result.returncode != 0:
-        if "already exists" in stderr.lower():
+        if _is_duplicate_receive(stderr):
             print(f"Warning: subvolume from '{stream.name}' already exists in "
                   f"{remote_dir} – skipping", file=sys.stderr)
             return None
         print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # Extract subvolume name reported by btrfs (stdout or stderr)
-    subvol_name = _parse_at_subvol(stderr) or _parse_at_subvol(
-        (ssh_result.stdout if ssh_result else "") or ""
-    )
-    if not subvol_name and ssh_result is not None:
-        print(f"Warning: could not determine received subvolume name from remote "
-              f"btrfs output; assuming '{stream.stem}'", file=sys.stderr)
-        subvol_name = stream.stem
-    if not subvol_name:
-        subvol_name = stream.stem
+    # The stream header is authoritative; the receive banner is a cross-check
+    subvol_name = _received_subvol_name(stream, ssh_result, cfg, "remote btrfs output")
 
     log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
     return subvol_name
@@ -1767,19 +1799,14 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
     stderr = (result.stderr or "").strip()
 
     if result.returncode != 0:
-        if "already exists" in stderr.lower():
+        if _is_duplicate_receive(stderr):
             print(f"Warning: subvolume from '{stream.name}' already exists in "
                   f"{backup_dir} – skipping", file=sys.stderr)
             return None
         print(f"Error receiving '{stream}' locally:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
-    name = _parse_at_subvol(result.stdout) or _parse_at_subvol(result.stderr)
-    if not name:
-        print(f"Warning: could not determine received subvolume name from btrfs "
-              f"output; assuming '{stream.stem}'", file=sys.stderr)
-        name = stream.stem
-    return name
+    return _received_subvol_name(stream, result, cfg, "btrfs receive output")
 
 
 def _receive_remote(stream: Path, remote: str, remote_dir: str, cfg: dict,
