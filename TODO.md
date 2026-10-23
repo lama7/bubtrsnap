@@ -169,7 +169,7 @@ still deferred by decision)
     _check_interrupted_rsync now has a 10s timeout; timeout/OSError means
     "no interruption detected" rather than an indefinite hang.
 
-## Improvements (not bugs) — 33b open
+## Improvements (not bugs) — all done (33b closed 2026-10-23)
 
 21. DONE (62a710a, 5b8fa1a, 29ed2cf): the fit check now runs only for FULL sends. btrfs cannot
     report an incremental stream's size in advance — verified empirically:
@@ -389,13 +389,61 @@ still deferred by decision)
 
     Not done here, split out as 33b below.
 
-33b. Open: the same question for `snapshot_dir`.  A snapshot directory cannot be
-    judged by the Received UUID (a `snapshot -r` has none), so detecting a
-    half-written *snapshot* needs a different signal — probably comparing the
-    subvolume's generation against the source's, or checking the send/receive
-    banner.  Deferred until there is a case that actually bites: rebuild's
-    snapshot legs cannot be classified either (TODO 35 progress note (2) says the
-    metadata-only leg carries no stderr).
+33b. DONE (5f9c62c; closed 2026-10-23): the same question for `snapshot_dir`,
+    answered by the read-only flag instead of the Received UUID.
+
+    Why the UUID rule cannot travel there: a `snapshot -r` writes no Received
+    UUID, so judging a snapshot pool by it would call every snapshot broken.  What
+    a usable snapshot does have is the flag: `subvolume snapshot -r` sets it,
+    `btrfs receive` creates the subvolume readonly, and both `btrfs send <path>`
+    and `-p`/`-c <parent>` refuse a writable one ("ERROR: parent subvolume ... is
+    not read-only").  Probed on stryder (btrfs-progs 6.14) and thorin (7.1):
+
+    - `subvolume list -r <dir>` is the only listing that reports the flag, and it
+      is a filter rather than a column: no combination of -u -R -p -o -s -c -t -a
+      prints it (-t prints a header-only table).  So the snapshot scan cannot ride
+      on the listing the destination walk already runs; it costs one extra
+      read-only call per pool per run, cached in `cfg["_readonly_seen"]` like the
+      other scans.  `-p` is added because a listing is filesystem-wide: without the
+      parent column a nested subvolume, or another pool's identically named
+      archive, looks like a direct child.  The pool's own ID comes from
+      `_get_subvolume_id`, now cached on cfg so the UUID map and this scan share
+      one `show`.  A build that rejects `-r` falls back to one `subvolume show` per
+      candidate and reads its `Flags:` line.  If neither can be done the scan
+      returns "unknown" and nothing is labelled or deleted.
+    - `-o` is still deliberately never used (it makes the path column
+      fs-root-relative and would break the delete paths `iter_archive_items_ssh`
+      builds), so direct children are identified by the parent ID, not the path.
+    - `snapshot -r` onto an existing writable directory silently nests: it creates
+      `<name>/src` inside it instead of replacing it.  That is why `rebuild`
+      refuses such a leg instead of attempting it.
+    - A `snapshot -r` that fails leaves nothing behind — existing name -> "Could
+      not create subvolume: Read-only file system", missing parent dir -> "Could
+      not open: No such file or directory", plain-file target -> "exists and it is
+      not a directory" — so the only ways an archive-named writable child appears in
+      snapshot_dir are a receive that died mid-stream (rebuild's remote ->
+      snapshot_dir leg), a snapshot made without -r, or `btrfs property set <path>
+      ro false`.  `stat` mode bits are identical (755) for both, so they are useless
+      as a signal.
+    - A partial still consumes the space the receive used, which is why the report
+      leads with the delete command.
+
+    Shape, as agreed 2026-10-23: report-only by default; deletion stays behind the
+    existing opt-in `--prune-partial-subvolumes`, no new flag.  The label is
+    "incompat", not "partial": nothing received these, so "half-written" is not the
+    claim being made — only that bubtrsnap cannot use them.  They are excluded from
+    keep-policy slot counting (`incompat` on `_apply_keep_policy_core`), printed as
+    `incompat` in `list`'s snapshot column, subtracted from the snapshot set when
+    `rebuild` plans, refused as a snapshot or remote-restore target, and filtered
+    out of `_archive_snapshots` so they are never offered as an incremental parent.
+    Only `snapshot_dir` is scanned; a remote destination is never one, so there the
+    Received UUID rule still applies.  When `snapshot_dir == backup_dir` both rules
+    run on the same directory.  A failed receive into snapshot_dir records its own
+    orphan (`_mark_incompat`), since the scan only knows what the pool held when it
+    was last walked.
+    - Tests: unittests/test_snapshot_incompat.py (27); listing counts in
+      test_find_parents.py and test_ssh.py account for the extra `list -r` call and
+      assert the read-only scan never reaches the remote.
 
 34. DONE (493d71f): `_run_rebuild` swallowed failures.  Phase 4 logged remote
     re-send and remote->local restore failures at level 3 (invisible at the
@@ -509,7 +557,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (418 across 23 files, re-run 2026-10-23); no secrets, eval/exec, pickle; stderr
+- All tests pass (445 across 24 files, re-run 2026-10-23); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
@@ -528,8 +576,8 @@ identity), then the two easy security items 15 and 16, then 21 (space guard)
 and 34 (rebuild exit code).
 
 Phase 1 (security, deferred by decision on 2026-10-22): 13, 12, 14
-Phase 2 (improvements): 33b (31 closed 2026-10-23 as housekeeping outside the
-repo; 33 and 35 are done: 35 is the disk-full sentinel, 33 the orphan it renames;
-33b is the snapshot_dir question)
+Phase 2 (improvements): closed. 33b done 2026-10-23 (5f9c62c), 31 closed the same
+day as housekeeping outside the repo, 33 and 35 done before that (35 is the
+disk-full sentinel, 33 the orphan it renames).  Nothing left in phase 2.
 
 Each item = one commit, test written first and proven red.

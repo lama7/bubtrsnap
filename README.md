@@ -290,8 +290,58 @@ Run with --prune-partial-subvolumes to remove such leftovers automatically.
 Detection is deliberately fail-closed: if the destination cannot be listed, or
 the UUID columns are not available (older btrfs-progs on a remote falls back to
 the plain listing it used to run), nothing is classified as partial and nothing
-is ever deleted on a guess.  `snapshot_dir` is never judged, because a snapshot
-made with `btrfs snapshot -r` has no Received UUID either.
+is ever deleted on a guess.  `snapshot_dir` is not judged this way, because a
+snapshot made with `btrfs subvolume snapshot -r` has no Received UUID either —
+the rule would call every snapshot broken.  What a snapshot pool *can* be judged
+by is the read-only flag, which is the next section.
+
+### When snapshot_dir holds something bubtrsnap cannot use
+
+Only a read-only subvolume can be sent, and only a read-only subvolume can be
+used as an incremental parent with `-p`/`-c`.  `bubtrsnap` snapshots with
+`btrfs subvolume snapshot -r`, so every archive it wrote in `snapshot_dir` carries
+that flag.  A child with an archive name that does not carry it is not an archive
+`bubtrsnap` can use, whatever made it: `snapshot` without `-r`, `btrfs property
+set <path> ro false`, or a `btrfs receive` that died mid-stream while `rebuild`
+was recovering a snapshot that only exists on the remote.
+
+The flag is read with one extra read-only call per snapshot pool per run,
+`btrfs subvolume list -r -p <snapshot_dir>`.  `-r` is the only listing that
+reports it — it is a filter rather than a column, so no combination of
+`-u -R -p -o -s -c -t -a` shows it — and a listing is filesystem-wide, so `-p`
+plus the pool's own subvolume ID keeps nested and other-pool entries out.  A
+btrfs-progs that rejects `-r` falls back to one `subvolume show` per candidate and
+reads its `Flags:` line; a pool that cannot be scanned at all is left alone.  Only
+`snapshot_dir` is scanned, never a remote destination: everything there was
+received, so the Received UUID rule above is the right one there.  When
+`snapshot_dir` and `backup_dir` are the same directory both rules run on it, and
+an entry caught by either is unusable.
+
+```
+Unusable snapshot: /snap holds 1 incompat subvolume(s) named like an archive that
+btrfs does not mark read-only:
+    lama7.202601010000
+Only a read-only subvolume can be sent, or used as an incremental parent, so these
+are not archives bubtrsnap can use: the keep policy, `list` and `rebuild` all
+ignore them.  A receive that died mid-stream leaves exactly this, and so does a
+snapshot made without -r.  They still hold the space they used, so removing them
+frees it:
+    btrfs subvolume delete /snap/lama7.202601010000
+  or: bubtrsnap prune lama7 --ts 202601010000
+Run with --prune-partial-subvolumes to remove such leftovers automatically.
+```
+
+Such an entry is called **incompat**, not partial: nothing received it, so
+"half-written" is not the claim being made — only that `bubtrsnap` cannot use it.
+Like a partial receive it is kept out of the keep policy's slot counting, so the
+corrupt newest entry cannot push a real archive out of a slot, and like a partial
+it is removed only if `--prune-partial-subvolumes` was set.  `list` prints
+`incompat` in the snapshot column instead of `yes`, and `rebuild` plans around it:
+`btrfs subvolume snapshot -r` onto an existing writable directory does not
+overwrite it, it nests a new subvolume inside it, so a snapshot leg whose target
+name is already such an entry is refused and counted as a failure rather than
+attempted.  A failed receive into `snapshot_dir` records its own orphan, so the
+legs still queued for that pool in the same run see it.
 
 ## Stream files
 
@@ -531,8 +581,9 @@ behaviour when no subcommand is given.
 **`bubtrsnap list [ARCHIVE ...]`** — read-only table of the snapshot / backup /
 remote timestamps that exist for each archive. All config archives are shown if
 none are named. A backup or remote entry left by a receive that never finished
-is labelled `partial` rather than `yes` (see *When a receive dies for another
-reason*).
+is labelled `partial` rather than `yes`, and a `snapshot_dir` entry that btrfs
+does not mark read-only is labelled `incompat` (see *When a receive dies for
+another reason* and *When snapshot_dir holds something bubtrsnap cannot use*).
 
 **`bubtrsnap prune --ts TS [ARCHIVE ...]`** — delete snapshot/backup subvolumes
 matching the given timestamp(s). `--ts` takes a single timestamp
@@ -562,8 +613,9 @@ backup to restore, so its remote re-send happens in the same run. Run
 A restore that was attempted and failed is reported at verbosity 1 and `rebuild`
 exits 1 when any action failed; an action the space guard chose not to attempt
 is a skip, not a failure, and does not change the exit code.  A partial receive
-(see above) does not count as a backup, so a leg that would have to receive over
-one is refused and counted as a failure.
+(see above) does not count as a backup, and an `incompat` entry does not count as
+a snapshot, so a leg that would have to receive over one, or snapshot into one, is
+refused and counted as a failure.
 
 Examples:
 
@@ -695,7 +747,9 @@ snapshot_dir = "/pool/snapshots"
 backup_dir   = "/backup"
 
 # Off by default: a run only reports such subvolumes and prints the delete
-# command.  Set per archive too, if only one archive should be pruned this way.
+# command.  Covers both a receive that died mid-stream in a backup or remote
+# pool and a snapshot_dir entry btrfs does not mark read-only.  Set per archive
+# too, if only one archive should be pruned this way.
 prune_partial_subvolumes = true
 
 [home]
