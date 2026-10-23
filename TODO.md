@@ -12,7 +12,8 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (tip 29ed2cf, VERSION 0.4.2.dev0). All DONE
+- `maintain` — working branch (last code change 493d71f, VERSION 0.4.2.dev0;
+  docs-only commits trail the code tip). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
   `bubtrsnap --version` now also prints the branch/commit it was built from,
@@ -345,6 +346,72 @@ still deferred by decision)
     before the pipe runs) or at least report it with a `btrfs subvolume delete`
     hint; a test would need a loopback btrfs with a truncated stream.
 
+34. DONE (493d71f): `_run_rebuild` swallowed failures.  Phase 4 logged remote
+    re-send and remote->local restore failures at level 3 (invisible at the
+    default verbosity) and returned 0 no matter what happened, so a rebuild
+    whose receive died half-way reported success.  Every phase-4 failure is now
+    logged at level 1, counted in a `failed` list, summarised on stderr
+    unconditionally (`Error: N rebuild action(s) failed: ...`), and the
+    subcommand exits 1.  A leg the item-21 space guard chose not to attempt is
+    still a skip, not a failure, so it does not change the exit code — that is
+    deliberate and pinned by a test.  Tests:
+    unittests/test_rebuild.py `TestRebuildFailureReporting` (6).
+
+35. Open (design agreed 2026-10-22, builds on 33 and 34): a full-disk partial
+    receive should leave a visible, self-clearing flag instead of silent
+    garbage.  The minimum correct action is already 34 (report + exit non-zero);
+    everything below is courtesy, but it is courtesy a space guard cannot
+    provide, because an incremental send's size is unknowable in advance
+    (item 21), so "the pool already has a partial in it" is the only reliable
+    signal that further sends are a bad idea.
+
+    Shape:
+    - Classify before acting.  Only an ENOSPC-class failure sets the flag:
+      "No space left on device" or "writing to ... failed".  "short read from
+      stream" (dropped ssh pipe), "File exists", and permission errors are NOT
+      disk-full and must not block future runs.  A helper `_is_enospc(stderr)`
+      beside `_is_duplicate_receive`; the partial still exists in those cases
+      and is only reported.
+    - Rename, don't delete: `.bubtrsnap-diskfull-{archive}-{ts}`.  Dot-prefixed
+      and hyphenated so it cannot match `_ARCHIVE_TS_RE`
+      (`^(.+)\.(\d{12})$`) — keep policy and every rebuild scan ignore it.
+      Archive + ts in the name so two different archives hitting the same pool
+      do not collide.  Rename beats delete empirically: it worked on a 100 %
+      full pool (3-7 ms), needs no CAP_SYS_ADMIN, and is reversible;
+      `btrfs subvolume delete` took 38-41 ms and left ~23 s of background
+      extent cleaning, and neither `df` nor `btrfs filesystem usage` showed the
+      reclaimed space straight after the delete or after `btrfs subvolume sync`.
+      btrfs-progs 7.1 has no `subvolume rename`, so a plain `mv` inside the same
+      parent directory is the operation (subvolid and UUID preserved,
+      `Received UUID: -` retained; `mv` across subvolumes fails with EXDEV).
+    - Detect on every run, in backup and rebuild alike: scan the destination
+      directory for the prefix.  Locally a sibling pass in `iter_archive_items`
+      (already walking that directory); remotely piggyback on the `btrfs
+      subvolume list` that `iter_archive_items_ssh` already runs, so no extra
+      SSH round trip.
+    - Scope is per destination: a sentinel in `backup_dir` blocks that archive's
+      local send/receive legs, a sentinel on the remote blocks only the remote
+      leg (a full remote must not cancel a local backup, same rule as item 21).
+      Keep-policy pruning still runs — it frees space and cannot see the
+      sentinel.  Metadata-only snapshots are unaffected.
+    - Exit code stays 1: there is no exit-code taxonomy in the codebase (every
+      failure path is `sys.exit(1)`), and a greppable message is enough.
+    - Dry-run cannot create the condition (no receives happen), but it must
+      detect a pre-existing sentinel and report the block exactly as a live run
+      would.  The rename itself is a mutation, so it goes through
+      `run(..., dry_run=cfg["dry_run"])`.
+    - The flag is self-clearing by design: the sentinel *is* the space the
+      failed receive ate, so the message's single command —
+      `btrfs subvolume delete /backup/.bubtrsnap-diskfull-...` — removes both
+      the block and the garbage.  Do not auto-clear it when free space looks
+      sufficient; that reintroduces the guessing the sentinel exists to remove.
+    - Deliberately not doing: a quarantine sweep (the self-clearing sentinel
+      makes it redundant).
+
+    Commits: (1) 34 above; (2) `_is_enospc` + rename in `_receive_local`,
+    `_receive_on_remote` and rebuild phase 4; (3) detection + per-destination
+    blocking incl. dry-run reporting; (4) docs.
+
 ## Keep-algorithm audit notes (no changes made, per instruction)
 
 Correct across 7 scenarios. Observations only: total kept can be less than
@@ -354,7 +421,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (332 across 20 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
+- All tests pass (338 across 20 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
@@ -369,9 +436,11 @@ only because ts are 12-digit padded.
 ## Suggested sequencing (open items only)
 
 Done 2026-10-22: 10, 11, 32 (plus 25 verified already fixed and 26's build
-identity), then the two easy security items 15 and 16.
+identity), then the two easy security items 15 and 16, then 21 (space guard)
+and 34 (rebuild exit code).
 
 Phase 1 (security, deferred by decision on 2026-10-22): 13, 12, 14
-Phase 2 (improvements): 31, 33
+Phase 2 (improvements): 31, 33, 35 (35 is the disk-full sentinel; 33 is the
+orphan it renames)
 
 Each item = one commit, test written first and proven red.

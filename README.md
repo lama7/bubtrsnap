@@ -462,6 +462,9 @@ remote is recovered as a local snapshot on the first run and gets its local
 backup filled in on the second.  An archive with no `backup_dir` has no local
 backup to restore, so its remote re-send happens in the same run. Run
 `bubtrsnap list` to confirm all three locations line up before calling it done.
+A restore that was attempted and failed is reported at verbosity 1 and `rebuild`
+exits 1 when any action failed; an action the space guard chose not to attempt
+is a skip, not a failure, and does not change the exit code.
 
 Examples:
 
