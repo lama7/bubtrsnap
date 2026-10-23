@@ -12,7 +12,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (last code change cf886cd, VERSION 0.4.2.dev0;
+- `maintain` — working branch (last code change 9e1c448, VERSION 0.4.2.dev0;
   docs-only commits trail the code tip). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
@@ -169,7 +169,7 @@ still deferred by decision)
     _check_interrupted_rsync now has a 10s timeout; timeout/OSError means
     "no interruption detected" rather than an indefinite hang.
 
-## Improvements (not bugs) — 31 and 33b open
+## Improvements (not bugs) — 33b open
 
 21. DONE (62a710a, 5b8fa1a, 29ed2cf): the fit check now runs only for FULL sends. btrfs cannot
     report an incremental stream's size in advance — verified empirically:
@@ -331,8 +331,16 @@ still deferred by decision)
     unittests/test_ssh.py only passed because its mock raised the exception by
     hand — it now reflects real behaviour.
 
-31. Housekeeping outside the repo: `~/.hermes/skills/.usage.json` still lists the
-    deleted `btrfs-ssh-backup` skill.
+31. DONE (2026-10-23): housekeeping outside the repo.  The deleted
+    `btrfs-ssh-backup` skill was still listed in `~/.hermes/skills/.usage.json`
+    with `state: "active"`, 3 uses, 3 views — a ledger entry for a skill that no
+    longer exists anywhere on disk (unlike the other removed skills, it has no
+    directory under `.archive/`, so the usual `state: "archived"` +
+    `archived_at` convention does not apply and the key is simply dropped).
+    Nothing in the repo is involved: no code, no test, no README change, so this
+    bookkeeping commit is the only trace.  The pre-edit ledger is backed up at
+    `/tmp/opencode/usage.json.bak-2026-10-23`, and Hermes will re-create an entry
+    if that skill name ever reappears.
 
 33. DONE (9e1c448; found while probing TODO 21 on 2026-10-22): a receive
     that dies half-way — the send stream truncated, the ssh pipe cut — leaves the
@@ -520,7 +528,8 @@ identity), then the two easy security items 15 and 16, then 21 (space guard)
 and 34 (rebuild exit code).
 
 Phase 1 (security, deferred by decision on 2026-10-22): 13, 12, 14
-Phase 2 (improvements): 31, 33b (33 and 35 are done: 35 is the disk-full
-sentinel, 33 the orphan it renames; 33b is the snapshot_dir question)
+Phase 2 (improvements): 33b (31 closed 2026-10-23 as housekeeping outside the
+repo; 33 and 35 are done: 35 is the disk-full sentinel, 33 the orphan it renames;
+33b is the snapshot_dir question)
 
 Each item = one commit, test written first and proven red.
