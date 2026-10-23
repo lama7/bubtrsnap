@@ -162,7 +162,7 @@ class TestSentinelDetection(Base):
         with mock.patch.object(bs, "run", side_effect=Runner()):
             bs._mark_diskfull("/backup", "big.202602010000", cfg)
             self.assertTrue(bs._diskfull_blocked("/backup", cfg))
-        self.assertEqual(cfg["_diskfull_seen"][("/backup", None)], [SENTINEL])
+        self.assertEqual(cfg["_dest_seen"][("/backup", None)]["sentinels"], [SENTINEL])
 
     def test_a_blocked_destination_is_not_rescanned_by_the_next_leg(self):
         """Two legs into the same pool in one run: the second uses the cache,

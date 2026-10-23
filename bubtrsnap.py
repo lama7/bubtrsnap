@@ -99,6 +99,9 @@ DEFAULT_CONFIG = {
     "dry_run": False,
     "rsync": False,
     "rsync_opts": None,
+    # TODO 33: delete subvolumes a receive left half-written.  Off by default:
+    # removing a subvolume is destructive, so the run only reports them.
+    "prune_partial_subvolumes": False,
 }
 
 # Day name to weekday (Mon=0 ... Sun=6)
@@ -635,6 +638,7 @@ ALLOWED_GLOBAL_OPTIONS = {
     "dry_run": bool,
     "rsync": bool,
     "rsync_opts": str,
+    "prune_partial_subvolumes": bool,
 }
 
 ALLOWED_ARCHIVE_OPTIONS = {
@@ -662,6 +666,7 @@ ALLOWED_ARCHIVE_OPTIONS = {
     "stage_dir": str,
     "rsync": bool,
     "rsync_opts": str,
+    "prune_partial_subvolumes": bool,
 }
 
 _KEEP_COUNT_KEYS = ("keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly")
@@ -906,6 +911,11 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
     cli_rsync_opts = getattr(cli, "rsync_opts", None)
     if cli_rsync_opts:
         global_cfg["rsync_opts"] = cli_rsync_opts
+
+    # TODO 33: opt-in deletion of subvolumes a receive left half-written.
+    cli_prune_partials = getattr(cli, "prune_partial_subvolumes", False)
+    if cli_prune_partials:
+        global_cfg["prune_partial_subvolumes"] = True
 
     # Track if CLI explicitly set backup_dir for precedence over archive-specific config
     cli_backup_dir = getattr(cli, "backup_dir", None)
@@ -1201,6 +1211,16 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
             archive_rsync_opts = cli_rsync_opts
         else:
             archive_rsync_opts = raw.get("rsync_opts", global_cfg.get("rsync_opts"))
+        # Same precedence for the partial-receive opt-in (TODO 33): the CLI flag
+        # wins outright, so --prune-partial-subvolumes overrides an archive that
+        # set prune_partial_subvolumes = false.
+        if cli_prune_partials:
+            archive_prune_partials = True
+        else:
+            archive_prune_partials = bool(
+                raw.get("prune_partial_subvolumes",
+                        global_cfg.get("prune_partial_subvolumes", False))
+            )
         if snaps_only and (
             send_file or recv_file or stage_file or send_dir or recv_dir or stage_dir
         ):
@@ -1268,6 +1288,7 @@ def load_and_resolve_archives(cli: argparse.Namespace, config_path: Path | None)
                     "forced_keep": _merge_keep(raw.get("forced_keep"), getattr(cli, "forced_keep", None)),
                     "rsync": archive_rsync,
                     "rsync_opts": archive_rsync_opts,
+                    "prune_partial_subvolumes": archive_prune_partials,
                 }
         resolved.append(entry)
 
@@ -1938,33 +1959,304 @@ def _mark_diskfull(dest_dir: str, name: str, cfg: dict,
     print(f"Disk full: the partial subvolume {src} is blocking {dest_dir}. "
           f"Remove it to free the space and unblock later runs:\n    {remedy}",
           file=sys.stderr)
-    _note_diskfull(cfg, dest_dir, [new], remote)
+    _note_inventory(cfg, dest_dir, remote, sentinels=[new], dropped=[name])
 
 
-def _note_diskfull(cfg: dict | None, dest_dir, names, remote: str | None = None) -> None:
-    """Record the sentinels a scan found in `dest_dir` for this run.
+def _note_inventory(cfg: dict | None, dest_dir, remote: str | None = None,
+                    sentinels=None, partials=None, entries=None,
+                    dropped=None, scanned: bool = False) -> dict:
+    """Merge one scan of `dest_dir` into this run's inventory of that pool.
 
-    Detection rides on scans the run already performs -- iter_archive_items and
-    iter_archive_items_ssh walk the destination anyway -- so the check costs no
-    extra command.  The cache lives on the run's cfg, so a partial renamed mid-run
-    is visible to the next leg into the same pool, and nothing leaks from one run
-    to the next.
+    *entries* is [(name_or_path, timestamp), ...] for every child that looks
+    like an archive.  Merging instead of overwriting is what makes a mid-run
+    change visible: a rename, a completed receive and a fresh orphan each update
+    the same cache, and nothing a leg already saw is forgotten.  *dropped* names
+    children that no longer exist under that name (renamed or deleted), which
+    keeps the cache honest for the legs that follow.  The cache lives on the
+    run's cfg, so it never leaks from one run to the next.
     """
     if cfg is None:
-        return
-    seen = cfg.setdefault("_diskfull_seen", {})
+        return {}
     key = (str(dest_dir), remote)
-    seen[key] = sorted(set(seen.get(key, ())) | {n for n in names if n})
+    inv = cfg.setdefault("_dest_seen", {}).setdefault(
+        key, {"sentinels": [], "partials": [], "entries": [], "scanned": False})
+    if sentinels:
+        inv["sentinels"] = sorted(set(inv["sentinels"]) | {n for n in sentinels if n})
+    if partials:
+        inv["partials"] = sorted(set(inv["partials"]) | {n for n in partials if n})
+    if entries:
+        known = {name for name, _ in inv["entries"]}
+        for name, ts in entries:
+            if name and name not in known:
+                inv["entries"].append((name, ts))
+                known.add(name)
+    if dropped:
+        gone = {str(n) for n in dropped if n}
+        if gone:
+            inv["entries"] = [e for e in inv["entries"] if Path(e[0]).name not in gone]
+            inv["partials"] = [n for n in inv["partials"] if n not in gone]
+    inv["scanned"] = inv["scanned"] or scanned
+    return inv
 
 
-def _sentinel_from_listing_line(line: str) -> str | None:
-    """Sentinel basename from a `btrfs subvolume list` line, else None."""
-    parts = line.split()
-    for i, part in enumerate(parts):
-        if part == "path" and i + 1 < len(parts):
-            name = Path(parts[-1]).name
-            return name if name.startswith(DISKFULL_PREFIX) else None
-    return None
+# `subvolume list -u -R -p` adds the uuid, received-uuid and parent columns and
+# leaves the path column byte-identical to the plain listing (verified on
+# btrfs-progs 6.14 and 7.1).  Adding -o would make that column fs-root-relative
+# and break the delete paths built from it, so the shared scan uses only these
+# three flags.
+_UUID_LIST_OPTS = ("-u", "-R", "-p")
+
+
+def _is_direct_child(path: str, dest_dir) -> bool:
+    """Is a listing's path column a direct child of the directory searched?
+
+    Children of a subvolume print as a bare name; when the search path is the
+    filesystem root they print relative to it.  Both spellings mean "direct
+    child", anything deeper is nested and is not something bubtrsnap wrote.
+    """
+    name = Path(path).name
+    d = str(dest_dir).rstrip("/")
+    return name == path or path == f"{d}/{name}"
+
+
+def _parse_dest_listing(output: str, dest_dir) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+    """(sentinels, entries, partials) from a `btrfs subvolume list <dest>` stdout.
+
+    A partial is a direct child of the destination whose name still matches the
+    archive pattern and whose Received UUID is missing: btrfs records that UUID
+    only when a stream completes, and prints `received_uuid -` when it never got
+    there.
+    """
+    sentinels: list[str] = []
+    entries: list[tuple[str, str]] = []
+    partials: list[str] = []
+    for line in (output or "").splitlines():
+        if " path " not in line:
+            continue
+        parts = line.split()
+        path = line.rsplit(" path ", 1)[1].strip()
+        if not path:
+            continue
+        name = Path(path).name
+        if name.startswith(DISKFULL_PREFIX):
+            sentinels.append(name)
+            continue
+        m = _ARCHIVE_TS_RE.match(name)
+        if not m or parse_ts(name) is None or not _is_direct_child(path, dest_dir):
+            continue
+        entries.append((path, m.group(2)))
+        if "uuid" not in parts or "received_uuid" not in parts:
+            continue
+        if parts[parts.index("uuid") + 1] != "-" and \
+                parts[parts.index("received_uuid") + 1] == "-":
+            partials.append(name)
+    return sentinels, entries, partials
+
+
+def _classify_partials(dest_dir, names: list[str], cfg: dict) -> list[str]:
+    """Which of *names* in *dest_dir* were left by an unfinished receive.
+
+    Only a destination written by `btrfs receive` can be judged: a snapshot made
+    locally with `snapshot -r` has no Received UUID either, so applying the rule
+    to snapshot_dir would call every snapshot corrupt.  Fail closed -- if the
+    listing or the UUID lookup cannot be done, nothing is a partial and nothing
+    is ever deleted on a guess.
+    """
+    if not names:
+        return []
+    snap = cfg.get("snapshot_dir")
+    if snap and Path(snap).resolve() == Path(dest_dir).resolve():
+        return []
+
+    mapping = _child_uuid_map(dest_dir, cfg)
+    found = []
+    if mapping is not None:
+        for name in names:
+            uuid, received = mapping.get(name, (None, None))
+            if uuid and not received:
+                found.append(name)
+    else:
+        # btrfs-progs too old for the columns: one `show` per candidate.
+        for name in names:
+            uuid, received = get_subvol_uuids(Path(dest_dir) / name, cfg)
+            if uuid and received is None:
+                found.append(name)
+    return sorted(found)
+
+
+def _local_inventory(dest_dir, cfg: dict):
+    """Scan a local destination: an iterdir for names, one listing for UUIDs."""
+    try:
+        children = list(Path(dest_dir).iterdir())
+    except OSError:
+        # Cannot read the pool (permissions, unmounted): report nothing rather
+        # than blocking the run on a guess.
+        return [], [], []
+    sentinels: list[str] = []
+    entries: list[tuple[str, str]] = []
+    for p in children:
+        if not (p.is_dir() or p.is_symlink()):
+            # snapshots/backups are subvolumes (dirs); skip plain files
+            continue
+        if p.name.startswith(DISKFULL_PREFIX):
+            sentinels.append(p.name)
+            continue
+        m = _ARCHIVE_TS_RE.match(p.name)
+        if m and parse_ts(p.name) is not None:
+            entries.append((p.name, m.group(2)))
+    return sentinels, entries, _classify_partials(dest_dir, [n for n, _ in entries], cfg)
+
+
+def _remote_listing(dest_dir, cfg: dict, remote: str, remote_sudo: bool) -> str | None:
+    """One listing of a remote destination, with the received-uuid column.
+
+    Read-only, so it runs during a dry run too: a dry run cannot fill a pool, but
+    it must see what a live run left behind.
+    """
+    cmd = build_ssh_cmd(
+        remote,
+        btrfs_cmd(cfg, "subvolume", "list", *_UUID_LIST_OPTS, str(dest_dir), sudo=False),
+        remote_sudo,
+    )
+    try:
+        # Read-only: always executed, even during a dry run.
+        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        # An older btrfs-progs on the remote may reject -u/-R/-p.  Retry the
+        # plain listing it used to run so the archives are still enumerated;
+        # with no received-uuid column nothing can be classified (fail closed).
+        # The retry only happens when the flagged listing actually failed, so a
+        # healthy run pays the same number of round trips it did before.
+        log(f"subvolume list -u -R -p failed for {remote}:{dest_dir}, "
+            f"retrying without the uuid columns", 3, cfg["verbose"])
+        cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list",
+                                             str(dest_dir), sudo=False), remote_sudo)
+        try:
+            result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                         check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError:
+            log(f"Failed to list subvolumes on {remote}:{dest_dir}", 3, cfg["verbose"])
+            return None
+    return result.stdout if result is not None else None
+
+
+def _destination_inventory(dest_dir, cfg: dict, remote: str | None = None,
+                           remote_sudo: bool = False) -> dict:
+    """What the pool at *dest_dir* holds, scanned once per run and cached."""
+    key = (str(dest_dir), remote)
+    inv = cfg.get("_dest_seen", {}).get(key)
+    if inv is not None and inv["scanned"]:
+        return inv
+    if remote:
+        sentinels, entries, partials = _parse_dest_listing(
+            _remote_listing(dest_dir, cfg, remote, remote_sudo), dest_dir)
+    else:
+        sentinels, entries, partials = _local_inventory(dest_dir, cfg)
+    return _note_inventory(cfg, dest_dir, remote, sentinels, partials, entries,
+                           scanned=True)
+
+
+def _report_partials(dest_dir, names: list[str], cfg: dict,
+                     remote: str | None = None, remote_sudo: bool = False) -> None:
+    """Tell the admin about the leftovers a dead receive left in *dest_dir*, once.
+
+    Printed on stderr at -v 0 because a partial is silent otherwise: it looks
+    like a backup, and the only way to notice is that the next restore skips it.
+    Reporting does not change the exit code -- a run that is *blocked* by a
+    partial reports the blocked leg instead (TODO 33).
+    """
+    if not names:
+        return
+    key = (str(dest_dir), remote)
+    reported = cfg.setdefault("_partial_reported", set())
+    if key in reported:
+        return
+    reported.add(key)
+
+    label = f"{remote}:{dest_dir}" if remote else str(dest_dir)
+    # The hint must be copy-pasteable as it stands: a pool this run can only
+    # reach through sudo needs sudo in the command it prints.
+    sudo = " sudo -n" if remote_sudo or cfg.get("remote_sudo") else ""
+    if remote:
+        deletes = [f"ssh {remote}{sudo} btrfs subvolume delete {dest_dir}/{n}"
+                   for n in names]
+    else:
+        deletes = [f"btrfs subvolume delete {Path(dest_dir) / n}" for n in names]
+    prunes = "; ".join(
+        f"bubtrsnap prune {n.rsplit('.', 1)[0]} --ts {n.rsplit('.', 1)[1]}"
+        for n in names
+    )
+
+    print(
+        f"Partial receive: {label} holds {len(names)} subvolume(s) left by a "
+        f"receive that died mid-stream:\n    " + "\n    ".join(names) +
+        "\nbtrfs records no Received UUID for them, so they are not usable "
+        "backups: the keep policy, `list` and `rebuild` all ignore them, and "
+        "nothing is restored over them.  They still hold the space the failed "
+        "receive used, so removing them frees it and clears the flag:\n    " +
+        "\n    ".join(deletes) +
+        f"\n  or: {prunes}" +
+        "\nRun with --prune-partial-subvolumes to remove such leftovers "
+        "automatically.",
+        file=sys.stderr,
+    )
+
+
+def _partial_receives(dest_dir, cfg: dict, remote: str | None = None,
+                      remote_sudo: bool = False) -> list[str]:
+    """Names of the half-written subvolumes *dest_dir* holds, reported once."""
+    inv = _destination_inventory(dest_dir, cfg, remote, remote_sudo)
+    if inv["partials"]:
+        _report_partials(dest_dir, inv["partials"], cfg, remote, remote_sudo)
+    return inv["partials"]
+
+
+def _partial_ts_set(dest_dir, archive: str, cfg: dict, remote: str | None = None,
+                   remote_sudo: bool = False) -> set[str]:
+    """Timestamps of the partial receives in *dest_dir* for *archive* (TODO 33)."""
+    return {
+        m.group(2)
+        for n in _partial_receives(dest_dir, cfg, remote, remote_sudo)
+        if (m := _ARCHIVE_TS_RE.match(n)) and m.group(1) == archive
+    }
+
+
+def _mark_partial(cfg: dict, dest_dir, name: str, remote: str | None = None) -> None:
+    """Record an orphan a failed receive just left, for the legs that follow.
+
+    The disk-full path (TODO 35) renames the subvolume out of the archive
+    pattern; this is the other failure mode -- a truncated or dropped stream --
+    where it keeps its archive name and only the missing Received UUID betrays
+    it.  We cannot read the UUID of a freshly orphaned subvolume cheaply, so the
+    run records it itself.  Nothing is created by a dry run, so nothing is
+    recorded either.
+    """
+    if cfg.get("dry_run"):
+        return
+    m = _ARCHIVE_TS_RE.match(name)
+    if not m:
+        return
+    inv = _note_inventory(cfg, dest_dir, remote, partials=[name],
+                         entries=[(name, m.group(2))])
+    _report_partials(dest_dir, inv["partials"], cfg, remote)
+
+
+def _mark_received(cfg: dict, dest_dir, name: str, remote: str | None = None) -> None:
+    """Record a completed receive so the cached listing is not stale.
+
+    A partial recorded earlier under the same name (a retried leg, or a scan
+    done before this one) is dropped: the stream finished, so the subvolume is
+    a real backup now.
+    """
+    if cfg.get("dry_run"):
+        return
+    m = _ARCHIVE_TS_RE.match(name)
+    if not m:
+        return
+    inv = _note_inventory(cfg, dest_dir, remote, entries=[(name, m.group(2))])
+    if name in inv["partials"]:
+        inv["partials"] = [n for n in inv["partials"] if n != name]
 
 
 def _diskfull_sentinels(dest_dir, cfg: dict, remote: str | None = None,
@@ -1974,40 +2266,8 @@ def _diskfull_sentinels(dest_dir, cfg: dict, remote: str | None = None,
     Read-only, so it runs during dry-run too: a dry-run can never create the
     condition, but it must see one a live run left behind.
     """
-    key = (str(dest_dir), remote)
-    cached = cfg.get("_diskfull_seen", {}).get(key)
-    if cached is not None:
-        return cached
+    return _destination_inventory(dest_dir, cfg, remote, remote_sudo)["sentinels"]
 
-    if remote:
-        cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list",
-                                             str(dest_dir), sudo=False), remote_sudo)
-        try:
-            result = run(cmd, dry_run=cfg.get("dry_run", False), read_only=True,
-                         verbosity=cfg["verbose"], capture_output=True,
-                         text=True, check=False)
-        except Exception:
-            result = None
-        names = []
-        if result is not None and result.returncode == 0:
-            for line in (result.stdout or "").splitlines():
-                name = _sentinel_from_listing_line(line)
-                if name:
-                    names.append(name)
-        _note_diskfull(cfg, dest_dir, names, remote)
-        return cfg["_diskfull_seen"][key]
-
-    names = []
-    try:
-        for p in Path(dest_dir).iterdir():
-            if p.name.startswith(DISKFULL_PREFIX) and (p.is_dir() or p.is_symlink()):
-                names.append(p.name)
-    except OSError:
-        # Cannot read the pool (permissions, unmounted): report nothing rather
-        # than blocking the run on a guess.
-        pass
-    _note_diskfull(cfg, dest_dir, names)
-    return cfg["_diskfull_seen"][key]
 
 
 def _diskfull_blocked(dest_dir, cfg: dict, remote: str | None = None,
@@ -2139,12 +2399,19 @@ def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
         if _is_enospc(stderr):
             _mark_diskfull(remote_dir, _receive_target_name(stream, ssh_result),
                           cfg, remote=remote, remote_sudo=remote_sudo)
+        else:
+            # TODO 33: the stream died mid-way (short read, dropped SSH
+            # connection).  The subvolume is there but has no Received UUID, so
+            # record it as a partial for the legs still queued for this pool.
+            _mark_partial(cfg, remote_dir,
+                          _receive_target_name(stream, ssh_result), remote)
         print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
     # The stream header is authoritative; the receive banner is a cross-check
     subvol_name = _received_subvol_name(stream, ssh_result, cfg, "remote btrfs output")
 
+    _mark_received(cfg, remote_dir, subvol_name, remote)
     log(f"Received subvolume: {subvol_name}", 1, cfg["verbose"])
     return subvol_name
 
@@ -2303,10 +2570,17 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
             return None
         if _is_enospc(stderr):
             _mark_diskfull(str(backup_dir), _receive_target_name(stream, result), cfg)
+        else:
+            # TODO 33: a stream that died mid-way leaves a subvolume with no
+            # Received UUID.  Record it so the legs that follow in this run see
+            # it before they try to receive over it.
+            _mark_partial(cfg, str(backup_dir), _receive_target_name(stream, result))
         print(f"Error receiving '{stream}' locally:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
-    return _received_subvol_name(stream, result, cfg, "btrfs receive output")
+    name = _received_subvol_name(stream, result, cfg, "btrfs receive output")
+    _mark_received(cfg, str(backup_dir), name)
+    return name
 
 
 def _receive_remote(stream: Path, remote: str, remote_dir: str, cfg: dict,
@@ -2466,12 +2740,15 @@ _ARCHIVE_TS_RE = re.compile(r"^(.+)\.(\d{12})$")
 def iter_archive_items(directory: Path, archive: str, cfg: dict | None = None):
     """Yield (timestamp_str, path) for exact archive.YYYYMMDDHHMM entries.
 
-    cfg is optional: when given, any disk-full sentinel seen on the walk is
-    recorded so the block check costs no extra command.
+    cfg is optional: when given, what the walk finds is merged into the run's
+    inventory of that destination, so the disk-full block check (TODO 35) costs
+    no extra command.  Partials are yielded as well -- `prune --ts` has to be
+    able to reach them -- but keep policy filters them out (TODO 33).
     """
     if not directory.is_dir():
         return
     sentinels = []
+    entries = []
     for p in directory.iterdir():
         if not p.is_dir() and not p.is_symlink():
             # snapshots/backups are subvolumes (dirs); skip plain files
@@ -2491,60 +2768,28 @@ def iter_archive_items(directory: Path, archive: str, cfg: dict | None = None):
         # validate it's a real datetime
         if parse_ts(p.name) is None:
             continue
+        entries.append((p.name, ts))
         yield ts, p
-    _note_diskfull(cfg, directory, sentinels)
+    _note_inventory(cfg, directory, None, sentinels=sentinels, entries=entries)
 
 
 def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict, remote_sudo: bool = False):
     """
     Yield (timestamp_str, remote_subvol_path) for exact archive.YYYYMMDDHHMM entries
     on a remote SSH host. Mirrors iter_archive_items but queries via SSH.
+
+    The listing carries -u -R -p so it also answers the disk-full (TODO 35) and
+    partial-receive (TODO 33) questions; it is scanned once per destination per
+    run and the result is cached on cfg.
     """
-    # Build SSH command to list subvolumes
-    cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list", remote_dir, sudo=False), remote_sudo)
-    try:
-        # Always execute read-only listing during dry-run
-        result = run(cmd,
-                     dry_run=False,
-                     verbosity=cfg["verbose"],
-                     check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError:
-        log(f"Failed to list subvolumes on {remote}:{remote_dir}", 3, cfg["verbose"])
-        return
-
-    if result is None:
-        return
-
-    sentinels = []
-    for line in result.stdout.splitlines():
-        # Parse: ID 256 gen 1234 top level 5 path lama7.20260831...
-        parts = line.split()
-        path_idx = -1
-        for i, part in enumerate(parts):
-            if part == "path" and i + 1 < len(parts):
-                path_idx = i + 1
-                break
-        if path_idx < 0:
-            continue
-        remote_subvol = parts[path_idx]
+    inv = _destination_inventory(remote_dir, cfg, remote, remote_sudo)
+    for remote_subvol, ts in inv["entries"]:
         name = Path(remote_subvol).name
-        if name.startswith(DISKFULL_PREFIX):
-            # A disk-full partial (TODO 35): the listing we already ran is the
-            # cheapest place to spot it, so the block check costs no extra SSH.
-            sentinels.append(name)
-            continue
-        # Match archive pattern
-        m = _ARCHIVE_TS_RE.match(remote_subvol)
-        if not m:
-            continue
-        if m.group(1) != archive:
-            continue
-        ts = m.group(2)
-        if parse_ts(remote_subvol) is None:
+        m = _ARCHIVE_TS_RE.match(name)
+        if not m or m.group(1) != archive:
             continue
         # Yield timestamp and full remote path
         yield ts, f"{remote_dir}/{remote_subvol}"
-    _note_diskfull(cfg, remote_dir, sentinels, remote)
 
 def _get_keeps(
     timestamps: list[str],
@@ -2720,6 +2965,8 @@ def _apply_keep_policy_core(
     no_items_msg: str,
     forced_keep: list[str] | None = None,
     week_startday: str | None = None,
+    partials: list[str] | None = None,
+    prune_partials: bool = False,
 ) -> None:
     """Shared keep-policy engine used by apply_keep_policy and apply_keep_policy_ssh.
 
@@ -2733,6 +2980,11 @@ def _apply_keep_policy_core(
     *week_startday* is the archive-level value (already resolved against the
     global by load_and_resolve_archives); when it is None the global cfg value
     is used.
+
+    *partials* is the list of names in this destination that a receive left
+    half-written (TODO 33).  They are removed from *items* before the slots are
+    counted, so a corrupt subvolume never pushes a real backup out of a slot.
+    They are only deleted when *prune_partials* is set.
     """
     keep_values = [
         keep.get("keep_hourly", 0),
@@ -2752,6 +3004,36 @@ def _apply_keep_policy_core(
     if not items:
         log(f"\t{no_items_msg}", 1, cfg["verbose"])
         return
+
+    # TODO 33: a subvolume left by a receive that died mid-stream is not a
+    # backup, so it must come out of the slot counting before the slots are
+    # filled -- otherwise the corrupt newest entry holds a slot and the last
+    # real backup is pruned.  Out of the policy it goes either way; it is only
+    # deleted when the user opted in with --prune-partial-subvolumes.
+    if partials:
+        partial_names = {str(p) for p in partials}
+        leftovers = [it for it in items
+                     if Path(str(it[1])).name in partial_names]
+        items = [it for it in items
+                 if Path(str(it[1])).name not in partial_names]
+        if leftovers and prune_partials:
+            for _, display, delete_cmd in leftovers:
+                log(f"\tRemoving partial receive {display} "
+                    f"(receive never finished: no Received UUID)",
+                    1, cfg["verbose"])
+                try:
+                    run(delete_cmd,
+                        dry_run=cfg.get("dry_run", False),
+                        verbosity=cfg["verbose"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True)
+                except subprocess.CalledProcessError:
+                    print(f"Error removing partial subvolume `{delete_cmd}`",
+                          file=sys.stderr)
+        if not items:
+            log(f"\t{no_items_msg}", 1, cfg["verbose"])
+            return
 
     # ascending timestamp order (btrbu style)
     items.sort(key=lambda x: x[0])
@@ -2801,12 +3083,14 @@ def _apply_keep_policy_core(
                 print(f"Error during prune: `{delete_cmd}`", file=sys.stderr)
                 sys.exit(1)
 
-def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict, remote_sudo: bool = False, forced_keep: list[str] | None = None, week_startday: str | None = None) -> None:
+def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict, cfg: dict, remote_sudo: bool = False, forced_keep: list[str] | None = None, week_startday: str | None = None, prune_partials: bool | None = None) -> None:
     """Apply the given keep policy to backups of an archive on a remote SSH host.
 
     Mirrors apply_keep_policy but operates via SSH.  Delegates the shared
     algorithm to _apply_keep_policy_core so fixes are applied in one place.
     """
+    if prune_partials is None:
+        prune_partials = bool(cfg.get("prune_partial_subvolumes", False))
     raw_items = list(iter_archive_items_ssh(remote, remote_dir, archive, cfg, remote_sudo))
     items = [
         (ts, remote_path,
@@ -2823,9 +3107,11 @@ def apply_keep_policy_ssh(remote: str, remote_dir: str, archive: str, keep: dict
         f"No prior archives for {archive} found in {remote}:{remote_dir}",
         forced_keep,
         week_startday,
+        partials=_partial_receives(remote_dir, cfg, remote, remote_sudo),
+        prune_partials=prune_partials,
     )
 
-def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forced_keep: list[str] | None = None, week_startday: str | None = None) -> None:
+def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forced_keep: list[str] | None = None, week_startday: str | None = None, prune_partials: bool | None = None) -> None:
     """Apply the given keep policy to snapshots or backups of an archive.
 
     Uses the btrbu algorithm (non-overlapping interval slots from newest
@@ -2840,6 +3126,8 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forc
         )
         return
 
+    if prune_partials is None:
+        prune_partials = bool(cfg.get("prune_partial_subvolumes", False))
     raw_items = list(iter_archive_items(directory, archive, cfg))
     items = [
         (ts, p.name, btrfs_cmd(cfg, "subvolume", "delete", str(p)))
@@ -2853,6 +3141,8 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forc
         f"No prior archives for {archive} found in {directory}",
         forced_keep,
         week_startday,
+        partials=_partial_receives(directory, cfg),
+        prune_partials=prune_partials,
     )
 
 #-----------------------------------------------------------------
@@ -2897,18 +3187,25 @@ def _apply_all_keep_policies(
     snap_dir: Path | None, backup_dir: Path | None, remote: str | None,
     remote_dir: str | None, remote_sudo: bool, name: str, keep: dict, cfg: dict,
     forced_keep: list[str] | None = None, week_startday: str | None = None,
+    prune_partials: bool | None = None,
 ) -> None:
     """Apply keep policy to snap_dir, backup_dir, and remote in one place.
 
     *week_startday* is the archive-level value; None falls back to the global.
+    *prune_partials* is the archive-level opt-in to delete subvolumes a dead
+    receive left behind (TODO 33); None falls back to the global.
     """
+    if prune_partials is None:
+        prune_partials = bool(cfg.get("prune_partial_subvolumes", False))
     if snap_dir:
-        apply_keep_policy(snap_dir, name, keep, cfg, forced_keep, week_startday)
+        apply_keep_policy(snap_dir, name, keep, cfg, forced_keep, week_startday,
+                          prune_partials)
     if backup_dir:
-        apply_keep_policy(backup_dir, name, keep, cfg, forced_keep, week_startday)
+        apply_keep_policy(backup_dir, name, keep, cfg, forced_keep, week_startday,
+                         prune_partials)
     if remote and remote_dir:
         apply_keep_policy_ssh(remote, remote_dir, name, keep, cfg, remote_sudo,
-                             forced_keep, week_startday)
+                             forced_keep, week_startday, prune_partials)
 
 
 def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict, name: str) -> None:
@@ -2935,7 +3232,12 @@ def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict
     if rc != 0:
         if _is_enospc(stderr):
             _mark_diskfull(str(backup_dir), snap.name, cfg)
+        else:
+            # TODO 33: a stream that stopped mid-way leaves a subvolume with no
+            # Received UUID in the backup pool.
+            _mark_partial(cfg, str(backup_dir), snap.name)
         raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
+    _mark_received(cfg, str(backup_dir), snap.name)
 
 
 def _receive_and_post(received: str | None, archive: dict, name: str, snap: Path | None,
@@ -2955,7 +3257,8 @@ def _receive_and_post(received: str | None, archive: dict, name: str, snap: Path
                  _build_hook_context(name, snap, received, backup_dir, remote, remote_dir, cfg), cfg)
     _apply_all_keep_policies(snap_dir or None, backup_dir, remote, remote_dir, remote_sudo,
                              name, keep, cfg, forced_keep,
-                             week_startday=archive.get("week_startday"))
+                             week_startday=archive.get("week_startday"),
+                             prune_partials=archive.get("prune_partial_subvolumes"))
 
 
 def process_archive(archive: dict, cfg: dict) -> str | None:
@@ -3160,7 +3463,8 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
                  _build_hook_context(name, snap, dest, backup_dir, remote, remote_dir, cfg), cfg)
         _apply_all_keep_policies(snap_dir, backup_dir, remote, remote_dir, remote_sudo, name, keep, cfg,
                                      forced_keep=forced_keep_list,
-                                     week_startday=archive.get("week_startday"))
+                                     week_startday=archive.get("week_startday"),
+                                     prune_partials=archive.get("prune_partial_subvolumes"))
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -3168,7 +3472,8 @@ def process_archive(archive: dict, cfg: dict) -> str | None:
     if snaps_only or not (backup_dir or (remote and remote_dir)):
         _apply_all_keep_policies(snap_dir, None, None, None, False, name, keep, cfg,
                                      forced_keep=forced_keep_list,
-                                     week_startday=archive.get("week_startday"))
+                                     week_startday=archive.get("week_startday"),
+                                     prune_partials=archive.get("prune_partial_subvolumes"))
         log(f"Finished archive: {name}\n", 1, cfg["verbose"])
         return
 
@@ -3380,6 +3685,10 @@ def _add_maint_global_options(p: argparse.ArgumentParser) -> None:
              "--stats, --dry-run, --daemon, --files-from, --bwlimit, --rsh, "
              "--rsync-path, --exclude, --include, --filter, and other potentially "
              "dangerous options. Blocked options are reported via stderr.")
+    p.add_argument("--prune-partial-subvolumes", action="store_true",
+        help="Delete subvolumes left by a receive that died mid-stream (no "
+             "Received UUID) instead of only reporting them. "
+             "Can be set globally or per-archive in config file.")
     p.add_argument("--keep-hourly", type=int, metavar="N", help="Number of hourly snapshots/backups to retain")
     p.add_argument("--keep-daily", type=int, metavar="N", help="Number of daily snapshots/backups to retain")
     p.add_argument("--keep-weekly", type=int, metavar="N", help="Number of weekly snapshots/backups to retain")
@@ -3998,6 +4307,16 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
         if remote and remote_dir:
             rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
 
+        # TODO 33: an entry left by a receive that died mid-stream is not a
+        # backup, so the table says so instead of "yes".  Snapshots are never
+        # labelled partial: they were never received, so they have no Received
+        # UUID by definition.
+        bak_partial = _partial_ts_set(bak_d, name, cfg) if bak_d and bak_d.is_dir() else set()
+        rem_partial = (
+            _partial_ts_set(remote_dir, name, cfg, remote, remote_sudo)
+            if remote and remote_dir else set()
+        )
+
         all_ts = sorted(snap_ts | bak_ts | rem_ts)
         log(f"\n=== {name} ===", 0, verbosity)
         if not all_ts:
@@ -4005,15 +4324,21 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
             continue
         # Only show columns that are actually configured for this archive.
         # snapshot_dir is global, so the snapshot column is always present.
-        cols = [("snapshot", snap_ts)]
+        cols = [("snapshot", snap_ts, set())]
         if bak_d:
-            cols.append(("backup", bak_ts))
+            cols.append(("backup", bak_ts, bak_partial))
         if remote and remote_dir:
-            cols.append(("remote", rem_ts))
-        hdr = "    " + f"{'timestamp':<20}" + " ".join(f"{label:<10}" for label, _ in cols)
+            cols.append(("remote", rem_ts, rem_partial))
+        hdr = "    " + f"{'timestamp':<20}" + " ".join(f"{label:<10}" for label, _, _ in cols)
         log(hdr, 0, verbosity)
         for ts in all_ts:
-            cells = [f"{ts:<20}"] + [f"{'yes' if ts in tset else 'no':<10}" for tset in (_x[1] for _x in cols)]
+            cells = [f"{ts:<20}"]
+            for _label, tset, partial in cols:
+                if ts not in tset:
+                    cell = "no"
+                else:
+                    cell = "partial" if ts in partial else "yes"
+                cells.append(f"{cell:<10}")
             log("    " + "".join(cells), 0, verbosity)
     log("List complete.", 0, verbosity)
     return 0
@@ -4139,10 +4464,22 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
             continue
 
         snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name, cfg)} if snap_d and snap_d.is_dir() else set()
-        bak_ts = {ts for ts, _ in iter_archive_items(bak_d, name, cfg)} if bak_d and bak_d.is_dir() else set()
+        # TODO 33: a subvolume left by a receive that died mid-stream is not a
+        # backup, so it does not count as present: rebuild plans to restore over
+        # it and then refuses to land on it (phase 4) rather than believing the
+        # archive is complete.
+        bak_partial = _partial_ts_set(bak_d, name, cfg) if bak_d and bak_d.is_dir() else set()
+        rem_partial = (
+            _partial_ts_set(remote_dir, name, cfg, remote, remote_sudo)
+            if remote and remote_dir else set()
+        )
+        bak_ts = ({ts for ts, _ in iter_archive_items(bak_d, name, cfg)} - bak_partial
+                  if bak_d and bak_d.is_dir() else set())
         rem_ts = set()
         if remote and remote_dir:
-            rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
+            rem_ts = ({ts for ts, _ in
+                       iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
+                      - rem_partial)
 
         all_ts = sorted(snap_ts | bak_ts | rem_ts)
         if not all_ts:
@@ -4337,6 +4674,19 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                     1, cfg["verbose"])
                 failed.append(label)
                 continue
+            # TODO 33: the target name may already exist as a half-written
+            # receive.  `btrfs receive` cannot land on an existing subvolume
+            # ("File exists"), and counting the leg as restored would leave a
+            # corrupt entry the next restore silently skips, so it is refused
+            # and counted as a failed leg.
+            if kind in ("backup", "remote", "from_remote") and it["dest"]:
+                d_remote = remote if kind == "remote" else None
+                if label in _partial_receives(str(it["dest"]), cfg, d_remote, remote_sudo):
+                    log(f"    {label}: skipped, {it['dest']} already holds a "
+                        f"partial receive with that name; delete it before "
+                        f"rebuilding", 1, cfg["verbose"])
+                    failed.append(label)
+                    continue
             if kind == "backup":
                 log(f"    {label}: restoring local backup from snapshot", 1, cfg["verbose"])
                 try:
@@ -4373,6 +4723,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                     if rc == 0:
                         log(f"    {label}: remote restored", 1, cfg["verbose"])
                         restored += 1
+                        _mark_received(cfg, remote_dir, label, remote)
                     else:
                         log(f"    {label}: remote re-send failed: {stderr.strip()}",
                             1, cfg["verbose"])
@@ -4380,6 +4731,8 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         if _is_enospc(stderr):
                             _mark_diskfull(str(remote_dir), label, cfg,
                                           remote=remote, remote_sudo=remote_sudo)
+                        else:
+                            _mark_partial(cfg, remote_dir, label, remote)
                 except Exception as e:
                     log(f"    {label}: remote re-send error: {e}", 1, cfg["verbose"])
                     failed.append(label)
@@ -4410,6 +4763,10 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         failed.append(label)
                         if _is_enospc(stderr):
                             _mark_diskfull(str(it["dest"]), label, cfg)
+                        # A snapshot_dir orphan cannot be told apart from a
+                        # snapshot (both have no Received UUID), so it is not
+                        # recorded as a partial; the disk-full flag above is the
+                        # only signal rebuild can use there.
                 except Exception as e:
                     log(f"    {label}: snapshot restore from remote error: {e}",
                         1, cfg["verbose"])
