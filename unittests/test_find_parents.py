@@ -171,8 +171,15 @@ class TestFindParentsLocal(unittest.TestCase):
         with patch.object(bs, "run", fake.run):
             bs.find_parents("lama7", snap, backup, cfg)
 
-        self.assertEqual(len(fake.lists()), 2, f"expected 2 listings, got {fake.calls}")
-        for cmd in fake.lists():
+        # TODO 33b: the read-only flag is only visible through `subvolume list -r`,
+        # so the snapshot directory gets one extra read-only listing.  The UUID
+        # walk itself is still one call per directory, and the directory's ID is
+        # looked up once and reused by both scans.
+        uuid_lists = [c for c in fake.lists() if "-r" not in c]
+        ro_lists = [c for c in fake.lists() if "-r" in c]
+        self.assertEqual(len(uuid_lists), 2, f"expected 2 listings, got {fake.calls}")
+        self.assertEqual(len(ro_lists), 1, f"read-only scan ran more than once: {fake.calls}")
+        for cmd in uuid_lists:
             for flag in ("-u", "-R", "-p", "-o"):
                 self.assertIn(flag, cmd, f"listing missing {flag}: {cmd}")
         # Only the two directory ID lookups, never one show per candidate.
@@ -204,7 +211,8 @@ class TestFindParentsLocal(unittest.TestCase):
             parents = bs.find_parents("lama7", snap, backup, cfg)
         self.assertEqual([p.name for p in parents], [f"lama7.{T2}", f"lama7.{T1}"])
         # Fallback path really does use the per-subvolume show loop.
-        self.assertEqual(len(fake.lists()), 2)
+        uuid_lists = [c for c in fake.lists() if "-r" not in c]
+        self.assertEqual(len(uuid_lists), 2)
         self.assertTrue(len(fake.shows()) >= 6, fake.calls)
 
     def test_unreceived_snapshot_is_not_a_parent(self):

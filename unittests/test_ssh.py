@@ -526,9 +526,16 @@ class TestFindParentsSSH(unittest.TestCase):
                                str(p).endswith("lama7.202608290230") or
                                str(p).endswith("lama7.202608300230"))
 
-            # One listing per directory (local snapshots + remote backup), and
+            # One UUID listing per directory (local snapshots + remote backup), and
             # no SSH round trip per remote subvolume.
-            self.assertEqual(sum("subvolume list" in c for c in calls), 2)
+            self.assertEqual(sum("subvolume list" in c and "-r" not in c for c in calls), 2)
+            # TODO 33b: the read-only flag needs its own listing (`subvolume list -r`
+            # is the only one that reports it).  It is local only -- snapshot_dir is
+            # never a remote destination -- and runs once per snapshot pool.
+            ro_lists = [c for c in calls if "subvolume list" in c and "-r" in c]
+            self.assertEqual(len(ro_lists), 1, f"read-only scan ran {len(ro_lists)} times: {calls}")
+            self.assertFalse(any("ssh" in c and "-r" in c for c in calls),
+                             "the read-only scan must not reach the remote")
             self.assertEqual(sum("ssh" in c and "subvolume show" in c for c in calls), 1)
             self.assertEqual(sum("ssh" in c and "subvolume list" in c for c in calls), 1)
 

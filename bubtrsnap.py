@@ -1516,7 +1516,23 @@ def _get_subvolume_id(
     remote: str | None = None,
     remote_sudo: bool = False,
 ) -> str | None:
-    """Subvolume ID of *dir_path*, or None if it is not a btrfs subvolume."""
+    """Subvolume ID of *dir_path*, or None if it is not a btrfs subvolume.
+
+    Cached on the run's cfg: the same directory is asked twice as often now
+    (the UUID map and the read-only scan of TODO 33b), and an ID does not
+    change mid-run.
+    """
+    cache = cfg.setdefault("_subvol_id_seen", {})
+    key = (str(dir_path), remote)
+    if key in cache:
+        return cache[key]
+    found = _lookup_subvolume_id(dir_path, cfg, remote=remote, remote_sudo=remote_sudo)
+    cache[key] = found
+    return found
+
+
+def _lookup_subvolume_id(dir_path, cfg: dict, *, remote: str | None = None,
+                        remote_sudo: bool = False) -> str | None:
     if remote:
         cmd = build_ssh_cmd(
             remote, btrfs_cmd(cfg, "subvolume", "show", str(dir_path), sudo=False), remote_sudo
@@ -1593,10 +1609,20 @@ def _archive_items(directory: Path, archive: str) -> list[Path]:
 
 
 def _archive_snapshots(archive: str, snapshot_dir: Path, cfg: dict) -> list[tuple]:
-    """(timestamp, path, uuid) for snapshots of *archive* directly under snapshot_dir."""
+    """(timestamp, path, uuid) for snapshots of *archive* directly under snapshot_dir.
+
+    TODO 33b: a child btrfs does not mark read-only is not a usable snapshot --
+    `btrfs send` refuses it and `-p`/`-c` refuse it as a parent -- so it is not
+    offered as an incremental parent.  Fail closed: when the readonly scan cannot
+    be done, every entry keeps its chance exactly as before.
+    """
     mapping = _child_uuid_map(snapshot_dir, cfg)
+    readonly = _readonly_children(snapshot_dir, cfg)
     snapshots = []
     for p in _archive_items(snapshot_dir, archive):
+        if readonly is not None and p.name not in readonly:
+            log(f"{p.name}: not read-only, cannot be a send parent", 3, cfg["verbose"])
+            continue
         ts = parse_ts(p.name)
         if mapping is not None:
             uuid, _ = mapping.get(p.name, (None, None))
@@ -1963,7 +1989,7 @@ def _mark_diskfull(dest_dir: str, name: str, cfg: dict,
 
 
 def _note_inventory(cfg: dict | None, dest_dir, remote: str | None = None,
-                    sentinels=None, partials=None, entries=None,
+                    sentinels=None, partials=None, entries=None, incompat=None,
                     dropped=None, scanned: bool = False) -> dict:
     """Merge one scan of `dest_dir` into this run's inventory of that pool.
 
@@ -1974,16 +2000,23 @@ def _note_inventory(cfg: dict | None, dest_dir, remote: str | None = None,
     children that no longer exist under that name (renamed or deleted), which
     keeps the cache honest for the legs that follow.  The cache lives on the
     run's cfg, so it never leaks from one run to the next.
+
+    *partials* are children a receive left half-written (TODO 33), *incompat*
+    children of the snapshot pool that btrfs does not mark read-only (TODO 33b).
+    Both are entries, but neither is a usable archive.
     """
     if cfg is None:
         return {}
     key = (str(dest_dir), remote)
     inv = cfg.setdefault("_dest_seen", {}).setdefault(
-        key, {"sentinels": [], "partials": [], "entries": [], "scanned": False})
+        key, {"sentinels": [], "partials": [], "incompat": [], "entries": [],
+             "scanned": False})
     if sentinels:
         inv["sentinels"] = sorted(set(inv["sentinels"]) | {n for n in sentinels if n})
     if partials:
         inv["partials"] = sorted(set(inv["partials"]) | {n for n in partials if n})
+    if incompat:
+        inv["incompat"] = sorted(set(inv["incompat"]) | {n for n in incompat if n})
     if entries:
         known = {name for name, _ in inv["entries"]}
         for name, ts in entries:
@@ -1995,6 +2028,7 @@ def _note_inventory(cfg: dict | None, dest_dir, remote: str | None = None,
         if gone:
             inv["entries"] = [e for e in inv["entries"] if Path(e[0]).name not in gone]
             inv["partials"] = [n for n in inv["partials"] if n not in gone]
+            inv["incompat"] = [n for n in inv["incompat"] if n not in gone]
     inv["scanned"] = inv["scanned"] or scanned
     return inv
 
@@ -2010,13 +2044,14 @@ _UUID_LIST_OPTS = ("-u", "-R", "-p")
 def _is_direct_child(path: str, dest_dir) -> bool:
     """Is a listing's path column a direct child of the directory searched?
 
-    Children of a subvolume print as a bare name; when the search path is the
-    filesystem root they print relative to it.  Both spellings mean "direct
-    child", anything deeper is nested and is not something bubtrsnap wrote.
+    Children of a subvolume print as a bare name; when the search path is itself
+    a subvolume of the filesystem root, `-o` prints them relative to that root,
+    as "<search dir>/<name>".  Anything deeper is nested and is not something
+    bubtrsnap wrote.
     """
     name = Path(path).name
     d = str(dest_dir).rstrip("/")
-    return name == path or path == f"{d}/{name}"
+    return name == path or path == f"{d}/{name}" or path == f"{Path(d).name}/{name}"
 
 
 def _parse_dest_listing(output: str, dest_dir) -> tuple[list[str], list[tuple[str, str]], list[str]]:
@@ -2084,6 +2119,117 @@ def _classify_partials(dest_dir, names: list[str], cfg: dict) -> list[str]:
     return sorted(found)
 
 
+# `subvolume list -r` is the only listing that reports the read-only flag, and
+# it is a filter rather than a column: no combination of -u -R -p -o -s -c -t -a
+# prints it (checked on btrfs-progs 6.14 and 7.1), so the snapshot scan cannot
+# ride on the listing the destination walk already runs.  `-p` is added because
+# a listing is filesystem-wide: without the parent column a nested subvolume, or
+# another pool's identically named archive, would look like a direct child.
+_RO_LIST_OPTS = ("-r", "-p")
+
+
+def _is_snapshot_pool(dest_dir, cfg: dict) -> bool:
+    """Is this destination the run's snapshot_dir?  (It may also be backup_dir.)"""
+    snap = cfg.get("snapshot_dir")
+    if not snap:
+        return False
+    try:
+        return Path(snap).resolve() == Path(dest_dir).resolve()
+    except OSError:
+        return False
+
+
+def _readonly_children(dest_dir, cfg: dict) -> set[str] | None:
+    """Names of *dest_dir*'s direct children that btrfs marks read-only.
+
+    None means "this build or pool cannot answer the question", which callers
+    must treat as unknown rather than as writable.  Read-only, so it runs during
+    a dry run too, and it is cached per destination per run like the other scans.
+    """
+    if cfg is None:
+        return None
+    key = str(dest_dir)
+    seen = cfg.setdefault("_readonly_seen", {})
+    if key in seen:
+        return seen[key]
+    cmd = btrfs_cmd(cfg, "subvolume", "list", *_RO_LIST_OPTS, str(dest_dir))
+    try:
+        # Read-only: always executed, even during a dry run.
+        result = run(cmd, dry_run=False, verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        log(f"subvolume list -r failed for {dest_dir}, falling back to "
+            f"per-subvolume show", 3, cfg["verbose"])
+        seen[key] = None          # one failed probe per destination per run
+        return None
+    if result is None or result.stdout is None:
+        return None
+    parent_id = _get_subvolume_id(dest_dir, cfg)
+    if parent_id is None:
+        # Not a btrfs subvolume (or unreadable): the parent column is the only
+        # way to tell this directory's children from the rest of the filesystem,
+        # so without it the listing says nothing.  Fail closed.
+        log(f"could not get the subvolume ID of {dest_dir}, "
+            f"read-only scan skipped", 3, cfg["verbose"])
+        seen[key] = None
+        return None
+    names: set[str] = set()
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if " path " not in line:
+            continue
+        path = line.rsplit(" path ", 1)[1].strip()
+        if not path:
+            continue
+        # The parent column is exact: only children of the searched directory.
+        if "parent" not in parts or parts[parts.index("parent") + 1] != str(parent_id):
+            continue
+        names.add(Path(path).name)
+    seen[key] = names
+    return names
+
+
+def _is_readonly_child(path, cfg: dict) -> bool:
+    """Whether one subvolume carries the read-only flag, via `subvolume show`.
+
+    The fallback for a btrfs-progs without `list -r`.  Assumes usable when the
+    lookup fails: a snapshot is never called broken on a guess, and nothing is
+    ever deleted on one.
+    """
+    try:
+        result = run(btrfs_cmd(cfg, "subvolume", "show", str(path)),
+                     dry_run=False, verbosity=cfg["verbose"],
+                     check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        return True
+    if result is None or result.stdout is None:
+        return True
+    for line in (result.stdout or "").splitlines():
+        if line.strip().startswith("Flags:"):
+            return "readonly" in line.split(":", 1)[1].lower()
+    return True
+
+
+def _classify_incompat(dest_dir, names: list[str], cfg: dict) -> list[str]:
+    """Which of *names* in a snapshot pool are not usable snapshots.
+
+    A snapshot bubtrsnap can use is read-only: `subvolume snapshot -r` sets the
+    flag and `btrfs receive` creates the subvolume readonly.  Anything else with
+    an archive name -- a receive that died mid-stream (rebuild's remote ->
+    snapshot_dir leg), a snapshot made without -r, a snapshot flipped with
+    `btrfs property set ... ro false` -- is rejected by `btrfs send` and by
+    `-p`/`-c` as a parent, so it cannot be backed up or restored from.  Only the
+    snapshot pool is judged: in a backup or remote pool a dead receive is already
+    caught by the Received UUID rule.
+    """
+    if not names or not _is_snapshot_pool(dest_dir, cfg):
+        return []
+    readonly = _readonly_children(dest_dir, cfg)
+    if readonly is None:
+        return sorted(n for n in names if not _is_readonly_child(Path(dest_dir) / n, cfg))
+    return sorted(n for n in names if n not in readonly)
+
+
 def _local_inventory(dest_dir, cfg: dict):
     """Scan a local destination: an iterdir for names, one listing for UUIDs."""
     try:
@@ -2091,7 +2237,7 @@ def _local_inventory(dest_dir, cfg: dict):
     except OSError:
         # Cannot read the pool (permissions, unmounted): report nothing rather
         # than blocking the run on a guess.
-        return [], [], []
+        return [], [], [], []
     sentinels: list[str] = []
     entries: list[tuple[str, str]] = []
     for p in children:
@@ -2104,7 +2250,9 @@ def _local_inventory(dest_dir, cfg: dict):
         m = _ARCHIVE_TS_RE.match(p.name)
         if m and parse_ts(p.name) is not None:
             entries.append((p.name, m.group(2)))
-    return sentinels, entries, _classify_partials(dest_dir, [n for n, _ in entries], cfg)
+    names = [n for n, _ in entries]
+    return (sentinels, entries, _classify_partials(dest_dir, names, cfg),
+            _classify_incompat(dest_dir, names, cfg))
 
 
 def _remote_listing(dest_dir, cfg: dict, remote: str, remote_sudo: bool) -> str | None:
@@ -2151,10 +2299,13 @@ def _destination_inventory(dest_dir, cfg: dict, remote: str | None = None,
     if remote:
         sentinels, entries, partials = _parse_dest_listing(
             _remote_listing(dest_dir, cfg, remote, remote_sudo), dest_dir)
+        # A remote destination is never a snapshot pool: everything there is
+        # received, so the Received UUID rule is the right one (TODO 33).
+        incompat: list[str] = []
     else:
-        sentinels, entries, partials = _local_inventory(dest_dir, cfg)
+        sentinels, entries, partials, incompat = _local_inventory(dest_dir, cfg)
     return _note_inventory(cfg, dest_dir, remote, sentinels, partials, entries,
-                           scanned=True)
+                           incompat=incompat, scanned=True)
 
 
 def _report_partials(dest_dir, names: list[str], cfg: dict,
@@ -2220,6 +2371,85 @@ def _partial_ts_set(dest_dir, archive: str, cfg: dict, remote: str | None = None
         for n in _partial_receives(dest_dir, cfg, remote, remote_sudo)
         if (m := _ARCHIVE_TS_RE.match(n)) and m.group(1) == archive
     }
+
+
+def _report_incompat(dest_dir, names: list[str], cfg: dict) -> None:
+    """Tell the admin about the unusable entries a snapshot pool holds, once.
+
+    "partial" is the right word for a destination written by `btrfs receive`:
+    a stream that never finished.  In snapshot_dir the same state means only
+    that btrfs does not mark the subvolume read-only, which is why the label here
+    is "incompat": whatever made it, bubtrsnap cannot use it.
+    """
+    if not names:
+        return
+    reported = cfg.setdefault("_incompat_reported", set())
+    if str(dest_dir) in reported:
+        return
+    reported.add(str(dest_dir))
+
+    sudo = "sudo -n " if cfg.get("local_sudo") else ""
+    deletes = [f"{sudo}btrfs subvolume delete {Path(dest_dir) / n}" for n in names]
+    prunes = "; ".join(
+        f"bubtrsnap prune {n.rsplit('.', 1)[0]} --ts {n.rsplit('.', 1)[1]}"
+        for n in names
+    )
+
+    print(
+        f"Unusable snapshot: {dest_dir} holds {len(names)} incompat "
+        f"subvolume(s) named like an archive that btrfs does not mark "
+        f"read-only:\n    " + "\n    ".join(names) +
+        "\nOnly a read-only subvolume can be sent, or used as an incremental "
+        "parent, so these are not archives bubtrsnap can use: the keep policy, "
+        "`list` and `rebuild` all ignore them.  A receive that died mid-stream "
+        "leaves exactly this, and so does a snapshot made without -r.  They still "
+        "hold the space they used, so removing them frees it:\n    " +
+        "\n    ".join(deletes) +
+        f"\n  or: {prunes}" +
+        "\nRun with --prune-partial-subvolumes to remove such leftovers "
+        "automatically.",
+        file=sys.stderr,
+    )
+
+
+def _incompat_snapshots(dest_dir, cfg: dict) -> list[str]:
+    """Names of the unusable entries *dest_dir* holds, reported once (TODO 33b).
+
+    Empty for a destination that is not the snapshot pool: a backup or remote
+    pool is judged by the Received UUID instead.
+    """
+    inv = _destination_inventory(dest_dir, cfg)
+    if inv["incompat"]:
+        _report_incompat(dest_dir, inv["incompat"], cfg)
+    return inv["incompat"]
+
+
+def _incompat_ts_set(dest_dir, archive: str, cfg: dict) -> set[str]:
+    """Timestamps of the unusable entries in *dest_dir* for *archive* (TODO 33b)."""
+    return {
+        m.group(2)
+        for n in _incompat_snapshots(dest_dir, cfg)
+        if (m := _ARCHIVE_TS_RE.match(n)) and m.group(1) == archive
+    }
+
+
+def _mark_incompat(cfg: dict, dest_dir, name: str) -> None:
+    """Record a snapshot_dir orphan the run just created, for the legs that follow.
+
+    The readonly scan lists what the pool held when it was last walked, so a
+    subvolume this run's own failed receive just left would not be seen.  That
+    orphan is exactly the TODO 33 shape -- an archive name, no Received UUID,
+    writable -- but in snapshot_dir the UUID rule cannot run, so the run records
+    it itself.  Nothing is created by a dry run, so nothing is recorded either.
+    """
+    if cfg.get("dry_run"):
+        return
+    m = _ARCHIVE_TS_RE.match(name)
+    if not m:
+        return
+    inv = _note_inventory(cfg, dest_dir, None, incompat=[name],
+                         entries=[(name, m.group(2))])
+    _report_incompat(dest_dir, inv["incompat"], cfg)
 
 
 def _mark_partial(cfg: dict, dest_dir, name: str, remote: str | None = None) -> None:
@@ -2966,6 +3196,7 @@ def _apply_keep_policy_core(
     forced_keep: list[str] | None = None,
     week_startday: str | None = None,
     partials: list[str] | None = None,
+    incompat: list[str] | None = None,
     prune_partials: bool = False,
 ) -> None:
     """Shared keep-policy engine used by apply_keep_policy and apply_keep_policy_ssh.
@@ -2982,9 +3213,10 @@ def _apply_keep_policy_core(
     is used.
 
     *partials* is the list of names in this destination that a receive left
-    half-written (TODO 33).  They are removed from *items* before the slots are
-    counted, so a corrupt subvolume never pushes a real backup out of a slot.
-    They are only deleted when *prune_partials* is set.
+    half-written (TODO 33), *incompat* the names in a snapshot pool that btrfs
+    does not mark read-only (TODO 33b).  Both are removed from *items* before the
+    slots are counted, so a corrupt subvolume never pushes a real archive out of
+    a slot.  They are only deleted when *prune_partials* is set.
     """
     keep_values = [
         keep.get("keep_hourly", 0),
@@ -3005,21 +3237,27 @@ def _apply_keep_policy_core(
         log(f"\t{no_items_msg}", 1, cfg["verbose"])
         return
 
-    # TODO 33: a subvolume left by a receive that died mid-stream is not a
-    # backup, so it must come out of the slot counting before the slots are
-    # filled -- otherwise the corrupt newest entry holds a slot and the last
-    # real backup is pruned.  Out of the policy it goes either way; it is only
-    # deleted when the user opted in with --prune-partial-subvolumes.
-    if partials:
-        partial_names = {str(p) for p in partials}
+    # TODO 33/33b: a subvolume left by a receive that died mid-stream is not a
+    # backup, and a snapshot pool entry that btrfs does not mark read-only is not
+    # a usable snapshot either.  Both must come out of the slot counting before
+    # the slots are filled -- otherwise the corrupt newest entry holds a slot and
+    # the last real archive is pruned.  Out of the policy they go either way; they
+    # are only deleted when the user opted in with --prune-partial-subvolumes.
+    partial_names = {str(p) for p in (partials or [])}
+    incompat_names = {str(p) for p in (incompat or [])}
+    unusable = partial_names | incompat_names
+    if unusable:
         leftovers = [it for it in items
-                     if Path(str(it[1])).name in partial_names]
+                     if Path(str(it[1])).name in unusable]
         items = [it for it in items
-                 if Path(str(it[1])).name not in partial_names]
+                 if Path(str(it[1])).name not in unusable]
         if leftovers and prune_partials:
             for _, display, delete_cmd in leftovers:
-                log(f"\tRemoving partial receive {display} "
-                    f"(receive never finished: no Received UUID)",
+                name = Path(str(display)).name
+                reason = ("receive never finished: no Received UUID"
+                          if name in partial_names else
+                          "not read-only: btrfs cannot send it")
+                log(f"\tRemoving unusable archive {display} ({reason})",
                     1, cfg["verbose"])
                 try:
                     run(delete_cmd,
@@ -3142,6 +3380,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forc
         forced_keep,
         week_startday,
         partials=_partial_receives(directory, cfg),
+        incompat=_incompat_snapshots(directory, cfg),
         prune_partials=prune_partials,
     )
 
@@ -3687,7 +3926,8 @@ def _add_maint_global_options(p: argparse.ArgumentParser) -> None:
              "dangerous options. Blocked options are reported via stderr.")
     p.add_argument("--prune-partial-subvolumes", action="store_true",
         help="Delete subvolumes left by a receive that died mid-stream (no "
-             "Received UUID) instead of only reporting them. "
+             "Received UUID), and snapshot_dir entries named like an archive that "
+             "btrfs does not mark read-only, instead of only reporting them. "
              "Can be set globally or per-archive in config file.")
     p.add_argument("--keep-hourly", type=int, metavar="N", help="Number of hourly snapshots/backups to retain")
     p.add_argument("--keep-daily", type=int, metavar="N", help="Number of daily snapshots/backups to retain")
@@ -4308,9 +4548,11 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
             rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
 
         # TODO 33: an entry left by a receive that died mid-stream is not a
-        # backup, so the table says so instead of "yes".  Snapshots are never
-        # labelled partial: they were never received, so they have no Received
-        # UUID by definition.
+        # backup, so the table says so instead of "yes".  Snapshots were never
+        # received, so they have no Received UUID by definition and cannot be
+        # judged that way; what a snapshot pool can be judged by is the read-only
+        # flag (TODO 33b), and an entry without it is labelled "incompat".
+        snap_unusable = _incompat_ts_set(snap_d, name, cfg) if snap_d and snap_d.is_dir() else set()
         bak_partial = _partial_ts_set(bak_d, name, cfg) if bak_d and bak_d.is_dir() else set()
         rem_partial = (
             _partial_ts_set(remote_dir, name, cfg, remote, remote_sudo)
@@ -4324,20 +4566,20 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
             continue
         # Only show columns that are actually configured for this archive.
         # snapshot_dir is global, so the snapshot column is always present.
-        cols = [("snapshot", snap_ts, set())]
+        cols = [("snapshot", snap_ts, snap_unusable, "incompat")]
         if bak_d:
-            cols.append(("backup", bak_ts, bak_partial))
+            cols.append(("backup", bak_ts, bak_partial, "partial"))
         if remote and remote_dir:
-            cols.append(("remote", rem_ts, rem_partial))
-        hdr = "    " + f"{'timestamp':<20}" + " ".join(f"{label:<10}" for label, _, _ in cols)
+            cols.append(("remote", rem_ts, rem_partial, "partial"))
+        hdr = "    " + f"{'timestamp':<20}" + " ".join(f"{label:<10}" for label, _, _, _ in cols)
         log(hdr, 0, verbosity)
         for ts in all_ts:
             cells = [f"{ts:<20}"]
-            for _label, tset, partial in cols:
+            for _label, tset, unusable, word in cols:
                 if ts not in tset:
                     cell = "no"
                 else:
-                    cell = "partial" if ts in partial else "yes"
+                    cell = word if ts in unusable else "yes"
                 cells.append(f"{cell:<10}")
             log("    " + "".join(cells), 0, verbosity)
     log("List complete.", 0, verbosity)
@@ -4463,11 +4705,15 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
             log("  no destination configured — nothing to rebuild", 1, cfg["verbose"])
             continue
 
-        snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name, cfg)} if snap_d and snap_d.is_dir() else set()
+        snap_unusable = (_incompat_ts_set(snap_d, name, cfg)
+                        if snap_d and snap_d.is_dir() else set())
+        snap_ts = ({ts for ts, _ in iter_archive_items(snap_d, name, cfg)} - snap_unusable
+                   if snap_d and snap_d.is_dir() else set())
         # TODO 33: a subvolume left by a receive that died mid-stream is not a
         # backup, so it does not count as present: rebuild plans to restore over
         # it and then refuses to land on it (phase 4) rather than believing the
-        # archive is complete.
+        # archive is complete.  TODO 33b: a snapshot pool entry that is not
+        # read-only is not a snapshot either, for the same reason.
         bak_partial = _partial_ts_set(bak_d, name, cfg) if bak_d and bak_d.is_dir() else set()
         rem_partial = (
             _partial_ts_set(remote_dir, name, cfg, remote, remote_sudo)
@@ -4687,6 +4933,18 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         f"rebuilding", 1, cfg["verbose"])
                     failed.append(label)
                     continue
+            # TODO 33b: in snapshot_dir the same situation is a subvolume btrfs
+            # does not mark read-only.  `snapshot -r` onto an existing writable
+            # directory does not overwrite it -- it nests a new subvolume inside
+            # it -- so the leg has to be refused rather than attempted.
+            if kind in ("snapshot", "from_remote") and it["dest"]:
+                if label in _incompat_snapshots(str(it["dest"]), cfg):
+                    log(f"    {label}: skipped, {it['dest']} already holds an "
+                        f"unusable snapshot with that name (btrfs does not mark "
+                        f"it read-only); delete it before rebuilding",
+                        1, cfg["verbose"])
+                    failed.append(label)
+                    continue
             if kind == "backup":
                 log(f"    {label}: restoring local backup from snapshot", 1, cfg["verbose"])
                 try:
@@ -4763,16 +5021,21 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         failed.append(label)
                         if _is_enospc(stderr):
                             _mark_diskfull(str(it["dest"]), label, cfg)
-                        # A snapshot_dir orphan cannot be told apart from a
-                        # snapshot (both have no Received UUID), so it is not
-                        # recorded as a partial; the disk-full flag above is the
-                        # only signal rebuild can use there.
+                        else:
+                            # TODO 33b: the receive left `label` behind in
+                            # snapshot_dir, writable and half-filled.  The
+                            # readonly scan cannot see it until the pool is
+                            # listed again, and the UUID rule never runs in a
+                            # snapshot pool, so this run records it itself.
+                            _mark_incompat(cfg, str(it["dest"]), label)
                 except Exception as e:
                     log(f"    {label}: snapshot restore from remote error: {e}",
                         1, cfg["verbose"])
                     failed.append(label)
                     if _is_enospc(str(e)):
                         _mark_diskfull(str(it["dest"]), label, cfg)
+                    else:
+                        _mark_incompat(cfg, str(it["dest"]), label)
 
     dry_prefix = "[dry-run] " if dry else ""
     if not any_actionable:
