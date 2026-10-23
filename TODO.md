@@ -169,7 +169,7 @@ still deferred by decision)
     _check_interrupted_rsync now has a 10s timeout; timeout/OSError means
     "no interruption detected" rather than an indefinite hang.
 
-## Improvements (not bugs) — 31 and 33 open
+## Improvements (not bugs) — 31 and 33b open
 
 21. DONE (62a710a, 5b8fa1a, 29ed2cf): the fit check now runs only for FULL sends. btrfs cannot
     report an incremental stream's size in advance — verified empirically:
@@ -334,17 +334,60 @@ still deferred by decision)
 31. Housekeeping outside the repo: `~/.hermes/skills/.usage.json` still lists the
     deleted `btrfs-ssh-backup` skill.
 
-33. Open (found while probing TODO 21 on 2026-10-22): a receive that dies
-    half-way — the send stream truncated, the remote full, the ssh pipe cut —
-    leaves the destination subvolume `{archive}.{ts}` behind with
-    `Received UUID: -`.  It is never chosen as a parent (`_match_parents`
-    compares UUID against received UUID, so a partial subvolume cannot match),
-    which is why the guard still works, but it is writable, useless, and it
-    blocks the next attempt with the same name: "creating subvolume ... failed:
-    File exists".  Nothing cleans it up.  Fix shape: on a failed receive,
-    delete the subvolume the receive was about to create (the name is known
-    before the pipe runs) or at least report it with a `btrfs subvolume delete`
-    hint; a test would need a loopback btrfs with a truncated stream.
+33. DONE (9e1c448; found while probing TODO 21 on 2026-10-22): a receive
+    that dies half-way — the send stream truncated, the ssh pipe cut — leaves the
+    destination subvolume `{archive}.{ts}` behind with `Received UUID: -`.  It is
+    never chosen as a parent (`_match_parents` compares UUID against received
+    UUID, so a partial subvolume cannot match), which is why the guard still
+    works, but it is writable, useless, and it blocks the next attempt with the
+    same name: "creating subvolume ... failed: File exists".  Nothing cleaned it
+    up, and `list` / keep policy / `rebuild` all believed it was a backup.
+
+    Shape, as agreed 2026-10-23:
+    - Report, do not mutate, by default.  Deleting a subvolume is destructive and
+      the admin may want to look at it; the run prints the `btrfs subvolume
+      delete` command and a `bubtrsnap prune <archive> --ts <ts>` hint.
+    - Detection rides on listings the run already has.  Remote: the
+      `btrfs subvolume list` that `iter_archive_items_ssh` already runs now
+      carries `-u -R -p` and its result is cached per destination per run in
+      `cfg["_dest_seen"]` (the same cache the TODO 35 sentinel scan used, now
+      shared by both).  Local: the directory walk already done, plus one
+      `subvolume list -u -R -p` for the UUIDs.  `-o` is deliberately *not* used:
+      it makes the path column fs-root-relative and would break the delete paths
+      `iter_archive_items_ssh` builds.  An old btrfs-progs that rejects the flags
+      falls back to the plain listing and classifies nothing (fail closed).
+    - A partial is a *direct child* of the destination whose name matches the
+      archive pattern and whose Received UUID is `-` while its own UUID is not.
+      `snapshot_dir` is never judged: a snapshot made with `snapshot -r` has no
+      Received UUID either.
+    - A receive that fails for a non-ENOSPC reason records its target as a
+      partial itself (`_mark_partial`), so the legs still queued for that pool in
+      the same run see it; a successful receive records it as real
+      (`_mark_received`) so the cached listing is not stale.  A disk-full rename
+      drops the old name from the cache.
+    - Keep policy excludes partials from slot counting (`partials` /
+      `prune_partials` on `_apply_keep_policy_core`).  They are still *yielded*
+      by `iter_archive_items`/`iter_archive_items_ssh` so `prune --ts` can reach
+      them.
+    - Opt-in deletion: `--prune-partial-subvolumes` / `prune_partial_subvolumes`
+      (global or per archive, CLI > archive > global), which only feeds the keep
+      policy.  It is a `store_true`, so it is not in `_MAINT_VALUE_TAKERS` and
+      cannot swallow the subcommand token.
+    - `list` labels a partial `partial` in the backup/remote columns; `rebuild`
+      treats it as absent when planning and refuses a leg whose target name is
+      already a partial, counting it as failed (exit 1).  A partial that nothing
+      else needs is only reported, and does not change the exit code.
+    - Tests: unittests/test_partial_detect.py (30).
+
+    Not done here, split out as 33b below.
+
+33b. Open: the same question for `snapshot_dir`.  A snapshot directory cannot be
+    judged by the Received UUID (a `snapshot -r` has none), so detecting a
+    half-written *snapshot* needs a different signal — probably comparing the
+    subvolume's generation against the source's, or checking the send/receive
+    banner.  Deferred until there is a case that actually bites: rebuild's
+    snapshot legs cannot be classified either (TODO 35 progress note (2) says the
+    metadata-only leg carries no stderr).
 
 34. DONE (493d71f): `_run_rebuild` swallowed failures.  Phase 4 logged remote
     re-send and remote->local restore failures at level 3 (invisible at the
@@ -458,7 +501,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (388 across 22 files, re-run 2026-10-23); no secrets, eval/exec, pickle; stderr
+- All tests pass (418 across 23 files, re-run 2026-10-23); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
@@ -477,7 +520,7 @@ identity), then the two easy security items 15 and 16, then 21 (space guard)
 and 34 (rebuild exit code).
 
 Phase 1 (security, deferred by decision on 2026-10-22): 13, 12, 14
-Phase 2 (improvements): 31, 33, 35 (35 is the disk-full sentinel; 33 is the
-orphan it renames)
+Phase 2 (improvements): 31, 33b (33 and 35 are done: 35 is the disk-full
+sentinel, 33 the orphan it renames; 33b is the snapshot_dir question)
 
 Each item = one commit, test written first and proven red.

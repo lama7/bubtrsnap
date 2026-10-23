@@ -245,6 +245,54 @@ read-only `btrfs subvolume list`; it also runs under `--dry-run`, so a dry run
 reports a block a live run left behind.  Metadata-only snapshot restores are not
 blocked, since they write no data.
 
+### When a receive dies for another reason
+
+A receive can also die without the pool being full: the stream is truncated, the
+SSH pipe is dropped, the process is killed.  btrfs then still creates the
+subvolume, and the only thing that distinguishes it from a real backup is that
+the Received UUID was never written:
+
+```
+$ btrfs subvolume list -R /backup
+ID 256 gen 9 top level 257 received_uuid -  path lama7.202601010000
+```
+
+bubtrsnap calls such a subvolume a **partial receive**.  It is detected from the
+listing the run already takes (`btrfs subvolume list -u -R -p` on a remote, one
+`subvolume list` plus the directory walk it already does locally), reported once
+per destination per run on stderr at `-v 0`, and treated as absent everywhere it
+matters:
+
+- `list` prints `partial` in that column instead of `yes`.
+- The keep policy does not count it in a slot, so a corrupt newest entry cannot
+  push the last real backup out of the policy and get it pruned.
+- `rebuild` plans to restore over it and then refuses the leg — `btrfs receive`
+  cannot land on an existing subvolume — and counts it as a failed action, so
+  `rebuild` exits 1.
+
+Nothing is deleted by default.  To make the run clean them up as part of keep
+policy, opt in with `--prune-partial-subvolumes` (or
+`prune_partial_subvolumes = true` in the config, globally or per archive):
+
+```
+Partial receive: /backup holds 1 subvolume(s) left by a receive that died
+mid-stream:
+    lama7.202601010000
+btrfs records no Received UUID for them, so they are not usable backups: the
+keep policy, `list` and `rebuild` all ignore them, and nothing is restored over
+them.  They still hold the space the failed receive used, so removing them frees
+it and clears the flag:
+    btrfs subvolume delete /backup/lama7.202601010000
+  or: bubtrsnap prune lama7 --ts 202601010000
+Run with --prune-partial-subvolumes to remove such leftovers automatically.
+```
+
+Detection is deliberately fail-closed: if the destination cannot be listed, or
+the UUID columns are not available (older btrfs-progs on a remote falls back to
+the plain listing it used to run), nothing is classified as partial and nothing
+is ever deleted on a guess.  `snapshot_dir` is never judged, because a snapshot
+made with `btrfs snapshot -r` has no Received UUID either.
+
 ## Stream files
 
 For very large subvolumes or when you want to break the send and receive steps
@@ -482,7 +530,9 @@ behaviour when no subcommand is given.
 
 **`bubtrsnap list [ARCHIVE ...]`** — read-only table of the snapshot / backup /
 remote timestamps that exist for each archive. All config archives are shown if
-none are named.
+none are named. A backup or remote entry left by a receive that never finished
+is labelled `partial` rather than `yes` (see *When a receive dies for another
+reason*).
 
 **`bubtrsnap prune --ts TS [ARCHIVE ...]`** — delete snapshot/backup subvolumes
 matching the given timestamp(s). `--ts` takes a single timestamp
@@ -511,7 +561,9 @@ backup to restore, so its remote re-send happens in the same run. Run
 `bubtrsnap list` to confirm all three locations line up before calling it done.
 A restore that was attempted and failed is reported at verbosity 1 and `rebuild`
 exits 1 when any action failed; an action the space guard chose not to attempt
-is a skip, not a failure, and does not change the exit code.
+is a skip, not a failure, and does not change the exit code.  A partial receive
+(see above) does not count as a backup, so a leg that would have to receive over
+one is refused and counted as a failure.
 
 Examples:
 
@@ -532,7 +584,7 @@ bubtrsnap rebuild home
 `backup_dir`, `snaps_only`, `export_dir`, `import_dir`, `stage_dir`,
 `remote_host`, `remote_path`, `remote_sudo`, `rsync`, `rsync_opts`,
 `week_startday`, `keep_hourly`, `keep_daily`, `keep_weekly`,
-`keep_monthly`, `keep_yearly`
+`keep_monthly`, `keep_yearly`, `prune_partial_subvolumes`
 
 **Per-archive only:**
 `subvolume` (required), `export_file`, `import_file`, `stage_file`,
@@ -634,6 +686,21 @@ keep_monthly = 4
 **Note:** rsync only affects the *file-based* stream transfer. A plain
 `btrfs send | btrfs receive` over SSH is never rsync'd, so a rsync config must
 also produce a stream file (`export_file`/`export_dir`/`stage_file`).
+
+Example — let keep policy clean up the leftovers of a receive that died
+mid-stream instead of only reporting them:
+
+```toml
+snapshot_dir = "/pool/snapshots"
+backup_dir   = "/backup"
+
+# Off by default: a run only reports such subvolumes and prints the delete
+# command.  Set per archive too, if only one archive should be pruned this way.
+prune_partial_subvolumes = true
+
+[home]
+subvolume = "/home"
+```
 
 ## Installing
 
