@@ -3863,9 +3863,11 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
     metadata-only subvolume snapshot, lost local backup <- snapshot via
     send/receive, lost remote <- local re-send, and a snapshot that exists
     only on the remote recovered back locally via an SSH send/receive).
-    Never deletes; proceeds automatically (no --yes gate)."""
+    Never deletes; proceeds automatically (no --yes gate).  Returns 0 when every
+    planned action succeeded and 1 when at least one leg failed."""
     dry = cfg.get("dry_run", False)
     restored = 0
+    failed: list[str] = []
     any_actionable = False
     for archive in archives:
         name = archive["name"]
@@ -4077,6 +4079,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                     restored += 1
                 except Exception as e:
                     log(f"    {label}: local backup restore failed: {e}", 1, cfg["verbose"])
+                    failed.append(label)
             elif kind == "snapshot":
                 log(f"    {label}: restoring snapshot (metadata-only) from backup", 1, cfg["verbose"])
                 try:
@@ -4088,6 +4091,7 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                     restored += 1
                 except Exception as e:
                     log(f"    {label}: snapshot restore failed: {e}", 1, cfg["verbose"])
+                    failed.append(label)
             elif kind == "remote":
                 log(f"    {label}: re-sending to remote {remote}", 1, cfg["verbose"])
                 try:
@@ -4104,9 +4108,12 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         log(f"    {label}: remote restored", 1, cfg["verbose"])
                         restored += 1
                     else:
-                        log(f"    {label}: remote re-send failed: {stderr.strip()}", 3, cfg["verbose"])
+                        log(f"    {label}: remote re-send failed: {stderr.strip()}",
+                            1, cfg["verbose"])
+                        failed.append(label)
                 except Exception as e:
                     log(f"    {label}: remote re-send error: {e}", 1, cfg["verbose"])
+                    failed.append(label)
             elif kind == "from_remote":
                 log(f"    {label}: restoring snapshot from remote {remote}", 1, cfg["verbose"])
                 try:
@@ -4126,15 +4133,27 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         log(f"    {label}: snapshot restored from remote", 1, cfg["verbose"])
                         restored += 1
                     else:
-                        log(f"    {label}: snapshot restore from remote failed: {stderr.strip()}", 3, cfg["verbose"])
+                        log(f"    {label}: snapshot restore from remote failed: "
+                            f"{stderr.strip()}", 1, cfg["verbose"])
+                        failed.append(label)
                 except Exception as e:
-                    log(f"    {label}: snapshot restore from remote error: {e}", 1, cfg["verbose"])
+                    log(f"    {label}: snapshot restore from remote error: {e}",
+                        1, cfg["verbose"])
+                    failed.append(label)
 
     dry_prefix = "[dry-run] " if dry else ""
     if not any_actionable:
         log(f"{dry_prefix}Rebuild complete: nothing to do.", 1, cfg["verbose"])
-    else:
-        log(f"{dry_prefix}Rebuild complete: {restored} restored.", 1, cfg["verbose"])
+        return 0
+    if failed:
+        log(f"{dry_prefix}Rebuild complete: {restored} restored, {len(failed)} failed.",
+            1, cfg["verbose"])
+        # Also to stderr, unconditionally: rebuild is often run from cron and
+        # the exit code alone is not a useful diagnosis (TODO 34).
+        print(f"Error: {len(failed)} rebuild action(s) failed: {', '.join(failed)}",
+              file=sys.stderr)
+        return 1
+    log(f"{dry_prefix}Rebuild complete: {restored} restored.", 1, cfg["verbose"])
     return 0
 
 

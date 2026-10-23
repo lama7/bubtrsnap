@@ -8,6 +8,9 @@ readonly subvolume, matching the normal snapshot convention).
 This exercises the new `from_remote` branch: the planning decision
 (`in_r and not in_s and not in_b`), the snapshot-space guard, and the
 Phase 4 execution that pipes an SSH send into a local receive.
+
+TestRebuildFailureReporting covers what happens when a Phase 4 leg fails:
+it must be visible at verbosity 1 and the run must exit non-zero.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from __future__ import annotations
 import io
 import subprocess
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -171,6 +174,191 @@ class TestRebuildWithoutBackupDir(unittest.TestCase):
             self.assertIn("re-send to remote (snapshot)", text)
             self.assertNotIn("restore local backup", text)
             m_piped.assert_not_called()
+
+
+class TestRebuildFailureReporting(unittest.TestCase):
+    """A failed rebuild leg must be visible at verbosity 1 and make the run
+    exit non-zero.
+
+    Before the fix, remote re-send and remote->local restore failures were
+    logged at level 3 (invisible at the default verbosity) and _run_rebuild
+    returned 0 no matter what phase 4 did, so `bubtrsnap rebuild` reported
+    success while a receive had died half-way leaving a partial subvolume.
+    """
+
+    ENOSPC = "receive failed: ERROR: writing to huge.bin failed: " \
+             "No space left on device"
+
+    def _cfg(self, snap_dir: Path, backup_dir: Path | None = None,
+             remote: str | None = None, remote_dir: str | None = None) -> dict:
+        return {
+            "verbose": 1, "dry_run": False, "local_sudo": False,
+            "snapshot_dir": str(snap_dir),
+            "backup_dir": str(backup_dir) if backup_dir else None,
+            "remote_host": remote, "remote_path": remote_dir,
+            "remote_sudo": False,
+            "keep_hourly": 0, "keep_daily": 0, "keep_weekly": 0,
+            "keep_monthly": 0, "keep_yearly": 0,
+            "week_startday": "sunday",
+        }
+
+    def _archive(self, snap_dir: Path, name: str = "root",
+                 remote: str | None = None, remote_dir: str | None = None) -> dict:
+        return {"name": name, "subvolume": str(snap_dir / name),
+                "remote_host": remote, "remote_path": remote_dir,
+                "remote_sudo": False}
+
+    def _run(self, archives, cfg, patches):
+        """Run _run_rebuild with the given (name, kwargs) patches applied.
+
+        Returns (rc, stdout_text, stderr_text).
+        """
+        out, err = io.StringIO(), io.StringIO()
+        fake = subprocess.CompletedProcess([], 0, "", "")
+        stack = [mock.patch.object(bs, name, **kw) for name, kw in patches]
+        stack.append(mock.patch.object(bs, "run", return_value=fake))
+        for p in stack:
+            p.__enter__()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = bs._run_rebuild(archives, cfg, cfg["verbose"])
+        finally:
+            for p in reversed(stack):
+                p.__exit__(None, None, None)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_remote_resend_failure_visible_and_nonzero(self):
+        """A remote re-send that dies with ENOSPC must be reported at -v 1 and
+        must not report a successful rebuild."""
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            ts = "202610011200"
+            (snap_dir / f"root.{ts}").mkdir()
+            cfg = self._cfg(snap_dir, remote="user@host", remote_dir="/backup")
+            archive = self._archive(snap_dir, remote="user@host",
+                                    remote_dir="/backup")
+            rc, out, err = self._run(
+                [archive], cfg,
+                [("iter_archive_items_ssh", {"return_value": []}),
+                 ("find_parents_ssh", {"return_value": []}),
+                 ("piped_run", {"return_value": (1, self.ENOSPC)})],
+            )
+            self.assertEqual(rc, 1, "rebuild must exit non-zero when a leg failed")
+            self.assertIn(f"root.{ts}: remote re-send failed", out)
+            self.assertIn("No space left on device", out)
+            self.assertIn("1 rebuild action(s) failed", err)
+            self.assertIn(f"root.{ts}", err)
+
+    def test_from_remote_failure_visible_and_nonzero(self):
+        """Remote->local restore is the rebuild retry path; a dead receive
+        there must be visible at -v 1 and exit non-zero."""
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            ts = "202610011200"
+            cfg = self._cfg(snap_dir, remote="user@host", remote_dir="/backup")
+            archive = self._archive(snap_dir, remote="user@host",
+                                    remote_dir="/backup")
+            rc, out, err = self._run(
+                [archive], cfg,
+                [("iter_archive_items", {"return_value": iter([])}),
+                 ("iter_archive_items_ssh",
+                  {"return_value": iter([(ts, f"/backup/root.{ts}")])}),
+                 ("_remote_size_of", {"return_value": 1024}),
+                 ("piped_run", {"return_value": (1, self.ENOSPC)})],
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("snapshot restore from remote failed", out)
+            self.assertIn("No space left on device", out)
+            self.assertIn("1 rebuild action(s) failed", err)
+
+    def test_local_restore_exception_returns_nonzero(self):
+        """An exception from the local piped send/receive already prints at -v 1,
+        but the exit code still has to reflect it."""
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            ts = "202610011200"
+            (snap_dir / f"root.{ts}").mkdir()
+            bak_dir = snap_dir / "backup"
+            bak_dir.mkdir()
+            cfg = self._cfg(snap_dir, backup_dir=bak_dir)
+            archive = self._archive(snap_dir)
+            rc, out, err = self._run(
+                [archive], cfg,
+                [("iter_archive_items_ssh", {"return_value": []}),
+                 ("find_parents", {"return_value": []}),
+                 ("_piped_send_to_local",
+                  {"side_effect": RuntimeError(
+                      "btrfs receive (local) failed: No space left on device")})],
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("local backup restore failed", out)
+            self.assertIn("1 rebuild action(s) failed", err)
+
+    def test_all_legs_succeed_returns_zero(self):
+        """The happy path must keep returning 0 and the original summary line."""
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            ts = "202610011200"
+            cfg = self._cfg(snap_dir, remote="user@host", remote_dir="/backup")
+            archive = self._archive(snap_dir, remote="user@host",
+                                    remote_dir="/backup")
+            rc, out, err = self._run(
+                [archive], cfg,
+                [("iter_archive_items", {"return_value": iter([])}),
+                 ("iter_archive_items_ssh",
+                  {"return_value": iter([(ts, f"/backup/root.{ts}")])}),
+                 ("_remote_size_of", {"return_value": 1024}),
+                 ("piped_run", {"return_value": (0, "")})],
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("Rebuild complete: 1 restored.", out)
+            self.assertEqual(err.strip(), "")
+
+    def test_space_guard_skip_is_not_a_failure(self):
+        """A leg the space guard chose not to attempt is a skip, not a failure:
+        the run still exits 0 so cron/callers don't see an error for a pool
+        that simply cannot fit a full send."""
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            ts = "202610011200"
+            snap = snap_dir / f"root.{ts}"
+            snap.mkdir()
+            (snap / "data.bin").write_bytes(b"x" * 4096)
+            bak_dir = snap_dir / "backup"
+            bak_dir.mkdir()
+            cfg = self._cfg(snap_dir, backup_dir=bak_dir)
+            archive = self._archive(snap_dir)
+            rc, out, err = self._run(
+                [archive], cfg,
+                [("iter_archive_items_ssh", {"return_value": []}),
+                 ("find_parents", {"return_value": []}),
+                 ("_space_check", {"return_value": False})],
+            )
+            self.assertEqual(rc, 0)
+            self.assertNotIn("failed", out)
+            self.assertEqual(err.strip(), "")
+
+    def test_mixed_success_and_failure_exits_nonzero(self):
+        """One good leg does not mask one bad leg."""
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td)
+            ts1, ts2 = "202610011200", "202610021200"
+            for ts in (ts1, ts2):
+                (snap_dir / f"root.{ts}").mkdir()
+            cfg = self._cfg(snap_dir, remote="user@host", remote_dir="/backup")
+            archive = self._archive(snap_dir, remote="user@host",
+                                    remote_dir="/backup")
+            rc, out, err = self._run(
+                [archive], cfg,
+                [("iter_archive_items_ssh", {"return_value": []}),
+                 ("find_parents_ssh", {"return_value": []}),
+                 ("piped_run",
+                  {"side_effect": [(0, ""), (1, self.ENOSPC)]})],
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("Rebuild complete: 1 restored, 1 failed.", out)
+            self.assertIn(f"root.{ts2}", err)
+            self.assertNotIn(f"root.{ts1}", err)
 
 
 if __name__ == "__main__":
