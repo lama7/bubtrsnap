@@ -12,7 +12,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (last code change 493d71f, VERSION 0.4.2.dev0;
+- `maintain` — working branch (last code change 9cc4919, VERSION 0.4.2.dev0;
   docs-only commits trail the code tip). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
@@ -357,7 +357,7 @@ still deferred by decision)
     deliberate and pinned by a test.  Tests:
     unittests/test_rebuild.py `TestRebuildFailureReporting` (6).
 
-35. Open (design agreed 2026-10-22, builds on 33 and 34): a full-disk partial
+35. In progress (design agreed 2026-10-22, builds on 33 and 34): a full-disk partial
     receive should leave a visible, self-clearing flag instead of silent
     garbage.  The minimum correct action is already 34 (report + exit non-zero);
     everything below is courtesy, but it is courtesy a space guard cannot
@@ -408,9 +408,25 @@ still deferred by decision)
     - Deliberately not doing: a quarantine sweep (the self-clearing sentinel
       makes it redundant).
 
-    Commits: (1) 34 above; (2) `_is_enospc` + rename in `_receive_local`,
-    `_receive_on_remote` and rebuild phase 4; (3) detection + per-destination
-    blocking incl. dry-run reporting; (4) docs.
+    Progress:
+    - (1) DONE (493d71f) — item 34 above.
+    - (2) DONE (9cc4919): `_is_enospc()`, `_diskfull_name()`,
+      `_receive_target_name()` and `_mark_diskfull()` sit beside
+      `_is_duplicate_receive`, and every receive leg that can fill a pool calls
+      them: `_receive_local`, `_receive_on_remote`, both legs of `send_backup`,
+      `_piped_send_to_local`, and the `remote` and `from_remote` legs of
+      rebuild.  The rename is scoped to the destination that actually failed and
+      goes through `run(..., dry_run=...)`.  Tests:
+      unittests/test_diskfull_rename.py (22).  Two caveats found while writing
+      it: a doomed full send keeps running for minutes before `piped_run()`
+      returns, so the classification is necessarily post-hoc — the rename
+      happens after the pipe has died, not during it; and rebuild's local
+      snapshot-restore leg cannot be classified at all, because it runs
+      `run(..., check=True, stderr=DEVNULL)` and the exception carries only the
+      exit status.
+    - (3) Open: detection + per-destination blocking, including dry-run
+      reporting.
+    - (4) Open: docs for the block semantics and the one-command remedy.
 
 ## Keep-algorithm audit notes (no changes made, per instruction)
 
@@ -421,7 +437,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (338 across 20 files, re-run 2026-10-22); no secrets, eval/exec, pickle; stderr
+- All tests pass (360 across 21 files, re-run 2026-10-23); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).

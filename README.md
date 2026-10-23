@@ -198,6 +198,26 @@ rsync_opts = '-e "ssh -p 2222 -i /home/user/.ssh/id_rsa"'
 Using rsync affects only file-based transfers (replacing scp) and does not
 affect piping `btrfs send | btrfs receive` or local backup operations.
 
+### When a destination runs out of space
+
+A `btrfs receive` that dies on a full destination pool still creates the
+subvolume it was writing and leaves it half-written.  bubtrsnap renames that
+partial to `.bubtrsnap-diskfull-<archive>-<timestamp>` in the destination that
+failed and prints the one command that clears it:
+
+```
+Disk full: the partial subvolume /backup/home.202601010000 is blocking /backup.
+Remove it to free the space and unblock later runs:
+    btrfs subvolume delete /backup/.bubtrsnap-diskfull-home-202601010000
+```
+
+The renamed subvolume is invisible to the keep policy, `list` and `rebuild`:
+its name cannot match the `archive.YYYYMMDDhhmm` pattern.  It is also the space
+the failed receive ate, so the command above removes both the garbage and the
+flag.  Only a real ENOSPC triggers this — a dropped SSH pipe, an
+already-existing target, or a permission error leaves the partial where it is.
+`--dry-run` never renames anything.
+
 ## Stream files
 
 For very large subvolumes or when you want to break the send and receive steps
