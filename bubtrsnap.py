@@ -1730,6 +1730,8 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         elapsed = (datetime.now() - start_time).total_seconds()
         log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
         if rc != 0:
+            if _is_enospc(stderr):
+                _mark_diskfull(str(backup_dir), snap.name, cfg)
             raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
 
     if has_remote:
@@ -1748,6 +1750,9 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         elapsed = (datetime.now() - start_time).total_seconds()
         log(f"btrfs send/receive (SSH) completed in {format_duration(elapsed)}", 1, cfg["verbose"])
         if rc != 0:
+            if _is_enospc(stderr):
+                _mark_diskfull(str(remote_dir), snap.name, cfg,
+                               remote=remote, remote_sudo=remote_sudo)
             raise RuntimeError(f"btrfs receive via SSH failed: {stderr}")
 
     return dest
@@ -1842,6 +1847,86 @@ def _is_duplicate_receive(stderr: str | None) -> bool:
     return "already exists" in low or "file exists" in low
 
 
+DISKFULL_PREFIX = ".bubtrsnap-diskfull"
+
+
+def _is_enospc(stderr: str | None) -> bool:
+    """True when a receive failed because the destination pool ran out of space.
+
+    Deliberately narrow: the sentinel this enables makes later runs refuse to
+    send into that pool, so a false positive would stop all backups for a
+    transient problem.  btrfs-progs 7.1 reports a full pool as 'writing to
+    <file> failed: No space left on device'; a dropped SSH pipe reports 'short
+    read from stream', an existing target reports 'File exists', and neither is
+    disk-full.
+    """
+    low = (stderr or "").lower()
+    return "no space left on device" in low or "enospc" in low
+
+
+def _diskfull_name(target: str) -> str:
+    """Sentinel name for the partial subvolume `target` ("{archive}.{ts}").
+
+    Dot-prefixed and hyphenated so the name can never match _ARCHIVE_TS_RE:
+    the keep policy, the rebuild plan and every remote listing ignore it, and
+    two different archives filling the same pool cannot collide.
+    """
+    archive, _, ts = target.rpartition(".")
+    parts = [DISKFULL_PREFIX] + [p for p in (archive, ts) if p]
+    return "-".join(parts)
+
+
+def _receive_target_name(stream: Path, result) -> str:
+    """Name of the subvolume a receive was creating.
+
+    The 'At subvol ...' banner is printed before btrfs starts writing chunks, so
+    it is available even when the write then fails; the stream filename stem is
+    the fallback when the banner never appeared.
+    """
+    text = ((result.stderr if result else "") or "") + \
+           ((result.stdout if result else "") or "")
+    name = _parse_at_subvol(text)
+    return Path(name).name if name else stream.stem
+
+
+def _mark_diskfull(dest_dir: str, name: str, cfg: dict,
+                   remote: str | None = None, remote_sudo: bool = False) -> None:
+    """Rename the half-written subvolume a disk-full receive left behind.
+
+    Renaming rather than deleting is deliberate: `mv` works on a pool with 0
+    bytes free (measured 3-7 ms on a 100 % full loopback pool), needs no
+    CAP_SYS_ADMIN, and is reversible if the subvolume turns out to be salvageable.
+    btrfs-progs 7.1 has no `subvolume rename`, so this is a plain `mv` in the
+    same parent directory -- `mv` across subvolumes fails with EXDEV.
+
+    The renamed subvolume is the space the failed receive ate, so the one
+    command the message prints removes both the garbage and the flag.
+    """
+    new = _diskfull_name(name)
+    if remote:
+        src, dst = f"{dest_dir}/{name}", f"{dest_dir}/{new}"
+        cmd = build_ssh_cmd(remote, ["mv", src, dst], remote_sudo)
+        remedy = f"ssh {remote}{' sudo -n' if remote_sudo else ''} btrfs subvolume delete {dst}"
+    else:
+        src, dst = str(Path(dest_dir) / name), str(Path(dest_dir) / new)
+        cmd = (["sudo", "-n", "mv"] if cfg.get("local_sudo") else ["mv"]) + [src, dst]
+        remedy = f"btrfs subvolume delete {dst}"
+
+    if cfg.get("dry_run"):
+        log(f"[dry-run] would rename {src} to {dst}", 1, cfg["verbose"])
+        return
+
+    result = run(cmd, dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"],
+                 capture_output=True, text=True, check=False)
+    if result is not None and result.returncode != 0:
+        print(f"Error: the pool {dest_dir} is full and the partial subvolume "
+              f"{src} could not be renamed: {(result.stderr or '').strip()}",
+              file=sys.stderr)
+    print(f"Disk full: the partial subvolume {src} is blocking {dest_dir}. "
+          f"Remove it to free the space and unblock later runs:\n    {remedy}",
+          file=sys.stderr)
+
+
 def _received_subvol_name(stream: Path, result, cfg: dict, source: str) -> str:
     """Name of the subvolume btrfs receive just created.
 
@@ -1927,6 +2012,9 @@ def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
             print(f"Warning: subvolume from '{stream.name}' already exists in "
                   f"{remote_dir} – skipping", file=sys.stderr)
             return None
+        if _is_enospc(stderr):
+            _mark_diskfull(remote_dir, _receive_target_name(stream, ssh_result),
+                          cfg, remote=remote, remote_sudo=remote_sudo)
         print(f"Error receiving '{stream}' via SSH:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
@@ -2084,6 +2172,8 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
             print(f"Warning: subvolume from '{stream.name}' already exists in "
                   f"{backup_dir} – skipping", file=sys.stderr)
             return None
+        if _is_enospc(stderr):
+            _mark_diskfull(str(backup_dir), _receive_target_name(stream, result), cfg)
         print(f"Error receiving '{stream}' locally:\n{stderr}", file=sys.stderr)
         sys.exit(1)
 
@@ -2690,6 +2780,8 @@ def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict
     elapsed = (datetime.now() - start_time).total_seconds()
     log(f"btrfs send/receive completed in {format_duration(elapsed)}", 1, cfg["verbose"])
     if rc != 0:
+        if _is_enospc(stderr):
+            _mark_diskfull(str(backup_dir), snap.name, cfg)
         raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
 
 
@@ -4111,9 +4203,15 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         log(f"    {label}: remote re-send failed: {stderr.strip()}",
                             1, cfg["verbose"])
                         failed.append(label)
+                        if _is_enospc(stderr):
+                            _mark_diskfull(str(remote_dir), label, cfg,
+                                          remote=remote, remote_sudo=remote_sudo)
                 except Exception as e:
                     log(f"    {label}: remote re-send error: {e}", 1, cfg["verbose"])
                     failed.append(label)
+                    if _is_enospc(str(e)):
+                        _mark_diskfull(str(remote_dir), label, cfg,
+                                      remote=remote, remote_sudo=remote_sudo)
             elif kind == "from_remote":
                 log(f"    {label}: restoring snapshot from remote {remote}", 1, cfg["verbose"])
                 try:
@@ -4136,10 +4234,14 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
                         log(f"    {label}: snapshot restore from remote failed: "
                             f"{stderr.strip()}", 1, cfg["verbose"])
                         failed.append(label)
+                        if _is_enospc(stderr):
+                            _mark_diskfull(str(it["dest"]), label, cfg)
                 except Exception as e:
                     log(f"    {label}: snapshot restore from remote error: {e}",
                         1, cfg["verbose"])
                     failed.append(label)
+                    if _is_enospc(str(e)):
+                        _mark_diskfull(str(it["dest"]), label, cfg)
 
     dry_prefix = "[dry-run] " if dry else ""
     if not any_actionable:
