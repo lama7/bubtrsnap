@@ -137,6 +137,7 @@ class TestSCPRemoteTemp(unittest.TestCase):
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False}
         mock_run.side_effect = [
             _ok("scp"),
+            _ok("ssh", "btrfs", "subvolume", "list"),
             _fail("ssh", "chmod: Operation not permitted"),
             _ok("ssh", "btrfs", "receive"),
             _ok("ssh", "rm"),

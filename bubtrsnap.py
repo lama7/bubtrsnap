@@ -1713,6 +1713,14 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
         log("No backup destination configured (no backup_dir or remote/remote_dir)", 1, cfg["verbose"])
         return dest
 
+    if has_local and _diskfull_blocked(str(backup_dir), cfg):
+        # TODO 35: the pool still holds a partial from the receive that died.
+        # Skipping is not fatal -- the remote leg and keep-policy pruning still
+        # run, and pruning is how the pool gets space back.
+        log(f"Local backup to {backup_dir} skipped: destination is disk-full",
+            1, cfg["verbose"])
+        has_local = False
+
     if has_local:
         start_time = datetime.now()
         if local_parents is None:
@@ -1733,6 +1741,11 @@ def send_backup(snap: Path, snapshot_dir: Path, backup_dir: Path | None, cfg: di
             if _is_enospc(stderr):
                 _mark_diskfull(str(backup_dir), snap.name, cfg)
             raise RuntimeError(f"btrfs receive (local) failed: {stderr}")
+
+    if has_remote and _diskfull_blocked(str(remote_dir), cfg, remote, remote_sudo):
+        log(f"SSH remote {remote}:{remote_dir} skipped: destination is disk-full",
+            1, cfg["verbose"])
+        has_remote = False
 
     if has_remote:
         start_time = datetime.now()
@@ -1925,6 +1938,107 @@ def _mark_diskfull(dest_dir: str, name: str, cfg: dict,
     print(f"Disk full: the partial subvolume {src} is blocking {dest_dir}. "
           f"Remove it to free the space and unblock later runs:\n    {remedy}",
           file=sys.stderr)
+    _note_diskfull(cfg, dest_dir, [new], remote)
+
+
+def _note_diskfull(cfg: dict | None, dest_dir, names, remote: str | None = None) -> None:
+    """Record the sentinels a scan found in `dest_dir` for this run.
+
+    Detection rides on scans the run already performs -- iter_archive_items and
+    iter_archive_items_ssh walk the destination anyway -- so the check costs no
+    extra command.  The cache lives on the run's cfg, so a partial renamed mid-run
+    is visible to the next leg into the same pool, and nothing leaks from one run
+    to the next.
+    """
+    if cfg is None:
+        return
+    seen = cfg.setdefault("_diskfull_seen", {})
+    key = (str(dest_dir), remote)
+    seen[key] = sorted(set(seen.get(key, ())) | {n for n in names if n})
+
+
+def _sentinel_from_listing_line(line: str) -> str | None:
+    """Sentinel basename from a `btrfs subvolume list` line, else None."""
+    parts = line.split()
+    for i, part in enumerate(parts):
+        if part == "path" and i + 1 < len(parts):
+            name = Path(parts[-1]).name
+            return name if name.startswith(DISKFULL_PREFIX) else None
+    return None
+
+
+def _diskfull_sentinels(dest_dir, cfg: dict, remote: str | None = None,
+                        remote_sudo: bool = False) -> list[str]:
+    """Partial subvolumes left by a disk-full receive in `dest_dir` (local or remote).
+
+    Read-only, so it runs during dry-run too: a dry-run can never create the
+    condition, but it must see one a live run left behind.
+    """
+    key = (str(dest_dir), remote)
+    cached = cfg.get("_diskfull_seen", {}).get(key)
+    if cached is not None:
+        return cached
+
+    if remote:
+        cmd = build_ssh_cmd(remote, btrfs_cmd(cfg, "subvolume", "list",
+                                             str(dest_dir), sudo=False), remote_sudo)
+        try:
+            result = run(cmd, dry_run=cfg.get("dry_run", False), read_only=True,
+                         verbosity=cfg["verbose"], capture_output=True,
+                         text=True, check=False)
+        except Exception:
+            result = None
+        names = []
+        if result is not None and result.returncode == 0:
+            for line in (result.stdout or "").splitlines():
+                name = _sentinel_from_listing_line(line)
+                if name:
+                    names.append(name)
+        _note_diskfull(cfg, dest_dir, names, remote)
+        return cfg["_diskfull_seen"][key]
+
+    names = []
+    try:
+        for p in Path(dest_dir).iterdir():
+            if p.name.startswith(DISKFULL_PREFIX) and (p.is_dir() or p.is_symlink()):
+                names.append(p.name)
+    except OSError:
+        # Cannot read the pool (permissions, unmounted): report nothing rather
+        # than blocking the run on a guess.
+        pass
+    _note_diskfull(cfg, dest_dir, names)
+    return cfg["_diskfull_seen"][key]
+
+
+def _diskfull_blocked(dest_dir, cfg: dict, remote: str | None = None,
+                      remote_sudo: bool = False) -> list[str]:
+    """True-side answer for "is this destination still full?".
+
+    Reports the block once per destination per run on stderr (so cron sees it at
+    -v 0) and records it in cfg["_diskfull_blocks"] so the subcommand exits
+    non-zero.  The caller is expected to skip the leg, not abort: the snapshot is
+    still taken, the other destination is still written, and keep-policy pruning
+    still runs -- pruning is how the pool gets space back.
+    """
+    names = _diskfull_sentinels(dest_dir, cfg, remote, remote_sudo)
+    if not names:
+        return names
+
+    label = f"{remote}:{dest_dir}" if remote else str(dest_dir)
+    sudo = " sudo -n" if remote_sudo else ""
+    blocks = cfg.setdefault("_diskfull_blocks", [])
+    if label not in blocks:
+        blocks.append(label)
+        print(f"Disk full: {label} holds {len(names)} partial subvolume(s) left by "
+              f"a failed receive:\n    " + "\n    ".join(names) +
+              f"\nNothing is sent to {label} while they are there.  They are also the "
+              f"space the failed receive used, so this clears both the block and the "
+              f"garbage:\n    " +
+              "\n    ".join(f"ssh {remote}{sudo} btrfs subvolume delete {dest_dir}/{n}"
+                            if remote else f"btrfs subvolume delete {Path(dest_dir) / n}"
+                            for n in names),
+              file=sys.stderr)
+    return names
 
 
 def _received_subvol_name(stream: Path, result, cfg: dict, source: str) -> str:
@@ -1977,6 +2091,16 @@ def _receive_on_remote(recv_cmd: list[str], remote: str, remote_dir: str,
     subvolume basename (None if it already exists).
     Aborts the whole program on any other error.
     """
+    if _diskfull_blocked(str(remote_dir), cfg, remote, remote_sudo):
+        log(f"receive into {remote}:{remote_dir} skipped: destination is disk-full",
+            1, cfg["verbose"])
+        # The stream file already sits on the remote; remove it so a blocked
+        # run does not leave multi-gigabyte garbage behind.
+        run(build_ssh_cmd(remote, ["rm", "-f", remote_tmp], remote_sudo),
+            dry_run=cfg.get("dry_run", False), verbosity=cfg["verbose"],
+            capture_output=True, check=False)
+        return None
+
     # A btrfs send stream is a byte-for-byte copy of the snapshot's contents:
     # scp inherits the remote's default mode and rsync copies the local file's,
     # so make it readable by the remote's owner only before receiving it.
@@ -2158,6 +2282,11 @@ def _receive_local(stream: Path, backup_dir: Path, cfg: dict) -> str | None:
     """
     recv_cmd = btrfs_cmd(cfg, "receive", "-f", str(stream), str(backup_dir))
 
+    if _diskfull_blocked(str(backup_dir), cfg):
+        log(f"receive into {backup_dir} skipped: destination is disk-full",
+            1, cfg["verbose"])
+        return None
+
     result = _timed_run(recv_cmd, "btrfs receive", cfg,
                         capture_output=True, text=True, check=False)
 
@@ -2334,14 +2463,24 @@ def _prev_year(ts: str, years_cnt: int) -> str:
     return _ts_str(datetime(t.year, 12, 31, 23, 59, 0, 0))
 
 _ARCHIVE_TS_RE = re.compile(r"^(.+)\.(\d{12})$")
-def iter_archive_items(directory: Path, archive: str):
-    """Yield (timestamp_str, path) for exact archive.YYYYMMDDHHMM entries."""
+def iter_archive_items(directory: Path, archive: str, cfg: dict | None = None):
+    """Yield (timestamp_str, path) for exact archive.YYYYMMDDHHMM entries.
+
+    cfg is optional: when given, any disk-full sentinel seen on the walk is
+    recorded so the block check costs no extra command.
+    """
     if not directory.is_dir():
         return
+    sentinels = []
     for p in directory.iterdir():
         if not p.is_dir() and not p.is_symlink():
             # snapshots/backups are subvolumes (dirs); skip plain files
             # remove this guard if you also prune stream files later
+            continue
+        if p.name.startswith(DISKFULL_PREFIX):
+            # A disk-full partial (TODO 35): not an archive, but the run that
+            # walks this pool has to know it is there.
+            sentinels.append(p.name)
             continue
         m = _ARCHIVE_TS_RE.match(p.name)
         if not m:
@@ -2353,6 +2492,7 @@ def iter_archive_items(directory: Path, archive: str):
         if parse_ts(p.name) is None:
             continue
         yield ts, p
+    _note_diskfull(cfg, directory, sentinels)
 
 
 def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict, remote_sudo: bool = False):
@@ -2375,6 +2515,7 @@ def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict
     if result is None:
         return
 
+    sentinels = []
     for line in result.stdout.splitlines():
         # Parse: ID 256 gen 1234 top level 5 path lama7.20260831...
         parts = line.split()
@@ -2383,19 +2524,27 @@ def iter_archive_items_ssh(remote: str, remote_dir: str, archive: str, cfg: dict
             if part == "path" and i + 1 < len(parts):
                 path_idx = i + 1
                 break
-        if path_idx >= 0:
-            remote_subvol = parts[path_idx]
-            # Match archive pattern
-            m = _ARCHIVE_TS_RE.match(remote_subvol)
-            if not m:
-                continue
-            if m.group(1) != archive:
-                continue
-            ts = m.group(2)
-            if parse_ts(remote_subvol) is None:
-                continue
-            # Yield timestamp and full remote path
-            yield ts, f"{remote_dir}/{remote_subvol}"
+        if path_idx < 0:
+            continue
+        remote_subvol = parts[path_idx]
+        name = Path(remote_subvol).name
+        if name.startswith(DISKFULL_PREFIX):
+            # A disk-full partial (TODO 35): the listing we already ran is the
+            # cheapest place to spot it, so the block check costs no extra SSH.
+            sentinels.append(name)
+            continue
+        # Match archive pattern
+        m = _ARCHIVE_TS_RE.match(remote_subvol)
+        if not m:
+            continue
+        if m.group(1) != archive:
+            continue
+        ts = m.group(2)
+        if parse_ts(remote_subvol) is None:
+            continue
+        # Yield timestamp and full remote path
+        yield ts, f"{remote_dir}/{remote_subvol}"
+    _note_diskfull(cfg, remote_dir, sentinels, remote)
 
 def _get_keeps(
     timestamps: list[str],
@@ -2691,7 +2840,7 @@ def apply_keep_policy(directory: Path, archive: str, keep: dict, cfg: dict, forc
         )
         return
 
-    raw_items = list(iter_archive_items(directory, archive))
+    raw_items = list(iter_archive_items(directory, archive, cfg))
     items = [
         (ts, p.name, btrfs_cmd(cfg, "subvolume", "delete", str(p)))
         for ts, p in raw_items
@@ -2764,6 +2913,10 @@ def _apply_all_keep_policies(
 
 def _piped_send_to_local(snap: Path, snap_dir: Path, backup_dir: Path, cfg: dict, name: str) -> None:
     """Perform a local piped btrfs send -> btrfs receive to backup_dir with timing."""
+    if _diskfull_blocked(str(backup_dir), cfg):
+        log(f"local send to {backup_dir} skipped: destination is disk-full",
+            1, cfg["verbose"])
+        return
     log("Finding parents for local piped send...", 1, cfg["verbose"])
     local_send_cmd = btrfs_cmd(cfg, "send")
     local_parents = find_parents(name, snap_dir, backup_dir, cfg)
@@ -3485,6 +3638,16 @@ def _run_backup(args: argparse.Namespace) -> int:
               f"{', '.join(failed_archives)}", file=sys.stderr)
         return 1
 
+    # TODO 35: a destination that still holds a disk-full partial was skipped
+    # rather than failed -- the snapshot is still there, pruning still ran --
+    # but the backup leg did not happen, so cron has to see a non-zero exit at
+    # -v 0 where the "Disk full:" detail was already printed.
+    blocks = global_cfg.get("_diskfull_blocks") or []
+    if blocks:
+        print(f"Error: {len(blocks)} destination(s) skipped because they are "
+              f"disk-full: {', '.join(blocks)}", file=sys.stderr)
+        return 1
+
     log("All archives processed.", 1, global_cfg["verbose"])
     return 0
 
@@ -3804,7 +3967,7 @@ def _iter_location(loc: dict, label: str, name: str, cfg: dict):
     else:
         d = loc["snap_dir"] if label == "snap" else loc["backup_dir"]
         if d is not None:
-            yield from iter_archive_items(d, name)
+            yield from iter_archive_items(d, name, cfg)
 
 
 def _loc_of(archive: dict, cfg: dict) -> dict:
@@ -3829,8 +3992,8 @@ def _run_list(archives: list[dict], cfg: dict, verbosity: int) -> int:
         remote_dir = loc["remote_dir"]
         remote_sudo = loc["remote_sudo"]
 
-        snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name)} if snap_d and snap_d.is_dir() else set()
-        bak_ts = {ts for ts, _ in iter_archive_items(bak_d, name)} if bak_d and bak_d.is_dir() else set()
+        snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name, cfg)} if snap_d and snap_d.is_dir() else set()
+        bak_ts = {ts for ts, _ in iter_archive_items(bak_d, name, cfg)} if bak_d and bak_d.is_dir() else set()
         rem_ts = set()
         if remote and remote_dir:
             rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
@@ -3975,8 +4138,8 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
             log("  no destination configured — nothing to rebuild", 1, cfg["verbose"])
             continue
 
-        snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name)} if snap_d and snap_d.is_dir() else set()
-        bak_ts = {ts for ts, _ in iter_archive_items(bak_d, name)} if bak_d and bak_d.is_dir() else set()
+        snap_ts = {ts for ts, _ in iter_archive_items(snap_d, name, cfg)} if snap_d and snap_d.is_dir() else set()
+        bak_ts = {ts for ts, _ in iter_archive_items(bak_d, name, cfg)} if bak_d and bak_d.is_dir() else set()
         rem_ts = set()
         if remote and remote_dir:
             rem_ts = {ts for ts, _ in iter_archive_items_ssh(remote, remote_dir, name, cfg, remote_sudo)}
@@ -4163,6 +4326,17 @@ def _run_rebuild(archives: list[dict], cfg: dict, verbosity: int) -> int:
             any_actionable = True
             ts = it["ts"]
             label = f"{name}.{ts}"
+            # TODO 35: a destination that still carries a disk-full partial is
+            # refused outright -- the send cannot fit and the receive would only
+            # leave another orphan.  It counts as a failed leg so rebuild exits
+            # non-zero and cron sees it.
+            if kind != "snapshot" and it["dest"] and _diskfull_blocked(
+                    str(it["dest"]), cfg,
+                    remote if kind == "remote" else None, remote_sudo):
+                log(f"    {label}: skipped, destination {it['dest']} is disk-full",
+                    1, cfg["verbose"])
+                failed.append(label)
+                continue
             if kind == "backup":
                 log(f"    {label}: restoring local backup from snapshot", 1, cfg["verbose"])
                 try:

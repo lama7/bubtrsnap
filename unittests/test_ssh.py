@@ -563,8 +563,11 @@ class TestSCPReceive(unittest.TestCase):
         result = bs._scp_and_receive(stream, "user@host", "/remote/backup", cfg)
 
         self.assertEqual(result, "test.202608280230")
-        # Verify run() was called 4 times (SCP, remote chmod, SSH receive, cleanup)
-        self.assertEqual(mock_run.call_count, 4)
+        # Verify run() was called 5 times (SCP, disk-full sentinel listing,
+        # remote chmod, SSH receive, cleanup).  The listing is read-only, so it
+        # still runs in a dry-run: a dry-run must be able to see a pool a live
+        # run already filled (TODO 35).
+        self.assertEqual(mock_run.call_count, 5)
         # Verify the return value is the stream stem
         self.assertEqual(result, stream.stem)
 
@@ -593,9 +596,11 @@ class TestSCPReceive(unittest.TestCase):
         stream = Path("/tmp/test.202608280230.btrfs")
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False}
         
-        # SCP succeeds, chmod succeeds, SSH receive fails, cleanup succeeds
+        # SCP succeeds, the sentinel listing finds nothing, chmod succeeds,
+        # SSH receive fails, cleanup succeeds
         mock_run.side_effect = [
             subprocess.CompletedProcess(args=["scp"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "btrfs", "subvolume", "list"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "chmod"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="error: no space left"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
@@ -1009,8 +1014,9 @@ class TestRsyncAndReceive(unittest.TestCase):
         cfg = {"dry_run": True, "verbose": 2, "remote_sudo": False,
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
-        # All calls return None for dry-run (rsync, chmod, receive, cleanup)
-        mock_run.side_effect = [None, None, None, None]
+        # All calls return None for dry-run (rsync, sentinel listing, chmod,
+        # receive, cleanup)
+        mock_run.side_effect = [None] * 5
 
         result = bs._rsync_and_receive(stream, "user@host", "/remote/backup", cfg)
         self.assertEqual(result, "test.202608280230")
@@ -1055,9 +1061,11 @@ class TestRsyncAndReceive(unittest.TestCase):
         cfg = {"dry_run": False, "verbose": 1, "remote_sudo": False,
                "local_sudo": False, "rsync": True, "rsync_opts": None}
 
-        # First call (rsync) succeeds, chmod succeeds, then the receive fails
+        # rsync succeeds, the disk-full sentinel listing finds nothing,
+        # chmod succeeds, then the receive fails
         mock_run.side_effect = [
             subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "btrfs", "subvolume", "list"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "chmod"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="no space left"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
@@ -1078,6 +1086,7 @@ class TestRsyncAndReceive(unittest.TestCase):
 
         mock_run.side_effect = [
             subprocess.CompletedProcess(args=["rsync"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["ssh", "btrfs", "subvolume", "list"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "chmod"], returncode=0, stdout="", stderr=""),
             subprocess.CompletedProcess(args=["ssh", "btrfs", "receive"], returncode=1, stdout="", stderr="subvolume already exists"),
             subprocess.CompletedProcess(args=["ssh", "rm"], returncode=0, stdout="", stderr=""),
