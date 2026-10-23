@@ -218,6 +218,33 @@ flag.  Only a real ENOSPC triggers this — a dropped SSH pipe, an
 already-existing target, or a permission error leaves the partial where it is.
 `--dry-run` never renames anything.
 
+While the sentinel is there, **nothing is sent to or received from that
+destination**.  A `btrfs send` into a full pool fails the same way and leaves
+another orphan, and an incremental stream's size cannot be measured in advance,
+so a partial already in the pool is the only reliable sign that the pool is
+broken.  The block is per destination: a full remote never cancels a local
+backup, and a full local backup never cancels the remote leg.  It is a skip,
+not an abort — the snapshot is still taken, the other destination is still
+written, and keep-policy pruning still runs, which is how the pool gets space
+back.  The run still exits 1 so cron sees it at `-v 0`, and the reason is
+printed once per destination per run:
+
+```
+Disk full: /backup holds 1 partial subvolume(s) left by a failed receive:
+    .bubtrsnap-diskfull-home-202601010000
+Nothing is sent to /backup while they are there.  They are also the space the
+failed receive used, so this clears both the block and the garbage:
+    btrfs subvolume delete /backup/.bubtrsnap-diskfull-home-202601010000
+Error: 1 destination(s) skipped because they are disk-full: /backup
+```
+
+Detection costs nothing on the paths that already list the destination (the
+keep policy, `rebuild` and the parent lookups), because those walks record what
+they see.  A remote receive that has not listed the pool yet issues one
+read-only `btrfs subvolume list`; it also runs under `--dry-run`, so a dry run
+reports a block a live run left behind.  Metadata-only snapshot restores are not
+blocked, since they write no data.
+
 ## Stream files
 
 For very large subvolumes or when you want to break the send and receive steps

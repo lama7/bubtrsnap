@@ -12,7 +12,7 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 - `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
   only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (last code change 9cc4919, VERSION 0.4.2.dev0;
+- `maintain` — working branch (last code change cf886cd, VERSION 0.4.2.dev0;
   docs-only commits trail the code tip). All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
@@ -357,7 +357,8 @@ still deferred by decision)
     deliberate and pinned by a test.  Tests:
     unittests/test_rebuild.py `TestRebuildFailureReporting` (6).
 
-35. In progress (design agreed 2026-10-22, builds on 33 and 34): a full-disk partial
+35. DONE (493d71f, 9cc4919, cf886cd; design agreed 2026-10-22, builds on 33
+    and 34): a full-disk partial
     receive should leave a visible, self-clearing flag instead of silent
     garbage.  The minimum correct action is already 34 (report + exit non-zero);
     everything below is courtesy, but it is courtesy a space guard cannot
@@ -424,9 +425,29 @@ still deferred by decision)
       snapshot-restore leg cannot be classified at all, because it runs
       `run(..., check=True, stderr=DEVNULL)` and the exception carries only the
       exit status.
-    - (3) Open: detection + per-destination blocking, including dry-run
-      reporting.
-    - (4) Open: docs for the block semantics and the one-command remedy.
+    - (3) DONE (cf886cd): detection and per-destination blocking.  `_note_diskfull`,
+      `_diskfull_sentinels()` and `_diskfull_blocked()` sit next to
+      `_mark_diskfull`; `iter_archive_items`/`iter_archive_items_ssh` record any
+      sentinel they walk past, so the check is free on paths that already list the
+      destination.  The cache lives on `cfg` (`_diskfull_seen`), not on a module
+      global, so it is scoped to one run — a run started after the admin clears
+      the pool is not blocked by what the previous run saw — and
+      `_mark_diskfull` feeds it, so a pool that fills mid-run is refused by the
+      next leg in the same run.  Hooked: both legs of `send_backup`,
+      `_receive_local`, `_receive_on_remote`, `_piped_send_to_local`, and rebuild
+      phase 4 (`backup`, `remote`, `from_remote`; the metadata-only `snapshot`
+      leg is not blocked).  A blocked leg is logged at level 1, recorded in
+      `cfg["_diskfull_blocks"]` and makes `_run_backup` return 1; in rebuild it
+      counts as a failed leg.  A remote receive leg that has no listing yet issues
+      one read-only `btrfs subvolume list` — that is the only place the check
+      costs a command, and the SCP/rsync sequence tests in test_ssh.py and
+      test_remote_tmp.py now count it.  Live check on stryder: with a sentinel in
+      /backup, `bubtrsnap rebuild --dry-run lama7` reported the block and exited
+      1, `bubtrsnap --dry-run lama7` skipped the local send, still ran keep
+      policy, and exited 1; after removing the sentinel both exited 0.  Tests:
+      unittests/test_diskfull_block.py (28).
+    - (4) DONE (this commit): README "When a destination runs out of space"
+      describes the block and the one-command remedy.
 
 ## Keep-algorithm audit notes (no changes made, per instruction)
 
@@ -437,7 +458,7 @@ only because ts are 12-digit padded.
 
 ## Verified clean (do not re-flag)
 
-- All tests pass (360 across 21 files, re-run 2026-10-23); no secrets, eval/exec, pickle; stderr
+- All tests pass (388 across 22 files, re-run 2026-10-23); no secrets, eval/exec, pickle; stderr
   discipline correct on error paths.
 - forced_keep threading intact (read from archive dict in
   _apply_all_keep_policies, threaded through to local and SSH paths).
