@@ -10,15 +10,48 @@ Full audit report: ~/.hermes/cache/scratch/bubtrsnap-audit-2026-10-15.md
 
 ## Branch workflow
 
-- `main` — shipping branch; currently at the v0.4.1 tag. FF from `maintain`
-  only at ship time, then tag, GitHub release, PyPI publish.
-- `maintain` — working branch (last code change 9e1c448, VERSION 0.4.2.dev0;
-  docs-only commits trail the code tip). All DONE
+- `main` — shipping branch; sits at the latest release tag. FF from
+  `maintain` only at ship time, then tag, GitHub release, PyPI publish
+  (v0.5.0 shipped 2026-10-26).
+- `maintain` — working branch. All DONE
   items below are committed here and pushed to the `stryder` remote; stryder
   runs this build via an editable pipx install from /home/lama7/src/bubtrsnap.
   `bubtrsnap --version` now also prints the branch/commit it was built from,
   so a dogfooded build identifies itself (see item 26).
 - Nothing reaches GitHub until a release is declared.
+
+## SHIPPED in v0.5.0 (tag pushed, GitHub release + PyPI published)
+
+Resilience to failed receives:
+
+- 9cc4919  a disk-full receive's partial is renamed `.bubtrsnap-diskfull-<archive>-<timestamp>`
+- cf886cd  refuses to send into a pool that still holds a disk-full partial
+- 9e1c448  partial receives are reported and no longer treated as backups
+- 5f9c62c  snapshot_dir entries btrfs does not mark read-only are reported and ignored
+- 493d71f  rebuild reports failed legs at -v 1 and exits non-zero
+
+Space guards:
+
+- 62a710a  hard-stop only for full sends known not to fit; incremental sends get a floor warning
+- 5b8fa1a  refined the fit-check; 29ed2cf one remote floor warning per archive, whichever route writes the remote
+
+Hardening:
+
+- 4cf896f  remote stream temp file unpredictable and owner-only
+- bc692e9  archive names validated at load; archive entries matched literally
+- d78d51f  a blocked rsync option now drops its argument too
+- 97e934a  reject negative keep_* counts in config and on the command line
+- 307b4cf  CLI --forced-keep timestamps format-validated before reaching the keep policy
+- 84afd70  _validate_subvol_path now actually checks the exit code (TODO 30)
+- 09bc88a  received-name extraction uses the stream header and understands 'At snapshot'
+- f5baa50  parent-discovery listing tolerates subvolume names with spaces
+
+Performance and visibility:
+
+- 8cb58ed  parent discovery uses one 'btrfs subvolume list' per directory (TODO 22)
+- 56ad416  build identity (branch, commit, dirty) stamped into --version and the run log
+
+README condensed for release: 06f8de4 (fault-mode and maintenance sections turned into summaries).
 
 ## SHIPPED in v0.4.1 (tag pushed, GitHub release + PyPI published)
 
