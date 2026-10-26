@@ -198,150 +198,44 @@ rsync_opts = '-e "ssh -p 2222 -i /home/user/.ssh/id_rsa"'
 Using rsync affects only file-based transfers (replacing scp) and does not
 affect piping `btrfs send | btrfs receive` or local backup operations.
 
-### When a destination runs out of space
+### Fault modes: partial receives and full destinations
 
-A `btrfs receive` that dies on a full destination pool still creates the
-subvolume it was writing and leaves it half-written.  bubtrsnap renames that
-partial to `.bubtrsnap-diskfull-<archive>-<timestamp>` in the destination that
-failed and prints the one command that clears it:
+A `btrfs receive` that dies mid-stream still creates the subvolume it was
+writing.  bubtrsnap detects these leftovers, reports them once per
+destination per run, and treats them as absent everywhere they matter - the
+keep policy, `list` and `rebuild` all ignore them - so a half-written entry
+can never take a real backup's keep slot or be mistaken for one.  Nothing is
+ever deleted unless you ask.
 
-```
-Disk full: the partial subvolume /backup/home.202601010000 is blocking /backup.
-Remove it to free the space and unblock later runs:
-    btrfs subvolume delete /backup/.bubtrsnap-diskfull-home-202601010000
-```
+- **Disk full.** A receive that fails on a full pool has its partial renamed
+  to `.bubtrsnap-diskfull-<archive>-<timestamp>`.  While a sentinel is
+  there, that destination is skipped: the sentinel holds exactly the space
+  the failed receive ate, and sending into that pool would only produce
+  another partial:
 
-The renamed subvolume is invisible to the keep policy, `list` and `rebuild`:
-its name cannot match the `archive.YYYYMMDDhhmm` pattern.  It is also the space
-the failed receive ate, so the command above removes both the garbage and the
-flag.  Only a real ENOSPC triggers this — a dropped SSH pipe, an
-already-existing target, or a permission error leaves the partial where it is.
-`--dry-run` never renames anything.
+      btrfs subvolume delete /backup/.bubtrsnap-diskfull-home-202601010000
 
-While the sentinel is there, **nothing is sent to or received from that
-destination**.  A `btrfs send` into a full pool fails the same way and leaves
-another orphan, and an incremental stream's size cannot be measured in advance,
-so a partial already in the pool is the only reliable sign that the pool is
-broken.  The block is per destination: a full remote never cancels a local
-backup, and a full local backup never cancels the remote leg.  It is a skip,
-not an abort — the snapshot is still taken, the other destination is still
-written, and keep-policy pruning still runs, which is how the pool gets space
-back.  The run still exits 1 so cron sees it at `-v 0`, and the reason is
-printed once per destination per run:
+  The skip is per destination - a full remote never cancels the local leg
+  and vice versa - snapshots are still taken and keep pruning still runs,
+  which is how the pool gets space back.  The run exits 1 so cron notices,
+  and the reason is printed once per destination per run.  Only a real
+  ENOSPC triggers the rename; `--dry-run` never renames anything.
 
-```
-Disk full: /backup holds 1 partial subvolume(s) left by a failed receive:
-    .bubtrsnap-diskfull-home-202601010000
-Nothing is sent to /backup while they are there.  They are also the space the
-failed receive used, so this clears both the block and the garbage:
-    btrfs subvolume delete /backup/.bubtrsnap-diskfull-home-202601010000
-Error: 1 destination(s) skipped because they are disk-full: /backup
-```
+- **Partial receives.** Any other mid-stream death (truncated stream,
+  dropped SSH pipe, killed process) leaves a subvolume that never got its
+  Received UUID, the mark of a completed receive.  `list` labels these
+  `partial`.
 
-Detection costs nothing on the paths that already list the destination (the
-keep policy, `rebuild` and the parent lookups), because those walks record what
-they see.  A remote receive that has not listed the pool yet issues one
-read-only `btrfs subvolume list`; it also runs under `--dry-run`, so a dry run
-reports a block a live run left behind.  Metadata-only snapshot restores are not
-blocked, since they write no data.
+- **Unusable snapshot entries.** A `snapshot_dir` entry named like an
+  archive that is not read-only cannot be sent or used as an incremental
+  parent, whatever made it.  `list` labels these `incompat`.
 
-### When a receive dies for another reason
-
-A receive can also die without the pool being full: the stream is truncated, the
-SSH pipe is dropped, the process is killed.  btrfs then still creates the
-subvolume, and the only thing that distinguishes it from a real backup is that
-the Received UUID was never written:
-
-```
-$ btrfs subvolume list -R /backup
-ID 256 gen 9 top level 257 received_uuid -  path lama7.202601010000
-```
-
-bubtrsnap calls such a subvolume a **partial receive**.  It is detected from the
-listing the run already takes (`btrfs subvolume list -u -R -p` on a remote, one
-`subvolume list` plus the directory walk it already does locally), reported once
-per destination per run on stderr at `-v 0`, and treated as absent everywhere it
-matters:
-
-- `list` prints `partial` in that column instead of `yes`.
-- The keep policy does not count it in a slot, so a corrupt newest entry cannot
-  push the last real backup out of the policy and get it pruned.
-- `rebuild` plans to restore over it and then refuses the leg — `btrfs receive`
-  cannot land on an existing subvolume — and counts it as a failed action, so
-  `rebuild` exits 1.
-
-Nothing is deleted by default.  To make the run clean them up as part of keep
-policy, opt in with `--prune-partial-subvolumes` (or
-`prune_partial_subvolumes = true` in the config, globally or per archive):
-
-```
-Partial receive: /backup holds 1 subvolume(s) left by a receive that died
-mid-stream:
-    lama7.202601010000
-btrfs records no Received UUID for them, so they are not usable backups: the
-keep policy, `list` and `rebuild` all ignore them, and nothing is restored over
-them.  They still hold the space the failed receive used, so removing them frees
-it and clears the flag:
-    btrfs subvolume delete /backup/lama7.202601010000
-  or: bubtrsnap prune lama7 --ts 202601010000
-Run with --prune-partial-subvolumes to remove such leftovers automatically.
-```
-
-Detection is deliberately fail-closed: if the destination cannot be listed, or
-the UUID columns are not available (older btrfs-progs on a remote falls back to
-the plain listing it used to run), nothing is classified as partial and nothing
-is ever deleted on a guess.  `snapshot_dir` is not judged this way, because a
-snapshot made with `btrfs subvolume snapshot -r` has no Received UUID either —
-the rule would call every snapshot broken.  What a snapshot pool *can* be judged
-by is the read-only flag, which is the next section.
-
-### When snapshot_dir holds something bubtrsnap cannot use
-
-Only a read-only subvolume can be sent, and only a read-only subvolume can be
-used as an incremental parent with `-p`/`-c`.  `bubtrsnap` snapshots with
-`btrfs subvolume snapshot -r`, so every archive it wrote in `snapshot_dir` carries
-that flag.  A child with an archive name that does not carry it is not an archive
-`bubtrsnap` can use, whatever made it: `snapshot` without `-r`, `btrfs property
-set <path> ro false`, or a `btrfs receive` that died mid-stream while `rebuild`
-was recovering a snapshot that only exists on the remote.
-
-The flag is read with one extra read-only call per snapshot pool per run,
-`btrfs subvolume list -r -p <snapshot_dir>`.  `-r` is the only listing that
-reports it — it is a filter rather than a column, so no combination of
-`-u -R -p -o -s -c -t -a` shows it — and a listing is filesystem-wide, so `-p`
-plus the pool's own subvolume ID keeps nested and other-pool entries out.  A
-btrfs-progs that rejects `-r` falls back to one `subvolume show` per candidate and
-reads its `Flags:` line; a pool that cannot be scanned at all is left alone.  Only
-`snapshot_dir` is scanned, never a remote destination: everything there was
-received, so the Received UUID rule above is the right one there.  When
-`snapshot_dir` and `backup_dir` are the same directory both rules run on it, and
-an entry caught by either is unusable.
-
-```
-Unusable snapshot: /snap holds 1 incompat subvolume(s) named like an archive that
-btrfs does not mark read-only:
-    lama7.202601010000
-Only a read-only subvolume can be sent, or used as an incremental parent, so these
-are not archives bubtrsnap can use: the keep policy, `list` and `rebuild` all
-ignore them.  A receive that died mid-stream leaves exactly this, and so does a
-snapshot made without -r.  They still hold the space they used, so removing them
-frees it:
-    btrfs subvolume delete /snap/lama7.202601010000
-  or: bubtrsnap prune lama7 --ts 202601010000
-Run with --prune-partial-subvolumes to remove such leftovers automatically.
-```
-
-Such an entry is called **incompat**, not partial: nothing received it, so
-"half-written" is not the claim being made — only that `bubtrsnap` cannot use it.
-Like a partial receive it is kept out of the keep policy's slot counting, so the
-corrupt newest entry cannot push a real archive out of a slot, and like a partial
-it is removed only if `--prune-partial-subvolumes` was set.  `list` prints
-`incompat` in the snapshot column instead of `yes`, and `rebuild` plans around it:
-`btrfs subvolume snapshot -r` onto an existing writable directory does not
-overwrite it, it nests a new subvolume inside it, so a snapshot leg whose target
-name is already such an entry is refused and counted as a failure rather than
-attempted.  A failed receive into `snapshot_dir` records its own orphan, so the
-legs still queued for that pool in the same run see it.
+Reports print the delete command for each leftover; clear them by hand, with
+`bubtrsnap prune <archive> --ts <timestamp>`, or let the keep policy remove
+them automatically with `--prune-partial-subvolumes` (config:
+`prune_partial_subvolumes`, global or per-archive).  Detection is read-only
+and runs under `--dry-run` too, so a dry run reports leftovers a live run
+left behind.
 
 ## Stream files
 
@@ -567,55 +461,41 @@ Always use `--dry-run` to preview a new keep policy or remote configuration.
 
 ## Maintenance subcommands
 
-Beyond the legacy `bubtrsnap ARCHIVE[=SUBVOLUME] ...` invocation, bubtrsnap
-offers maintenance subcommands. When you give a subcommand name on the command
-line it is parsed with its own option set; with no subcommand the legacy backup
-behaviour applies (all positionals are archive names). The global options
-(`--config`, `--snapshot-dir`, `--backup-dir`, `-v/--verbose`, `--dry-run`,
-`--rsync`, and the `keep_*` policies) are shared by every subcommand. Run
-`bubtrsnap <subcommand> --help` for that command's full option list.
+Alongside the legacy `bubtrsnap ARCHIVE[=SUBVOLUME] ...` invocation, bubtrsnap
+offers four maintenance subcommands.  Global options (`--config`,
+`--snapshot-dir`, `--backup-dir`, `-v/--verbose`, `--dry-run`, `--rsync`, and
+the `keep_*` policies) apply to all of them; `bubtrsnap <subcommand> --help`
+shows each one's own options.  With no subcommand bubtrsnap backs up exactly
+as before.
 
-**`bubtrsnap backup`** — take snapshots and send backups. This is the default
-behaviour when no subcommand is given.
+**`backup`** - snapshots and sends backups; the default behaviour with no
+subcommand.
 
-**`bubtrsnap list [ARCHIVE ...]`** — read-only table of the snapshot / backup /
-remote timestamps that exist for each archive. All config archives are shown if
-none are named. A backup or remote entry left by a receive that never finished
-is labelled `partial` rather than `yes`, and a `snapshot_dir` entry that btrfs
-does not mark read-only is labelled `incompat` (see *When a receive dies for
-another reason* and *When snapshot_dir holds something bubtrsnap cannot use*).
+**`list [ARCHIVE ...]`** - read-only table of which timestamps exist in the
+snapshots, the local backup, and the remote for each archive (all configured
+archives if you name none).  Leftovers from failed receives are labelled
+`partial` or `incompat` rather than `yes` (see *Fault modes* above).
 
-**`bubtrsnap prune --ts TS [ARCHIVE ...]`** — delete snapshot/backup subvolumes
-matching the given timestamp(s). `--ts` takes a single timestamp
-`YYYYMMDDhhmm` or a dotted inclusive range `<from>..<to>`; multiple `--ts`
-options match any of them. Prune never operates on "all" archives — name at
-least one. Without `--yes` (and without `--dry-run`) it asks for confirmation
-before deleting. If any timestamp in the target set is marked `forced_keep`,
-the preview labels it `[forced-keep]` and an *additional* confirmation is
-required even when `--yes` is set (a hand-picked range can capture a
-protected timestamp by accident); declining aborts the whole prune.
+**`prune --ts TS [ARCHIVE ...]`** - deletes the snapshot and backup
+subvolumes matching a timestamp `YYYYMMDDhhmm`, an inclusive dotted range
+(`202601010000..202601050000`), or several `--ts` options.  It never acts on
+"all" archives - name at least one - and asks for confirmation before
+deleting unless `--yes` or `--dry-run` is given.  Timestamps protected by
+`forced_keep` are flagged in the preview and require an extra confirmation
+even with `--yes`, since a hand-picked range can capture a protected
+timestamp by accident.
 
-**`bubtrsnap rebuild [ARCHIVE ...]`** — reconcile snapshot/backup/remote
-locations. It restores a lost local snapshot from a local backup, restores a
-lost local backup from a local snapshot (via `btrfs send`/`receive`), and
-re-sends to a remote when it is missing there; it can also recover a snapshot
-that exists only on the remote. It never deletes — it only restores. All
-config archives are rebuilt if none are named. A rebuild is plan-first: its
-action list is computed once from the state at the start of the run, and each
-action fills only one of the three locations. As a result, a snapshot missing
-in *two* locations needs two runs. For example, an archive that only exists as
-a local snapshot gets its local backup restored on the first run and is only
-re-sent to the remote on the second; likewise an archive that only exists on the
-remote is recovered as a local snapshot on the first run and gets its local
-backup filled in on the second.  An archive with no `backup_dir` has no local
-backup to restore, so its remote re-send happens in the same run. Run
-`bubtrsnap list` to confirm all three locations line up before calling it done.
-A restore that was attempted and failed is reported at verbosity 1 and `rebuild`
-exits 1 when any action failed; an action the space guard chose not to attempt
-is a skip, not a failure, and does not change the exit code.  A partial receive
-(see above) does not count as a backup, and an `incompat` entry does not count as
-a snapshot, so a leg that would have to receive over one, or snapshot into one, is
-refused and counted as a failure.
+**`rebuild [ARCHIVE ...]`** - reconciles an archive's three locations: it
+restores a lost snapshot from the local backup or the remote, restores a
+lost local backup from the snapshot, and re-sends to the remote where the
+archive is missing.  It only restores - it never deletes.  Each run plans
+from the state at its start and each action fills one location, so an
+archive missing in two locations takes two runs to fully reconcile; an archive
+with no `backup_dir` has nothing to restore locally, so its remote re-send
+happens in the same run.  Run `list` to confirm all three match.  A failed restore is reported at
+verbosity 1 and makes `rebuild` exit 1; a leg the space guard chose not to
+attempt is a skip, not a failure.  Partial and incompat entries are refused
+as restore targets (see *Fault modes* above).
 
 Examples:
 
@@ -746,10 +626,9 @@ mid-stream instead of only reporting them:
 snapshot_dir = "/pool/snapshots"
 backup_dir   = "/backup"
 
-# Off by default: a run only reports such subvolumes and prints the delete
-# command.  Covers both a receive that died mid-stream in a backup or remote
-# pool and a snapshot_dir entry btrfs does not mark read-only.  Set per archive
-# too, if only one archive should be pruned this way.
+# Off by default: a run only reports `partial` and `incompat` leftovers and
+# prints their delete commands.  Set per archive if only one archive should
+# be pruned this way.
 prune_partial_subvolumes = true
 
 [home]
