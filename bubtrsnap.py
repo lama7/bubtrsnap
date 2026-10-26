@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.4.2.dev0"
+VERSION = "0.5.0"
 
 _BUILD_IDENTITY: str | None = None
 
